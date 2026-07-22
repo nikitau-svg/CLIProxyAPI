@@ -17,6 +17,66 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func TestExchangeCodeForTokensPreservesAccountAndOrganization(t *testing.T) {
+	auth := &ClaudeAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(strings.NewReader(`{
+						"access_token":"access",
+						"refresh_token":"refresh",
+						"expires_in":3600,
+						"organization":{"uuid":"org-team","name":"Example Team"},
+						"account":{"uuid":"account-1","email_address":"same@example.com"}
+					}`)),
+					Header:  make(http.Header),
+					Request: req,
+				}, nil
+			}),
+		},
+	}
+
+	bundle, err := auth.ExchangeCodeForTokens(context.Background(), "code", "state", &PKCECodes{CodeVerifier: "verifier"})
+	if err != nil {
+		t.Fatalf("ExchangeCodeForTokens() error = %v", err)
+	}
+	if bundle.TokenData.AccountUUID != "account-1" {
+		t.Fatalf("unexpected account UUID: %q", bundle.TokenData.AccountUUID)
+	}
+	if bundle.TokenData.OrganizationUUID != "org-team" {
+		t.Fatalf("unexpected organization UUID: %q", bundle.TokenData.OrganizationUUID)
+	}
+	if bundle.TokenData.OrganizationName != "Example Team" {
+		t.Fatalf("unexpected organization name: %q", bundle.TokenData.OrganizationName)
+	}
+
+	storage := auth.CreateTokenStorage(bundle)
+	if storage.AccountUUID != "account-1" || storage.OrganizationUUID != "org-team" || storage.OrganizationName != "Example Team" {
+		t.Fatalf("organization identity was not preserved in storage: %#v", storage)
+	}
+}
+
+func TestUpdateTokenStorageKeepsOrganizationWhenRefreshOmitsIt(t *testing.T) {
+	auth := &ClaudeAuth{}
+	storage := &ClaudeTokenStorage{
+		Email:            "same@example.com",
+		AccountUUID:      "account-1",
+		OrganizationUUID: "org-team",
+		OrganizationName: "Example Team",
+	}
+
+	auth.UpdateTokenStorage(storage, &ClaudeTokenData{
+		AccessToken:  "new-access",
+		RefreshToken: "new-refresh",
+		Expire:       "2099-01-01T00:00:00Z",
+	})
+
+	if storage.Email != "same@example.com" || storage.AccountUUID != "account-1" || storage.OrganizationUUID != "org-team" || storage.OrganizationName != "Example Team" {
+		t.Fatalf("refresh erased stable identity: %#v", storage)
+	}
+}
+
 func TestRefreshTokensWithRetry_429BlocksImmediateReplay(t *testing.T) {
 	resetClaudeRefreshState()
 	defer resetClaudeRefreshState()

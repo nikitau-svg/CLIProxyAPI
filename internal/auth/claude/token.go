@@ -31,6 +31,15 @@ type ClaudeTokenStorage struct {
 	// Email is the Anthropic account email address associated with this token.
 	Email string `json:"email"`
 
+	// AccountUUID identifies the Anthropic account independently of its email.
+	AccountUUID string `json:"account_uuid,omitempty"`
+
+	// OrganizationUUID identifies the personal or team workspace selected during OAuth.
+	OrganizationUUID string `json:"organization_uuid,omitempty"`
+
+	// OrganizationName is the human-readable name of the selected workspace.
+	OrganizationName string `json:"organization_name,omitempty"`
+
 	// Type indicates the authentication provider type, always "claude" for this storage.
 	Type string `json:"type"`
 

@@ -478,6 +478,12 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if organizationUUID := strings.TrimSpace(gjson.GetBytes(data, "organization_uuid").String()); organizationUUID != "" {
+					fileData["organization_uuid"] = organizationUUID
+				}
+				if organizationName := strings.TrimSpace(gjson.GetBytes(data, "organization_name").String()); organizationName != "" {
+					fileData["organization_name"] = organizationName
+				}
 				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 					fileData["project_id"] = projectID
 				}
@@ -559,6 +565,12 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
+	}
+	if organizationUUID := authMetadataString(auth, "organization_uuid"); organizationUUID != "" {
+		entry["organization_uuid"] = organizationUUID
+	}
+	if organizationName := authMetadataString(auth, "organization_name"); organizationName != "" {
+		entry["organization_name"] = organizationName
 	}
 	if projectID := authProjectID(auth); projectID != "" {
 		entry["project_id"] = projectID
@@ -748,6 +760,14 @@ func authEmail(auth *coreauth.Auth) string {
 		}
 	}
 	return ""
+}
+
+func authMetadataString(auth *coreauth.Auth, key string) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	value, _ := auth.Metadata[key].(string)
+	return strings.TrimSpace(value)
 }
 
 func authAttribute(auth *coreauth.Auth, key string) string {
@@ -2087,12 +2107,23 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 		// Create token storage
 		tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
+		fileName := claude.CredentialFileName(tokenStorage.Email, tokenStorage.OrganizationUUID)
+		metadata := map[string]any{"email": tokenStorage.Email}
+		if tokenStorage.AccountUUID != "" {
+			metadata["account_uuid"] = tokenStorage.AccountUUID
+		}
+		if tokenStorage.OrganizationUUID != "" {
+			metadata["organization_uuid"] = tokenStorage.OrganizationUUID
+		}
+		if tokenStorage.OrganizationName != "" {
+			metadata["organization_name"] = tokenStorage.OrganizationName
+		}
 		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+			ID:       fileName,
 			Provider: "claude",
-			FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+			FileName: fileName,
 			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
+			Metadata: metadata,
 		}
 		if errGuard := guardOAuthSessionPendingForSave(state, "anthropic"); errGuard != nil {
 			return
