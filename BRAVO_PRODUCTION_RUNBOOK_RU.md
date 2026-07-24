@@ -1,5 +1,8 @@
 # Bravo 0.5.0: шаблон production runbook
 
+Для новой установки на AWS без переноса данных используйте
+[`AWS_INSTALL_RU.md`](AWS_INSTALL_RU.md).
+
 Публичный шаблон использует:
 
 ```bash

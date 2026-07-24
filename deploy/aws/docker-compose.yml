@@ -1,0 +1,30 @@
+services:
+  cli-proxy-api:
+    image: ${CLIPROXYAPI_IMAGE:-cliproxyapi-local:v7.2.94-bravo-native0.5.0}
+    pull_policy: never
+    container_name: CLIProxyAPI-Prod
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "/CLIProxyAPI/cliproxy-healthcheck"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 10s
+    ports:
+      # API and Management UI. Keep these ports private; use an SSH/SSM tunnel.
+      - "127.0.0.1:8317:8317"
+      # Localhost OAuth callbacks used by Codex, Claude, and Antigravity.
+      - "127.0.0.1:1455:1455"
+      - "127.0.0.1:54545:54545"
+      - "127.0.0.1:51121:51121"
+    volumes:
+      - "./config.yaml:/CLIProxyAPI/config.yaml"
+      - "./auths:/root/.cli-proxy-api"
+      - "./bravo-data:/CLIProxyAPI/bravo-data"
+      - "./logs:/CLIProxyAPI/logs"
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
