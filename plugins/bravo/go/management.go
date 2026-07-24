@@ -83,6 +83,7 @@ func registerManagement() ([]byte, error) {
 			{Method: http.MethodDelete, Path: "/bravo/projects", Description: "Revoke and delete a Bravo project."},
 			{Method: http.MethodPost, Path: "/bravo/projects/rotate", Description: "Rotate a Bravo project key and return it once."},
 			{Method: http.MethodGet, Path: "/bravo/analytics", Description: "Query redacted Bravo usage analytics by project, subscription, provider, model, and time bucket."},
+			{Method: http.MethodGet, Path: "/bravo/compatibility", Description: "Compare the live host model registry with reviewed Bravo profiles and effective routes."},
 			{Method: http.MethodGet, Path: "/bravo/routes", Description: "List effective or default Bravo model routes."},
 			{Method: http.MethodPut, Path: "/bravo/routes", Description: "Validate, preview, and persist one Bravo route override."},
 			{Method: http.MethodPost, Path: "/bravo/routes/reset", Description: "Reset one Bravo route to its configured default."},
@@ -112,6 +113,9 @@ func handleManagement(raw []byte) ([]byte, error) {
 	}
 	if response, errAnalytics := handleAnalyticsManagement(rpcReq); response != nil || errAnalytics != nil {
 		return response, errAnalytics
+	}
+	if response, errCompatibility := handleCompatibilityManagement(rpcReq); response != nil || errCompatibility != nil {
+		return response, errCompatibility
 	}
 	if response, errRoutes := handleRoutesManagement(rpcReq); response != nil || errRoutes != nil {
 		return response, errRoutes

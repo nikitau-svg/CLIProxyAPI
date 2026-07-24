@@ -95,6 +95,9 @@ func TestMethodNamesAreStable(t *testing.T) {
 	if MethodHostModelStreamClose != "host.model.stream_close" {
 		t.Fatalf("MethodHostModelStreamClose = %q", MethodHostModelStreamClose)
 	}
+	if MethodHostModelList != "host.model.list" {
+		t.Fatalf("MethodHostModelList = %q", MethodHostModelList)
+	}
 	if MethodHostAuthList != "host.auth.list" {
 		t.Fatalf("MethodHostAuthList = %q", MethodHostAuthList)
 	}

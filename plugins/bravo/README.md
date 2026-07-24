@@ -46,7 +46,7 @@ command. Claude Code 2.1.218 also sends `thinking.display: "omitted"`;
 Bravo accepts this live-verified presentation preference and strips the source
 thinking object before executing a physical candidate.
 
-Bravo 0.5.0 also preserves PNG/JPEG image blocks sent through Anthropic
+The current Bravo release also preserves PNG/JPEG image blocks sent through Anthropic
 Messages, including images nested in an older Claude Code `tool_result`.
 This path is live-verified for both Claude and Codex physical candidates,
 with and without streaming. Images do not change effort routing.
@@ -160,7 +160,7 @@ retry, and fallback; stale entries fail closed.
 
 ## Per-project allocation and live quota
 
-Version 0.5.0 applies project ownership, strict pools, and reserve policy:
+The current release applies project ownership, strict pools, and reserve policy:
 
 - the persistent usage ledger is keyed by stable project ID and exact
   `auth_index`;
@@ -221,6 +221,21 @@ POST /v0/management/bravo/routes/reset
 Capabilities are intentionally read-only. An unverified contract is rejected
 instead of being promoted by configuration.
 
+The authenticated compatibility advisor compares the host's static and live
+model catalogs with reviewed Bravo contracts, the effective model map, and
+logical routes:
+
+```text
+GET /v0/management/bravo/compatibility
+```
+
+The standard Management UI runs this check automatically and keeps the details
+collapsed until they are needed. A newly discovered model remains fail-closed
+and is classified by the first required action: host/catalog work is a code
+fix, Bravo model-map work is a YAML fix, and logical assignment is a route
+fix. Every suggestion names its target and includes a reviewable snippet;
+suggestions are never applied automatically.
+
 ## Verified contract
 
 Text logical models currently support:
@@ -277,15 +292,18 @@ install -m 0644 dist/index.html \
   ../CLIProxyAPI/.canary-dist/management.html
 ```
 
-Then, from the CLIProxyAPI repository root, build the 0.5.0 image:
+Then, from the CLIProxyAPI repository root, load the stable release manifest
+and build the matching image:
 
 ```bash
-docker build --platform linux/arm64 \
-  --build-arg VERSION=v7.2.94-bravo-native0.5.0 \
-  --build-arg COMMIT=bravo-native0.5.0 \
-  --build-arg BUILD_DATE=YYYY-MM-DD \
+. ./deploy/aws/release.env
+
+docker build --platform "$RELEASE_PLATFORM" \
+  --build-arg VERSION="$CLIPROXYAPI_VERSION" \
+  --build-arg COMMIT="$(git rev-parse HEAD)" \
+  --build-arg BUILD_DATE="$(date -u +%F)" \
   -f Dockerfile.canary \
-  -t cliproxyapi-local:v7.2.94-bravo-native0.5.0 .
+  -t "$CLIPROXYAPI_IMAGE" .
 ```
 
 Reusable live harnesses:
@@ -303,14 +321,14 @@ scripts/bravo-vision-smoke.rb
 The live harnesses read credentials from files and avoid printing secrets or
 image payloads.
 
-The verified 0.5.0 Linux/arm64 release image is
-`cliproxyapi-local:v7.2.94-bravo-native0.5.0` with
-`bravo-v0.5.0.so`; its reference digest is
-`sha256:605c9888b2f58c2d3db37575efecd2663b90e298f60b005315b073672b420b18`.
-Release gates include the full Go suite, focused race tests, plugin race/vet,
-77 WebUI tests plus lint/typecheck/build, a 12-cell protocol smoke, a 9-check
-projects/pools/routes/analytics smoke, controlled pre-payload failover, real
-Claude Code with `--effort xhigh`, and Chrome/Playwright desktop/mobile QA.
+`bravo/stable` and `deploy/aws/release.env` are the installation channel.
+Release tags are retained only as immutable rollback points. Moving the stable
+channel requires the full Go suite, plugin race/vet, WebUI
+tests/lint/typecheck/build, protocol and management smoke checks, controlled
+pre-payload failover, real Claude Code, and Chrome/Playwright desktop/mobile
+QA.
 
-The operator-oriented Russian deployment template is
-[`BRAVO_PRODUCTION_RUNBOOK_RU.md`](../../BRAVO_PRODUCTION_RUNBOOK_RU.md).
+The current clean-install guide is
+[`AWS_INSTALL_RU.md`](../../AWS_INSTALL_RU.md). The separate
+`BRAVO_PRODUCTION_RUNBOOK_RU.md` is retained only as historical 0.5 migration
+evidence.

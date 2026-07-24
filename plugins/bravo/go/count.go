@@ -87,7 +87,7 @@ func countTokens(raw []byte) ([]byte, error) {
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
-			failure := classifyHTTPFailure(response.StatusCode, response.Headers, "token count returned an HTTP error")
+			failure := classifyHTTPFailure(response.StatusCode, response.Headers, "token count returned an HTTP error", response.Body)
 			recordExecutionAttempt(attempt, started, response.StatusCode, false, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure

@@ -84,7 +84,7 @@ func TestRouteOverrideManagementPreviewPersistAndReset(t *testing.T) {
 		t.Fatalf("reset status/body/calls = %d %#v %d", status, reset, mutationCalls)
 	}
 	restored := loadedConfig().Models["opus"].Candidates
-	if len(restored) != 2 || normalizeProvider(restored[0].Provider) != "claude" || restored[0].Model != "claude-opus-4-8" {
+	if len(restored) != 2 || normalizeProvider(restored[0].Provider) != "claude" || restored[0].Model != "claude-opus-5" {
 		t.Fatalf("reset route = %#v", restored)
 	}
 }

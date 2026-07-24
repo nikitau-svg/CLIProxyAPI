@@ -653,6 +653,57 @@ func TestResolveCandidateContractDropsImplicitClaudeEffortForForcedFunctionTools
 	}
 }
 
+func TestResolveCandidateContractHandlesDefaultOnClaudeForcedTools(t *testing.T) {
+	t.Parallel()
+
+	contract, errDetect := detectRequestContract(
+		protocolClaude,
+		[]byte(`{"tool_choice":{"type":"any"},"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`),
+		false,
+	)
+	if errDetect != nil {
+		t.Fatal(errDetect)
+	}
+
+	t.Run("Opus 5 may explicitly disable implicit thinking", func(t *testing.T) {
+		item := candidate{
+			Provider:     "claude",
+			Model:        "claude-opus-5",
+			Effort:       "high",
+			Capabilities: []string{capabilityText, capabilityTools},
+		}
+		resolved, errResolve := resolveCandidateContract(item, contract)
+		if errResolve != nil {
+			t.Fatalf("resolveCandidateContract() error = %v", errResolve)
+		}
+		if resolved.Effort != "" {
+			t.Fatalf("resolved effort = %q, want implicit thinking disabled", resolved.Effort)
+		}
+	})
+
+	t.Run("Fable 5 fails closed because thinking cannot be disabled", func(t *testing.T) {
+		item := candidate{
+			Provider:     "claude",
+			Model:        "claude-fable-5",
+			Effort:       "max",
+			Capabilities: []string{capabilityText, capabilityTools},
+		}
+		_, errResolve := resolveCandidateContract(item, contract)
+		assertContractError(t, errResolve, "bravo_capability_conflict", capabilityTools)
+	})
+
+	t.Run("unknown Claude policy fails closed", func(t *testing.T) {
+		item := candidate{
+			Provider:     "claude",
+			Model:        "claude-future-unverified",
+			Effort:       "high",
+			Capabilities: []string{capabilityText, capabilityTools},
+		}
+		_, errResolve := resolveCandidateContract(item, contract)
+		assertContractError(t, errResolve, "bravo_contract_unverified", capabilityTools)
+	})
+}
+
 func TestResolveCandidateContractKeepsExplicitClaudeForcedToolConflict(t *testing.T) {
 	t.Parallel()
 

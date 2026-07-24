@@ -85,13 +85,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 
 	switch config.Mode {
 	case thinking.ModeNone:
-		result, _ := sjson.SetBytes(body, "thinking.type", "disabled")
-		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-		result, _ = sjson.DeleteBytes(result, "output_config.effort")
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
-		}
-		return result, nil
+		return applyDisabledThinking(body, modelInfo), nil
 
 	case thinking.ModeLevel:
 		// Adaptive thinking effort is only valid when the model advertises discrete levels.
@@ -117,13 +111,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		// Budget is expected to be pre-validated by ValidateConfig (clamped, ZeroAllowed enforced).
 		// Decide enabled/disabled based on budget value.
 		if config.Budget == 0 {
-			result, _ := sjson.SetBytes(body, "thinking.type", "disabled")
-			result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-			result, _ = sjson.DeleteBytes(result, "output_config.effort")
-			if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-				result, _ = sjson.DeleteBytes(result, "output_config")
-			}
-			return result, nil
+			return applyDisabledThinking(body, modelInfo), nil
 		}
 
 		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
@@ -162,6 +150,25 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	default:
 		return body, nil
 	}
+}
+
+func applyDisabledThinking(body []byte, modelInfo *registry.ModelInfo) []byte {
+	result, _ := sjson.SetBytes(body, "thinking.type", "disabled")
+	result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
+
+	// On default-on models, effort still controls non-thinking output and tool
+	// behavior. Preserve it so the executor can validate the model-specific
+	// disable cap and forward safe low-through-high values unchanged.
+	defaultOn := modelInfo != nil && modelInfo.Thinking != nil && modelInfo.Thinking.DefaultOn
+	if defaultOn {
+		return result
+	}
+
+	result, _ = sjson.DeleteBytes(result, "output_config.effort")
+	if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
+		result, _ = sjson.DeleteBytes(result, "output_config")
+	}
+	return result
 }
 
 // normalizeClaudeBudget applies Claude-specific constraints to ensure max_tokens > budget_tokens.

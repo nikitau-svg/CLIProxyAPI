@@ -43,11 +43,13 @@ func TestPluginModelInfoToRegistryModelInfoClonesThinkingAndSlices(t *testing.T)
 		SupportedInputModalities:   []string{"text"},
 		SupportedOutputModalities:  []string{"image"},
 		Thinking: &pluginapi.ThinkingSupport{
-			Min:            1,
-			Max:            2,
-			ZeroAllowed:    true,
-			DynamicAllowed: true,
-			Levels:         []string{"low", "high"},
+			Min:             1,
+			Max:             2,
+			ZeroAllowed:     true,
+			DynamicAllowed:  true,
+			DefaultOn:       true,
+			MaxDisableLevel: "high",
+			Levels:          []string{"low", "high"},
 		},
 		UserDefined: true,
 	}
@@ -62,7 +64,8 @@ func TestPluginModelInfoToRegistryModelInfoClonesThinkingAndSlices(t *testing.T)
 	if got.Thinking == nil {
 		t.Fatal("Thinking = nil, want converted thinking support")
 	}
-	if got.Thinking.Min != 1 || got.Thinking.Max != 2 || !got.Thinking.ZeroAllowed || !got.Thinking.DynamicAllowed || fmt.Sprint(got.Thinking.Levels) != "[low high]" {
+	if got.Thinking.Min != 1 || got.Thinking.Max != 2 || !got.Thinking.ZeroAllowed || !got.Thinking.DynamicAllowed ||
+		!got.Thinking.DefaultOn || got.Thinking.MaxDisableLevel != "high" || fmt.Sprint(got.Thinking.Levels) != "[low high]" {
 		t.Fatalf("Thinking = %#v, want copied thinking support", got.Thinking)
 	}
 
@@ -135,11 +138,13 @@ func TestRegisterModelsRegistersProviderModelsAndClientID(t *testing.T) {
 						SupportedInputModalities:   []string{"text"},
 						SupportedOutputModalities:  []string{"text"},
 						Thinking: &pluginapi.ThinkingSupport{
-							Min:            1,
-							Max:            2,
-							ZeroAllowed:    true,
-							DynamicAllowed: true,
-							Levels:         []string{"low"},
+							Min:             1,
+							Max:             2,
+							ZeroAllowed:     true,
+							DynamicAllowed:  true,
+							DefaultOn:       true,
+							MaxDisableLevel: "low",
+							Levels:          []string{"low"},
 						},
 						UserDefined: true,
 					}},
@@ -169,7 +174,8 @@ func TestRegisterModelsRegistersProviderModelsAndClientID(t *testing.T) {
 		t.Fatalf("registered model = %#v, want converted fields", model)
 	}
 	if model.Thinking == nil || model.Thinking.Min != 1 || model.Thinking.Max != 2 || !model.Thinking.ZeroAllowed ||
-		!model.Thinking.DynamicAllowed || model.Thinking.Levels[0] != "low" {
+		!model.Thinking.DynamicAllowed || !model.Thinking.DefaultOn || model.Thinking.MaxDisableLevel != "low" ||
+		model.Thinking.Levels[0] != "low" {
 		t.Fatalf("registered thinking = %#v, want converted thinking", model.Thinking)
 	}
 }

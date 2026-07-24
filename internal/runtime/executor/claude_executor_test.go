@@ -2747,6 +2747,7 @@ func TestValidateClaudeSamplingForUpstream_UsesModernModelLimits(t *testing.T) {
 	for _, model := range []string{
 		"claude-opus-4-7",
 		"claude-opus-4-8",
+		"claude-opus-5",
 		"claude-sonnet-5",
 		"claude-fable-5",
 	} {
@@ -2840,7 +2841,10 @@ func TestValidateClaudeSamplingForUpstream_RejectsInvalidThinkingSampling(t *tes
 
 func TestValidateClaudeSamplingForUpstream_AfterForcedToolChoicePreservesSampling(t *testing.T) {
 	payload := []byte(`{"temperature":0,"thinking":{"type":"adaptive"},"output_config":{"effort":"max"},"tool_choice":{"type":"any"}}`)
-	out := disableThinkingIfToolChoiceForced(payload)
+	out, errPrepare := prepareClaudeThinkingForUpstream(payload, "claude-opus-4-6")
+	if errPrepare != nil {
+		t.Fatalf("prepareClaudeThinkingForUpstream() error = %v", errPrepare)
+	}
 	if err := validateClaudeSamplingForUpstream(out, "claude-opus-4-6"); err != nil {
 		t.Fatalf("validateClaudeSamplingForUpstream() error = %v", err)
 	}
@@ -2850,6 +2854,169 @@ func TestValidateClaudeSamplingForUpstream_AfterForcedToolChoicePreservesSamplin
 	}
 	if got := gjson.GetBytes(out, "temperature").Float(); got != 0 {
 		t.Fatalf("temperature = %v, want 0", got)
+	}
+}
+
+func TestPrepareClaudeThinkingForUpstream_DefaultOnPolicies(t *testing.T) {
+	tests := []struct {
+		name         string
+		model        string
+		payload      string
+		wantError    string
+		wantDisabled bool
+		wantEffort   string
+		wantNoEffort bool
+	}{
+		{
+			name:         "Opus 5 forced high explicitly disables default thinking",
+			model:        "claude-opus-5",
+			payload:      `{"output_config":{"effort":"high"},"tool_choice":{"type":"any"}}`,
+			wantDisabled: true,
+			wantEffort:   "high",
+		},
+		{
+			name:         "Opus 5 forced choice uses safe default high",
+			model:        "claude-opus-5",
+			payload:      `{"tool_choice":{"type":"tool","name":"lookup"}}`,
+			wantDisabled: true,
+			wantNoEffort: true,
+		},
+		{
+			name:      "Opus 5 forced xhigh fails closed",
+			model:     "claude-opus-5",
+			payload:   `{"output_config":{"effort":"xhigh"},"tool_choice":{"type":"any"}}`,
+			wantError: "cannot disable thinking at effort \"xhigh\"",
+		},
+		{
+			name:      "Opus 5 explicit disabled max fails closed",
+			model:     "claude-opus-5",
+			payload:   `{"thinking":{"type":"disabled"},"output_config":{"effort":"max"}}`,
+			wantError: "cannot disable thinking at effort \"max\"",
+		},
+		{
+			name:         "Sonnet 5 explicit disabled max is allowed",
+			model:        "claude-sonnet-5",
+			payload:      `{"thinking":{"type":"disabled"},"output_config":{"effort":"max"}}`,
+			wantDisabled: true,
+			wantEffort:   "max",
+		},
+		{
+			name:      "Fable 5 forced choice fails because thinking is always on",
+			model:     "claude-fable-5",
+			payload:   `{"tool_choice":{"type":"any"}}`,
+			wantError: "thinking is always on",
+		},
+		{
+			name:      "Fable 5 explicit disable fails closed",
+			model:     "claude-fable-5",
+			payload:   `{"thinking":{"type":"disabled"}}`,
+			wantError: "does not allow thinking to be disabled",
+		},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			out, err := prepareClaudeThinkingForUpstream([]byte(testCase.payload), testCase.model)
+			if testCase.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+					t.Fatalf("error = %v, want substring %q; body=%s", err, testCase.wantError, out)
+				}
+				status, ok := err.(interface{ StatusCode() int })
+				if !ok || status.StatusCode() != http.StatusBadRequest {
+					t.Fatalf("error status = %v, want %d", err, http.StatusBadRequest)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("prepareClaudeThinkingForUpstream() error = %v", err)
+			}
+			if got := gjson.GetBytes(out, "thinking.type").String(); testCase.wantDisabled && got != "disabled" {
+				t.Fatalf("thinking.type = %q, want disabled; body=%s", got, out)
+			}
+			if testCase.wantEffort != "" {
+				if got := gjson.GetBytes(out, "output_config.effort").String(); got != testCase.wantEffort {
+					t.Fatalf("output_config.effort = %q, want %q; body=%s", got, testCase.wantEffort, out)
+				}
+			}
+			if testCase.wantNoEffort && gjson.GetBytes(out, "output_config.effort").Exists() {
+				t.Fatalf("output_config.effort should remain omitted; body=%s", out)
+			}
+		})
+	}
+}
+
+func TestClaudeExecutor_ExecuteDirectOpus5ForcedToolChoiceUsesExplicitDisabled(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_opus5","type":"message","model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{
+		"max_tokens":128,
+		"messages":[{"role":"user","content":"use lookup"}],
+		"tools":[{"name":"lookup","description":"lookup","input_schema":{"type":"object"}}],
+		"tool_choice":{"type":"any"},
+		"output_config":{"effort":"medium"}
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected direct Claude request to reach the test upstream")
+	}
+	if got := gjson.GetBytes(seenBody, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled; body=%s", got, seenBody)
+	}
+	if got := gjson.GetBytes(seenBody, "output_config.effort").String(); got != "medium" {
+		t.Fatalf("output_config.effort = %q, want medium; body=%s", got, seenBody)
+	}
+}
+
+func TestClaudeExecutor_ExecuteDirectOpus5ForcedXHighDoesNotCallUpstream(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{
+		"max_tokens":128,
+		"messages":[{"role":"user","content":"use lookup"}],
+		"tools":[{"name":"lookup","description":"lookup","input_schema":{"type":"object"}}],
+		"tool_choice":{"type":"tool","name":"lookup"},
+		"output_config":{"effort":"xhigh"}
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err == nil || !strings.Contains(err.Error(), `cannot disable thinking at effort "xhigh"`) {
+		t.Fatalf("Execute() error = %v, want Opus 5 disable-cap error", err)
+	}
+	if calls != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls)
 	}
 }
 

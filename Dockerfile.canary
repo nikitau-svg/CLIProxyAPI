@@ -26,12 +26,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     cd /app/plugins/bravo/go && \
     go mod download && \
     CGO_ENABLED=1 GOOS=linux go build -buildvcs=false -buildmode=c-shared \
-    -o /app/bravo-v0.5.0.so .
+    -o /app/bravo.so .
 
 # Keep the exact canary runtime layer and replace only the patched binary.
 FROM eceasy/cli-proxy-api@sha256:5f261f6ca5505fbe4ba0bc30cc615a4d3925c99ad6ae686411e43cf32135bb5d
 
 COPY --from=builder /app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
 COPY --from=builder /app/cliproxy-healthcheck /CLIProxyAPI/cliproxy-healthcheck
-COPY --from=builder /app/bravo-v0.5.0.so /CLIProxyAPI/plugin-dist/bravo-v0.5.0.so
+COPY --from=builder /app/bravo.so /CLIProxyAPI/plugin-dist/bravo.so
 COPY .canary-dist/management.html /CLIProxyAPI/static/management.html

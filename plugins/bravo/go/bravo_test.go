@@ -20,7 +20,7 @@ func TestDefaultConfigCoversConnectedGeneralModels(t *testing.T) {
 	}
 	expected := []string{
 		"frontier", "deep", "balanced", "fast", "auto",
-		"claude-fable-5", "claude-sonnet-5", "claude-opus-4-8",
+		"claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8",
 		"claude-3-5-haiku-20241022",
 		"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
 		"gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
@@ -64,8 +64,8 @@ func TestDefaultSmartRoutesPairOnlyCrossProviderEquivalents(t *testing.T) {
 	t.Parallel()
 	cfg := defaultPluginConfig()
 	expected := map[string][]string{
-		"opus":   {"claude/claude-opus-4-8", "codex/gpt-5.6-sol"},
-		"sol":    {"codex/gpt-5.6-sol", "claude/claude-opus-4-8"},
+		"opus":   {"claude/claude-opus-5", "codex/gpt-5.6-sol"},
+		"sol":    {"codex/gpt-5.6-sol", "claude/claude-opus-5"},
 		"sonnet": {"claude/claude-sonnet-5", "codex/gpt-5.6-terra"},
 		"terra":  {"codex/gpt-5.6-terra", "claude/claude-sonnet-5"},
 		"haiku":  {"claude/claude-haiku-4-5-20251001", "codex/gpt-5.6-luna"},

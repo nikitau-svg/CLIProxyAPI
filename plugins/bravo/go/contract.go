@@ -316,12 +316,42 @@ func resolveCandidateContract(item candidate, contract requestCapabilityContract
 	if normalizeContractProvider(item.Provider) == "claude" &&
 		contract.ForcedToolChoice &&
 		!contract.Effort.Specified {
+		if errVerify := verifyClaudeForcedToolDisableSupport(item, contract); errVerify != nil {
+			return candidate{}, errVerify
+		}
 		item.Effort = ""
 	}
 	if errVerify := verifyCandidateContract(item, contract); errVerify != nil {
 		return candidate{}, errVerify
 	}
 	return resolveCandidateEffort(item, contract.Effort)
+}
+
+func verifyClaudeForcedToolDisableSupport(item candidate, contract requestCapabilityContract) error {
+	baseModel := strings.TrimSpace(thinking.ParseSuffix(item.Model).ModelName)
+	modelInfo := registry.LookupModelInfo(baseModel, normalizeProvider(item.Provider))
+	if modelInfo == nil {
+		return &capabilityContractError{
+			Code:       "bravo_contract_unverified",
+			Provider:   "claude",
+			Protocol:   contract.Protocol,
+			Capability: capabilityTools,
+			Message:    fmt.Sprintf("candidate claude/%s has no verified forced-tool thinking policy", baseModel),
+		}
+	}
+	if modelInfo.Thinking == nil || !modelInfo.Thinking.DefaultOn {
+		return nil
+	}
+	if modelInfo.Thinking.ZeroAllowed {
+		return nil
+	}
+	return &capabilityContractError{
+		Code:       "bravo_capability_conflict",
+		Provider:   "claude",
+		Protocol:   contract.Protocol,
+		Capability: capabilityTools,
+		Message:    fmt.Sprintf("candidate claude/%s keeps thinking enabled and cannot execute a forced tool choice", baseModel),
+	}
 }
 
 func verifyCandidateContract(item candidate, contract requestCapabilityContract) error {

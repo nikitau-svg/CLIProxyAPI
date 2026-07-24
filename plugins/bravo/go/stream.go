@@ -246,7 +246,7 @@ func forwardCandidateStream(ctx context.Context, hostStreamID, pluginStreamID, p
 
 func streamChunkFailure(chunk pluginapi.HostModelStreamReadResponse) executionFailure {
 	if detail := chunk.ErrorDetail; detail != nil {
-		return executionFailure{
+		failure := executionFailure{
 			Code:       firstNonEmpty(detail.Code, "bravo_host_stream_error"),
 			Message:    firstNonEmpty(detail.Message, chunk.Error),
 			Status:     firstPositive(detail.HTTPStatus, http.StatusBadGateway),
@@ -254,13 +254,14 @@ func streamChunkFailure(chunk pluginapi.HostModelStreamReadResponse) executionFa
 			Headers:    cloneHeader(detail.Headers),
 			RetryAfter: firstNonEmpty(detail.RetryAfter, detail.Headers.Get("Retry-After")),
 		}
+		return classifyProviderFailureSignal(failure, detail.Code, detail.Message, chunk.Error)
 	}
-	return executionFailure{
+	return classifyProviderFailureSignal(executionFailure{
 		Code:      "bravo_host_stream_error",
 		Message:   chunk.Error,
 		Status:    http.StatusBadGateway,
 		Retryable: true,
-	}
+	}, chunk.Error)
 }
 
 func emitPluginStreamChunk(ctx context.Context, streamID string, payload []byte) error {

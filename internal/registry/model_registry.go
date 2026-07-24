@@ -99,6 +99,11 @@ type ThinkingSupport struct {
 	ZeroAllowed bool `json:"zero_allowed,omitempty" yaml:"zero-allowed,omitempty"`
 	// DynamicAllowed indicates whether -1 is a valid value (dynamic thinking budget).
 	DynamicAllowed bool `json:"dynamic_allowed,omitempty" yaml:"dynamic-allowed,omitempty"`
+	// DefaultOn indicates that omitting the thinking field enables provider-managed thinking.
+	DefaultOn bool `json:"default_on,omitempty" yaml:"default-on,omitempty"`
+	// MaxDisableLevel is the highest named effort at which thinking may be disabled.
+	// An empty value means that disabling is not effort-dependent.
+	MaxDisableLevel string `json:"max_disable_level,omitempty" yaml:"max-disable-level,omitempty"`
 	// Levels defines discrete reasoning effort levels (e.g., "low", "medium", "high").
 	// When set, the model uses level-based reasoning instead of token budgets.
 	Levels []string `json:"levels,omitempty" yaml:"levels,omitempty"`

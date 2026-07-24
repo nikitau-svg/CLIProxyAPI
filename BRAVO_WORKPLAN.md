@@ -24,6 +24,17 @@ the decisions survive across sessions.
   organization/workspace identity.
 - Limit state must distinguish provider-confirmed reset, inferred cooldown,
   and unknown.
+- Provider account exhaustion must be classified by both HTTP status and
+  reviewed provider error signals. Anthropic can return exhausted extra usage
+  as HTTP 400 `invalid_request_error`; that account-level condition must retry
+  the next subscription/provider while ordinary malformed-request 400s remain
+  terminal.
+- The integrated admin UI must expose a model compatibility/update center.
+  Newly discovered provider models are never silently promoted into Bravo:
+  the operator sees whether the current host, plugin, contract matrix, and
+  route policy support them, exactly what is missing, and whether adopting the
+  model needs only a signed catalog/policy update or a rebuilt CLIProxyAPI
+  image.
 - The production listener stays unchanged until a canary passes.
 
 ## Implemented in this branch
@@ -62,6 +73,11 @@ the decisions survive across sessions.
 - Deterministic candidate/account plan with pinned auth and one-attempt core
   controls.
 - Structured non-stream and stream errors with `Retry-After`.
+- Semantic account-quota retry classification. Anthropic's HTTP 400
+  `out of extra usage` signal is converted to
+  `bravo_subscription_quota_exhausted`, so the same client call can continue
+  through another Claude account and then a mapped Codex candidate; unrelated
+  invalid-request 400s remain terminal.
 - No stream fallback after the first client-visible payload.
 - OpenAI Chat, OpenAI Responses, and Anthropic Messages request-contract
   detection.
@@ -124,11 +140,40 @@ the decisions survive across sessions.
 - Claude sampling fields are preserved when thinking is absent. When thinking
   is active, unsupported `temperature`, `top_p`, or `top_k` combinations are
   rejected synchronously instead of being silently removed.
+- Pinned Claude Opus 5, Sonnet 5, and Fable 5 model-contract overlays protect
+  the runtime when the remotely refreshed catalog is missing or incomplete.
+  Default-on and always-on thinking, forced-tool disable rules, named effort,
+  and sampling restrictions are validated before the upstream request.
+- Authenticated compatibility endpoint plus a compact, collapsed Management
+  UI advisor. It compares the static/live host catalog, reviewed Bravo
+  profiles, effective YAML model map, and logical routes; reports
+  code/YAML/route fixes with exact targets and snippets; and never applies a
+  suggestion automatically.
 - Synchronous stream capability preflight, so unsupported streaming requests
   return a precise 422 before any upstream call.
 - Linux/arm64 shared-plugin build in the canary Dockerfile.
 
-## Reference release evidence
+## Bravo 0.6 source and canary evidence
+
+- Full CLIProxyAPI `go test ./... -count=1` passed after the Opus 5,
+  compatibility-advisor, and semantic failover changes.
+- Full Bravo `go test -race ./... -count=1` and `go vet ./...` passed.
+- Exact Bun 1.3.14 release container passed 88 WebUI tests, ESLint, TypeScript,
+  and the single-file production build.
+- Isolated zero-credential canary passed plugin status, compatibility,
+  Opus-5-to-Sol routes, project create/redaction/patch/rotate/delete, and
+  analytics schema-v2 management smoke checks.
+- Unit/integration coverage proves Claude HTTP 400 quota exhaustion and
+  reviewed 400/422 model-entitlement failures continue to Codex, while
+  malformed request/schema/contract failures remain terminal.
+- Chrome/Playwright desktop and 400 px mobile QA passed with all disclosures
+  closed by default, working compatibility search/filter/details, and no
+  horizontal overflow.
+- The AWS clean installer follows `bravo/stable` plus a tracked
+  `deploy/aws/release.env`; a release tag is optional and never required for a
+  fresh install.
+
+## Historical 0.5 reference release evidence
 
 - CLI image: `cliproxyapi-local:v7.2.94-bravo-native0.5.0`
 - Image digest:
@@ -178,7 +223,7 @@ the decisions survive across sessions.
 - Smart-key scope and ordinary-key non-interference.
 - Chrome/Playwright desktop and narrow-viewport dashboard review.
 
-Completed source/build evidence for 0.5.0:
+Historical completed source/build evidence for 0.5.0:
 
 - Full repository `go test -count=1 -timeout=10m ./...`.
 - Focused host/plugin race tests, full Bravo race suite, and `go vet`.
@@ -263,6 +308,10 @@ Historical 0.2.1 conformance baseline:
 
 ## Next allocator/product increments
 
+- Signed release-feed/GHCR delivery on top of the implemented compatibility
+  advisor, so the UI can link a required code fix to a ready canary image and
+  release notes. Binary updates remain operator-approved and pass through the
+  canary/rollback gate rather than modifying production in place.
 - Per-project route overrides on top of the current global hot route editor.
 - operator-defined per-project budgets, rate caps, and alerts;
 - explicit fairness debt/credit so intermittent users stay responsive under

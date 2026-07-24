@@ -113,7 +113,7 @@ func execute(raw []byte) ([]byte, error) {
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
-			failure := classifyHTTPFailure(response.StatusCode, response.Headers, "candidate returned an HTTP error")
+			failure := classifyHTTPFailure(response.StatusCode, response.Headers, "candidate returned an HTTP error", response.Body)
 			recordExecutionAttempt(attempt, started, response.StatusCode, false, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
@@ -274,15 +274,15 @@ func classifyExecutionError(err error) executionFailure {
 		if status == 0 {
 			status = http.StatusBadGateway
 		}
-		retryable := hostErr.Retryable || retryableHTTPStatus(status)
-		return executionFailure{
+		failure := executionFailure{
 			Code:       firstNonEmpty(hostErr.Code, "bravo_host_call_failed"),
 			Message:    hostErr.Message,
 			Status:     status,
-			Retryable:  retryable,
+			Retryable:  hostErr.Retryable || retryableHTTPStatus(status),
 			Headers:    cloneHeader(hostErr.Headers),
 			RetryAfter: firstNonEmpty(hostErr.RetryAfter, hostErr.Headers.Get("Retry-After")),
 		}
+		return classifyProviderFailureSignal(failure, hostErr.Code, hostErr.Message)
 	}
 	return executionFailure{
 		Code:      "bravo_host_call_failed",
@@ -292,8 +292,8 @@ func classifyExecutionError(err error) executionFailure {
 	}
 }
 
-func classifyHTTPFailure(status int, headers http.Header, message string) executionFailure {
-	return executionFailure{
+func classifyHTTPFailure(status int, headers http.Header, message string, responseBody ...[]byte) executionFailure {
+	failure := executionFailure{
 		Code:       "bravo_candidate_http_error",
 		Message:    fmt.Sprintf("%s (%d)", message, status),
 		Status:     status,
@@ -301,6 +301,104 @@ func classifyHTTPFailure(status int, headers http.Header, message string) execut
 		Headers:    cloneHeader(headers),
 		RetryAfter: headers.Get("Retry-After"),
 	}
+	for _, body := range responseBody {
+		failure = classifyProviderFailureSignal(failure, string(body))
+	}
+	return failure
+}
+
+// Authentication and access failures returned by an upstream model call are
+// scoped to the pinned subscription. Bravo can safely continue with the next
+// credential/provider because the client request has already passed the local
+// request-contract checks. A provider-side HTTP 400 or 422 remains terminal
+// unless it carries one of the reviewed quota or model-entitlement signals
+// below.
+func classifyProviderFailureSignal(failure executionFailure, values ...string) executionFailure {
+	switch failure.Status {
+	case http.StatusUnauthorized:
+		failure.Code = "bravo_subscription_auth_unavailable"
+		failure.Retryable = true
+		return failure
+	case http.StatusForbidden:
+		failure.Code = "bravo_subscription_access_denied"
+		failure.Retryable = true
+		return failure
+	}
+
+	failure = classifyProviderQuotaSignal(failure, values...)
+	if failure.Code == "bravo_subscription_quota_exhausted" {
+		return failure
+	}
+	if (failure.Status == http.StatusBadRequest || failure.Status == http.StatusUnprocessableEntity) &&
+		providerModelEntitlementSignal(values...) {
+		failure.Code = "bravo_subscription_model_unavailable"
+		failure.Retryable = true
+	}
+	return failure
+}
+
+// Some subscription-backed providers report account exhaustion as a generic
+// HTTP 400 invalid_request_error. These exact account-level signals are safe to
+// retry on another credential or provider; ordinary malformed-request 400s
+// remain terminal so Bravo never hides a client contract error.
+func classifyProviderQuotaSignal(failure executionFailure, values ...string) executionFailure {
+	for _, value := range values {
+		if !providerQuotaSignal(value) {
+			continue
+		}
+		failure.Code = "bravo_subscription_quota_exhausted"
+		failure.Retryable = true
+		return failure
+	}
+	return failure
+}
+
+func providerQuotaSignal(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return false
+	}
+	for _, signal := range []string{
+		"out of extra usage",
+		"extra usage is disabled",
+		"extra usage limit",
+		"reached your usage limit",
+		"usage limit has been reached",
+	} {
+		if strings.Contains(value, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+// Keep this list aligned with the host's reviewed model-support classification.
+// Do not add broad words such as "invalid model": malformed model fields are
+// request-scoped and must remain terminal.
+func providerModelEntitlementSignal(values ...string) bool {
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		for _, signal := range []string{
+			"model_not_supported",
+			"requested model is not supported",
+			"requested model is unsupported",
+			"requested model is unavailable",
+			"model is not supported",
+			"model not supported",
+			"unsupported model",
+			"model unavailable",
+			"not available for your plan",
+			"not available for your account",
+		} {
+			if strings.Contains(value, signal) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func retryableHTTPStatus(status int) bool {

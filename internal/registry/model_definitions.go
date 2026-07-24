@@ -7,6 +7,9 @@ import (
 )
 
 const (
+	claudeBuiltinOpus5ModelID       = "claude-opus-5"
+	claudeBuiltinSonnet5ModelID     = "claude-sonnet-5"
+	claudeBuiltinFable5ModelID      = "claude-fable-5"
 	codexBuiltinImage15ModelID      = "gpt-image-1.5"
 	codexBuiltinImageModelID        = "gpt-image-2"
 	xaiBuiltinImageModelID          = "grok-imagine-image"
@@ -32,7 +35,7 @@ type staticModelsJSON struct {
 
 // GetClaudeModels returns the standard Claude model definitions.
 func GetClaudeModels() []*ModelInfo {
-	return cloneModelInfos(getModels().Claude)
+	return WithClaudeBuiltins(cloneModelInfos(getModels().Claude))
 }
 
 // GetGeminiModels returns the standard Gemini model definitions.
@@ -117,6 +120,19 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 	return upsertModelInfos(models, codexBuiltinImage15ModelInfo(), codexBuiltinImageModelInfo())
 }
 
+// WithClaudeBuiltins injects contract-sensitive Claude definitions that must
+// remain available even while the remote model catalog catches up. Built-ins
+// replace matching remote IDs so incomplete capability metadata cannot weaken
+// request validation.
+func WithClaudeBuiltins(models []*ModelInfo) []*ModelInfo {
+	return upsertModelInfos(
+		models,
+		claudeBuiltinOpus5ModelInfo(),
+		claudeBuiltinSonnet5ModelInfo(),
+		claudeBuiltinFable5ModelInfo(),
+	)
+}
+
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
 // not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
@@ -129,6 +145,65 @@ func normalizeAntigravityCapabilityModelID(modelID string) string {
 		modelID = strings.TrimSpace(modelID[:open])
 	}
 	return modelID
+}
+
+func claudeBuiltinOpus5ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  claudeBuiltinOpus5ModelID,
+		Object:              "model",
+		OwnedBy:             "anthropic",
+		Type:                "claude",
+		DisplayName:         "Claude Opus 5",
+		Description:         "Anthropic's Opus model for complex coding and long-horizon agentic work",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			ZeroAllowed:     true,
+			DynamicAllowed:  true,
+			DefaultOn:       true,
+			MaxDisableLevel: "high",
+			Levels:          []string{"low", "medium", "high", "xhigh", "max"},
+		},
+	}
+}
+
+func claudeBuiltinSonnet5ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  claudeBuiltinSonnet5ModelID,
+		Object:              "model",
+		Created:             1782777600,
+		OwnedBy:             "anthropic",
+		Type:                "claude",
+		DisplayName:         "Claude Sonnet 5",
+		Description:         "Anthropic's agentic Sonnet model for coding, tool use, and enterprise workflows",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			ZeroAllowed:    true,
+			DynamicAllowed: true,
+			DefaultOn:      true,
+			Levels:         []string{"low", "medium", "high", "xhigh", "max"},
+		},
+	}
+}
+
+func claudeBuiltinFable5ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  claudeBuiltinFable5ModelID,
+		Object:              "model",
+		Created:             1781049600,
+		OwnedBy:             "anthropic",
+		Type:                "claude",
+		DisplayName:         "Claude Fable 5",
+		Description:         "Anthropic's most capable widely released model, for the most demanding reasoning and long-horizon agentic work",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 128000,
+		Thinking: &ThinkingSupport{
+			DynamicAllowed: true,
+			DefaultOn:      true,
+			Levels:         []string{"low", "medium", "high", "xhigh", "max"},
+		},
+	}
 }
 
 func codexBuiltinImage15ModelInfo() *ModelInfo {
@@ -310,7 +385,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 
 	data := getModels()
 	allModels := [][]*ModelInfo{
-		data.Claude,
+		WithClaudeBuiltins(cloneModelInfos(data.Claude)),
 		data.Gemini,
 		data.Vertex,
 		data.AIStudio,

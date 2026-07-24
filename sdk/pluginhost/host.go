@@ -301,11 +301,13 @@ func thinkingSupportToPlugin(thinking *internalregistry.ThinkingSupport) *Thinki
 		return nil
 	}
 	return &ThinkingSupport{
-		Min:            thinking.Min,
-		Max:            thinking.Max,
-		ZeroAllowed:    thinking.ZeroAllowed,
-		DynamicAllowed: thinking.DynamicAllowed,
-		Levels:         cloneStringSlice(thinking.Levels),
+		Min:             thinking.Min,
+		Max:             thinking.Max,
+		ZeroAllowed:     thinking.ZeroAllowed,
+		DynamicAllowed:  thinking.DynamicAllowed,
+		DefaultOn:       thinking.DefaultOn,
+		MaxDisableLevel: thinking.MaxDisableLevel,
+		Levels:          cloneStringSlice(thinking.Levels),
 	}
 }
 

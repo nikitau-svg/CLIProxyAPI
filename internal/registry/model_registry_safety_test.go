@@ -162,7 +162,8 @@ func TestLookupModelInfoIncludesClaudeSonnet5(t *testing.T) {
 	if model.MaxCompletionTokens != 128000 {
 		t.Fatalf("Claude Sonnet 5 max completion tokens = %d, want 128000", model.MaxCompletionTokens)
 	}
-	if model.Thinking == nil || !model.Thinking.ZeroAllowed || !model.Thinking.DynamicAllowed || model.Thinking.Min != 0 || model.Thinking.Max != 0 {
+	if model.Thinking == nil || !model.Thinking.ZeroAllowed || !model.Thinking.DynamicAllowed || !model.Thinking.DefaultOn ||
+		model.Thinking.Min != 0 || model.Thinking.Max != 0 {
 		t.Fatalf("expected Claude Sonnet 5 dynamic level-only thinking with zero allowed, got %+v", model.Thinking)
 	}
 	expectedLevels := []string{"low", "medium", "high", "xhigh", "max"}
@@ -172,6 +173,32 @@ func TestLookupModelInfoIncludesClaudeSonnet5(t *testing.T) {
 	for i, level := range expectedLevels {
 		if model.Thinking.Levels[i] != level {
 			t.Fatalf("Claude Sonnet 5 thinking levels = %+v, want %+v", model.Thinking.Levels, expectedLevels)
+		}
+	}
+}
+
+func TestLookupModelInfoIncludesClaudeOpus5WithoutGuessedTimestamp(t *testing.T) {
+	model := LookupModelInfo("claude-opus-5")
+	if model == nil {
+		t.Fatal("expected Claude Opus 5 static model")
+	}
+	if model.Created != 0 {
+		t.Fatalf("Claude Opus 5 created = %d, want 0 until an official release timestamp is recorded", model.Created)
+	}
+	if model.ContextLength != 1000000 || model.MaxCompletionTokens != 128000 {
+		t.Fatalf("Claude Opus 5 limits = context %d output %d, want 1000000/128000", model.ContextLength, model.MaxCompletionTokens)
+	}
+	if model.Thinking == nil || !model.Thinking.DefaultOn || !model.Thinking.ZeroAllowed ||
+		!model.Thinking.DynamicAllowed || model.Thinking.MaxDisableLevel != "high" {
+		t.Fatalf("Claude Opus 5 thinking policy = %+v", model.Thinking)
+	}
+	expectedLevels := []string{"low", "medium", "high", "xhigh", "max"}
+	if len(model.Thinking.Levels) != len(expectedLevels) {
+		t.Fatalf("Claude Opus 5 thinking levels = %+v, want %+v", model.Thinking.Levels, expectedLevels)
+	}
+	for i, level := range expectedLevels {
+		if model.Thinking.Levels[i] != level {
+			t.Fatalf("Claude Opus 5 thinking levels = %+v, want %+v", model.Thinking.Levels, expectedLevels)
 		}
 	}
 }

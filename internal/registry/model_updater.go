@@ -364,6 +364,27 @@ func validateModelSection(section string, models []*ModelInfo) error {
 			return fmt.Errorf("%s contains duplicate model id %q", section, modelID)
 		}
 		seen[modelID] = struct{}{}
+
+		if model.Thinking == nil {
+			continue
+		}
+		maxDisableLevel := strings.TrimSpace(model.Thinking.MaxDisableLevel)
+		if maxDisableLevel == "" {
+			continue
+		}
+		if !model.Thinking.ZeroAllowed {
+			return fmt.Errorf("%s[%d] model %q sets max_disable_level but does not allow disabling thinking", section, i, modelID)
+		}
+		levelFound := false
+		for _, level := range model.Thinking.Levels {
+			if strings.EqualFold(strings.TrimSpace(level), maxDisableLevel) {
+				levelFound = true
+				break
+			}
+		}
+		if !levelFound {
+			return fmt.Errorf("%s[%d] model %q max_disable_level %q is not listed in thinking levels", section, i, modelID, maxDisableLevel)
+		}
 	}
 	return nil
 }

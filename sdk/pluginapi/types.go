@@ -181,6 +181,11 @@ type ThinkingSupport struct {
 	ZeroAllowed bool
 	// DynamicAllowed reports whether automatic reasoning budget selection is supported.
 	DynamicAllowed bool
+	// DefaultOn reports whether omitting the thinking field enables provider-managed thinking.
+	DefaultOn bool
+	// MaxDisableLevel is the highest named effort at which thinking may be disabled.
+	// An empty value means that disabling is not effort-dependent.
+	MaxDisableLevel string
 	// Levels lists supported named reasoning levels.
 	Levels []string
 }
@@ -680,6 +685,46 @@ type HostModelExecutionError struct {
 type HostModelStreamCloseRequest struct {
 	// StreamID identifies the host-owned stream.
 	StreamID string `json:"stream_id"`
+}
+
+// HostModelListRequest asks the host for a redacted snapshot of its reviewed
+// model catalog and models currently supplied by connected providers.
+type HostModelListRequest struct {
+	// HostCallbackID restores the authenticated management request context.
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// HostModelListEntry is provider-specific, redacted model metadata from the
+// host catalog and live registry. It intentionally contains no credential
+// identifiers or credential counts.
+type HostModelListEntry struct {
+	// Provider is the host provider identifier that supplies the model.
+	Provider string `json:"provider"`
+	// ID is the provider-native model identifier.
+	ID string `json:"id"`
+	// DisplayName is the optional user-facing model name.
+	DisplayName string `json:"display_name,omitempty"`
+	// Type is the registry model capability family.
+	Type string `json:"type,omitempty"`
+	// SupportedParameters lists parameters advertised by the host registry.
+	SupportedParameters []string `json:"supported_parameters,omitempty"`
+	// SupportedInputModalities lists accepted input modalities.
+	SupportedInputModalities []string `json:"supported_input_modalities,omitempty"`
+	// SupportedOutputModalities lists produced output modalities.
+	SupportedOutputModalities []string `json:"supported_output_modalities,omitempty"`
+	// Thinking describes reasoning controls advertised by the host registry.
+	Thinking *ThinkingSupport `json:"thinking,omitempty"`
+	// Catalog reports whether the model exists in the host's reviewed static
+	// catalog. A live-only model can be Available while Catalog is false.
+	Catalog bool `json:"catalog"`
+	// Available reports whether at least one connected provider currently
+	// advertises the model. It does not expose how many credentials do so.
+	Available bool `json:"available"`
+}
+
+// HostModelListResponse contains a deterministic provider/model snapshot.
+type HostModelListResponse struct {
+	Models []HostModelListEntry `json:"models"`
 }
 
 type HostRecentRequestEntry struct {

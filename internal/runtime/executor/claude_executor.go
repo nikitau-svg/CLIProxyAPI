@@ -311,8 +311,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = ensureModelMaxTokens(body, baseModel)
 
-	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
-	body = disableThinkingIfToolChoiceForced(body)
+	body, err = prepareClaudeThinkingForUpstream(body, upstreamModel)
+	if err != nil {
+		return resp, err
+	}
 	if err = validateClaudeSamplingForUpstream(body, upstreamModel); err != nil {
 		return resp, err
 	}
@@ -508,8 +510,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = ensureModelMaxTokens(body, baseModel)
 
-	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
-	body = disableThinkingIfToolChoiceForced(body)
+	body, err = prepareClaudeThinkingForUpstream(body, upstreamModel)
+	if err != nil {
+		return nil, err
+	}
 	if err = validateClaudeSamplingForUpstream(body, upstreamModel); err != nil {
 		return nil, err
 	}
@@ -954,23 +958,122 @@ func extractAndRemoveBetas(body []byte) ([]string, []byte) {
 	return betas, body
 }
 
-// disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
-// Anthropic API does not allow thinking when tool_choice is set to "any" or a specific tool.
-// See: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#important-considerations
-func disableThinkingIfToolChoiceForced(body []byte) []byte {
-	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
-	// "auto" is allowed with thinking, but "any" or "tool" (specific tool) are not
-	if toolChoiceType == "any" || toolChoiceType == "tool" {
-		// Remove thinking configuration entirely to avoid API error
+// prepareClaudeThinkingForUpstream enforces the final thinking/tool-choice
+// contract after translation and payload overrides. Forced tool choices require
+// thinking to be disabled. Off-by-default models can omit thinking as before;
+// default-on models must receive an explicit disabled object, and requests that
+// cannot disable at their effective effort fail before any upstream call.
+func prepareClaudeThinkingForUpstream(body []byte, model string) ([]byte, error) {
+	info := registry.LookupModelInfo(strings.TrimSpace(model), "claude")
+	defaultOn := info != nil && info.Thinking != nil && info.Thinking.DefaultOn
+	toolChoiceType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "tool_choice.type").String()))
+	forcedToolChoice := toolChoiceType == "any" || toolChoiceType == "tool"
+
+	if !defaultOn {
+		if !forcedToolChoice {
+			return body, nil
+		}
 		body, _ = sjson.DeleteBytes(body, "thinking")
-		// Adaptive thinking may also set output_config.effort; remove it to avoid
-		// leaking thinking controls when tool_choice forces tool use.
 		body, _ = sjson.DeleteBytes(body, "output_config.effort")
 		if oc := gjson.GetBytes(body, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
 			body, _ = sjson.DeleteBytes(body, "output_config")
 		}
+		return body, nil
 	}
-	return body
+
+	var effort string
+	var err error
+	body, effort, err = normalizeClaudeDefaultOnEffort(body, info)
+	if err != nil {
+		return body, err
+	}
+
+	if forcedToolChoice {
+		if !info.Thinking.ZeroAllowed {
+			return body, newClaudeRequestValidationError(
+				fmt.Sprintf("%s cannot use forced tool_choice because thinking is always on", info.ID),
+			)
+		}
+		if !claudeThinkingCanBeDisabledAtEffort(info.Thinking, effort) {
+			return body, newClaudeRequestValidationError(
+				fmt.Sprintf("%s cannot disable thinking at effort %q; maximum supported disable effort is %q", info.ID, effort, info.Thinking.MaxDisableLevel),
+			)
+		}
+		body, _ = sjson.SetRawBytes(body, "thinking", []byte(`{"type":"disabled"}`))
+	}
+
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()), "disabled") {
+		if !info.Thinking.ZeroAllowed {
+			return body, newClaudeRequestValidationError(
+				fmt.Sprintf("%s does not allow thinking to be disabled", info.ID),
+			)
+		}
+		if !claudeThinkingCanBeDisabledAtEffort(info.Thinking, effort) {
+			return body, newClaudeRequestValidationError(
+				fmt.Sprintf("%s cannot disable thinking at effort %q; maximum supported disable effort is %q", info.ID, effort, info.Thinking.MaxDisableLevel),
+			)
+		}
+	}
+
+	return body, nil
+}
+
+func normalizeClaudeDefaultOnEffort(body []byte, info *registry.ModelInfo) ([]byte, string, error) {
+	const defaultEffort = "high"
+
+	effortResult := gjson.GetBytes(body, "output_config.effort")
+	if !effortResult.Exists() {
+		return body, defaultEffort, nil
+	}
+	if effortResult.Type != gjson.String {
+		return body, "", newClaudeRequestValidationError("output_config.effort must be a string")
+	}
+	effort := strings.ToLower(strings.TrimSpace(effortResult.String()))
+	if effort == "" || info == nil || info.Thinking == nil || !thinking.HasLevel(info.Thinking.Levels, effort) {
+		modelID := "Claude model"
+		if info != nil && strings.TrimSpace(info.ID) != "" {
+			modelID = strings.TrimSpace(info.ID)
+		}
+		return body, "", newClaudeRequestValidationError(
+			fmt.Sprintf("output_config.effort %q is not supported by %s", effort, modelID),
+		)
+	}
+	if effort != effortResult.String() {
+		body, _ = sjson.SetBytes(body, "output_config.effort", effort)
+	}
+	return body, effort, nil
+}
+
+func claudeThinkingCanBeDisabledAtEffort(support *registry.ThinkingSupport, effort string) bool {
+	if support == nil || !support.ZeroAllowed {
+		return false
+	}
+	maxDisableLevel := strings.ToLower(strings.TrimSpace(support.MaxDisableLevel))
+	if maxDisableLevel == "" {
+		return true
+	}
+	effortRank := claudeEffortRank(effort)
+	maxRank := claudeEffortRank(maxDisableLevel)
+	return effortRank >= 0 && maxRank >= 0 && effortRank <= maxRank
+}
+
+func claudeEffortRank(effort string) int {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal":
+		return 0
+	case "low":
+		return 1
+	case "medium":
+		return 2
+	case "high":
+		return 3
+	case "xhigh":
+		return 4
+	case "max":
+		return 5
+	default:
+		return -1
+	}
 }
 
 // validateClaudeSamplingForUpstream rejects sampling controls that Anthropic
@@ -1029,6 +1132,9 @@ func claudeModelUsesDefaultSamplingOnly(model string) bool {
 	info := registry.LookupModelInfo(strings.TrimSpace(model), "claude")
 	if info == nil {
 		return false
+	}
+	if info.Thinking != nil && info.Thinking.DefaultOn {
+		return true
 	}
 	return strings.EqualFold(info.Type, "claude") &&
 		info.Created >= claudeOpus47Created

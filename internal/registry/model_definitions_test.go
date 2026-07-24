@@ -50,6 +50,98 @@ func TestWithXAIBuiltinsIncludesVideoPreviewModel(t *testing.T) {
 	t.Fatalf("expected xAI builtin model %s", xaiBuiltinVideo15PreviewModelID)
 }
 
+func TestWithClaudeBuiltinsReplacesStaleContractMetadataWithoutDuplicates(t *testing.T) {
+	models := WithClaudeBuiltins([]*ModelInfo{
+		{ID: "remote-claude-model", Type: "claude"},
+		{
+			ID:                  claudeBuiltinOpus5ModelID,
+			Type:                "claude",
+			ContextLength:       1,
+			MaxCompletionTokens: 1,
+			Thinking:            &ThinkingSupport{},
+		},
+	})
+
+	seenOpus5 := 0
+	for _, model := range models {
+		if model == nil || model.ID != claudeBuiltinOpus5ModelID {
+			continue
+		}
+		seenOpus5++
+		if model.Created != 0 {
+			t.Fatalf("Claude Opus 5 created = %d, want 0 until an official release timestamp is recorded", model.Created)
+		}
+		if model.ContextLength != 1000000 || model.MaxCompletionTokens != 128000 {
+			t.Fatalf("Claude Opus 5 limits = context %d output %d, want 1000000/128000", model.ContextLength, model.MaxCompletionTokens)
+		}
+		if model.Thinking == nil || !model.Thinking.DefaultOn || !model.Thinking.ZeroAllowed ||
+			!model.Thinking.DynamicAllowed || model.Thinking.MaxDisableLevel != "high" {
+			t.Fatalf("Claude Opus 5 thinking policy = %+v", model.Thinking)
+		}
+	}
+	if seenOpus5 != 1 {
+		t.Fatalf("Claude Opus 5 entries = %d, want 1", seenOpus5)
+	}
+}
+
+func TestClaudeBuiltinsSurviveRemoteCatalogWithoutOpus5(t *testing.T) {
+	original := getModels()
+	modelsCatalogStore.mu.Lock()
+	modelsCatalogStore.data = &staticModelsJSON{
+		Claude: []*ModelInfo{{
+			ID:   "remote-only-claude-model",
+			Type: "claude",
+		}},
+	}
+	modelsCatalogStore.mu.Unlock()
+	t.Cleanup(func() {
+		modelsCatalogStore.mu.Lock()
+		modelsCatalogStore.data = original
+		modelsCatalogStore.mu.Unlock()
+	})
+
+	found := false
+	for _, model := range GetClaudeModels() {
+		if model != nil && model.ID == claudeBuiltinOpus5ModelID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("GetClaudeModels omitted pinned Claude Opus 5 after remote catalog replacement")
+	}
+
+	model := LookupStaticModelInfo(claudeBuiltinOpus5ModelID)
+	if model == nil || model.Thinking == nil || !model.Thinking.DefaultOn || model.Thinking.MaxDisableLevel != "high" {
+		t.Fatalf("LookupStaticModelInfo Claude Opus 5 = %+v", model)
+	}
+}
+
+func TestClaude5BuiltinThinkingPolicies(t *testing.T) {
+	tests := []struct {
+		modelID        string
+		zeroAllowed    bool
+		maxDisable     string
+		dynamicAllowed bool
+	}{
+		{modelID: claudeBuiltinOpus5ModelID, zeroAllowed: true, maxDisable: "high", dynamicAllowed: true},
+		{modelID: claudeBuiltinSonnet5ModelID, zeroAllowed: true, dynamicAllowed: true},
+		{modelID: claudeBuiltinFable5ModelID, zeroAllowed: false, dynamicAllowed: true},
+	}
+
+	for _, testCase := range tests {
+		model := LookupStaticModelInfo(testCase.modelID)
+		if model == nil || model.Thinking == nil {
+			t.Fatalf("%s static thinking metadata is missing", testCase.modelID)
+		}
+		if !model.Thinking.DefaultOn || model.Thinking.ZeroAllowed != testCase.zeroAllowed ||
+			model.Thinking.DynamicAllowed != testCase.dynamicAllowed ||
+			model.Thinking.MaxDisableLevel != testCase.maxDisable {
+			t.Fatalf("%s thinking policy = %+v", testCase.modelID, model.Thinking)
+		}
+	}
+}
+
 func TestAntigravityWebSearchModelForRequiresRequestedModelCapability(t *testing.T) {
 	registryRef := GetGlobalRegistry()
 	registryRef.RegisterClient("test-antigravity-websearch-route", "antigravity", []*ModelInfo{

@@ -158,11 +158,13 @@ func pluginThinkingSupportToRegistryThinkingSupport(thinking *pluginapi.Thinking
 		return nil
 	}
 	return &registry.ThinkingSupport{
-		Min:            thinking.Min,
-		Max:            thinking.Max,
-		ZeroAllowed:    thinking.ZeroAllowed,
-		DynamicAllowed: thinking.DynamicAllowed,
-		Levels:         cloneStringSlice(thinking.Levels),
+		Min:             thinking.Min,
+		Max:             thinking.Max,
+		ZeroAllowed:     thinking.ZeroAllowed,
+		DynamicAllowed:  thinking.DynamicAllowed,
+		DefaultOn:       thinking.DefaultOn,
+		MaxDisableLevel: thinking.MaxDisableLevel,
+		Levels:          cloneStringSlice(thinking.Levels),
 	}
 }
 
@@ -198,11 +200,13 @@ func registryThinkingSupportToPluginThinkingSupport(thinking *registry.ThinkingS
 		return nil
 	}
 	return &pluginapi.ThinkingSupport{
-		Min:            thinking.Min,
-		Max:            thinking.Max,
-		ZeroAllowed:    thinking.ZeroAllowed,
-		DynamicAllowed: thinking.DynamicAllowed,
-		Levels:         cloneStringSlice(thinking.Levels),
+		Min:             thinking.Min,
+		Max:             thinking.Max,
+		ZeroAllowed:     thinking.ZeroAllowed,
+		DynamicAllowed:  thinking.DynamicAllowed,
+		DefaultOn:       thinking.DefaultOn,
+		MaxDisableLevel: thinking.MaxDisableLevel,
+		Levels:          cloneStringSlice(thinking.Levels),
 	}
 }
 

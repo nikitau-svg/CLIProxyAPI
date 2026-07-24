@@ -1,6 +1,6 @@
 services:
   cli-proxy-api:
-    image: ${CLIPROXYAPI_IMAGE:-cliproxyapi-local:v7.2.94-bravo-native0.5.0}
+    image: ${CLIPROXYAPI_IMAGE:?missing CLIPROXYAPI_IMAGE in runtime .env}
     pull_policy: never
     container_name: CLIProxyAPI-Prod
     restart: unless-stopped

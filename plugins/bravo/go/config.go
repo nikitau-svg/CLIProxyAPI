@@ -39,7 +39,7 @@ func defaultPluginConfig() pluginConfig {
 			DisplayName: "Bravo Deep",
 			Description: "Deliberate reasoning pool, preferring Opus and Sol.",
 			Candidates: []candidate{
-				claude("claude-opus-4-8", "high", 100),
+				claude("claude-opus-5", "high", 100),
 				codex("gpt-5.6-sol", "high", 90),
 			},
 		},
@@ -63,7 +63,7 @@ func defaultPluginConfig() pluginConfig {
 			DisplayName: "Bravo Opus",
 			Description: "Opus subscriptions first, then the equivalent Sol pool.",
 			Candidates: []candidate{
-				claude("claude-opus-4-8", "high", 100),
+				claude("claude-opus-5", "high", 100),
 				codex("gpt-5.6-sol", "high", 90),
 			},
 		},
@@ -104,7 +104,7 @@ func defaultPluginConfig() pluginConfig {
 			Description: "Sol subscriptions first, then the equivalent Opus pool.",
 			Candidates: []candidate{
 				codex("gpt-5.6-sol", "max", 100),
-				claude("claude-opus-4-8", "max", 90),
+				claude("claude-opus-5", "max", 90),
 			},
 		},
 		"terra": {
@@ -154,6 +154,7 @@ func defaultPluginConfig() pluginConfig {
 	// (codex-auto-review and gpt-5.3-codex-spark) remain direct-only.
 	exact := map[string][]candidate{
 		"claude-fable-5":             {claude("claude-fable-5", "max", 100), codex("gpt-5.6-sol", "max", 90)},
+		"claude-opus-5":              {claude("claude-opus-5", "high", 100), codex("gpt-5.6-sol", "high", 90)},
 		"claude-sonnet-5":            {claude("claude-sonnet-5", "medium", 100), codex("gpt-5.6-terra", "medium", 90)},
 		"claude-opus-4-8":            {claude("claude-opus-4-8", "high", 100), codex("gpt-5.6-sol", "high", 90)},
 		"claude-opus-4-7":            {claude("claude-opus-4-7", "high", 100), codex("gpt-5.6-sol", "high", 90)},
