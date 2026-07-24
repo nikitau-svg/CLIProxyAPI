@@ -146,8 +146,15 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 		return
 	}
 	h.mu.Lock()
+	previous := h.pluginHost
 	h.pluginHost = host
 	h.mu.Unlock()
+	if previous != nil && previous != host {
+		previous.SetPluginConfigListMutator(nil)
+	}
+	if host != nil {
+		host.SetPluginConfigListMutator(h.mutatePluginConfigList)
+	}
 }
 
 // SetConfigReloadHook updates the callback used after management saves config changes.

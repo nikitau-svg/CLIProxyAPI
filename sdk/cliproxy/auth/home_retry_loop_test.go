@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -13,7 +14,8 @@ import (
 )
 
 type repeatedHomeAuthDispatcher struct {
-	calls atomic.Int32
+	calls  atomic.Int32
+	authID string
 }
 
 func (d *repeatedHomeAuthDispatcher) HeartbeatOK() bool {
@@ -22,9 +24,13 @@ func (d *repeatedHomeAuthDispatcher) HeartbeatOK() bool {
 
 func (d *repeatedHomeAuthDispatcher) RPopAuth(context.Context, string, string, http.Header, int) ([]byte, error) {
 	d.calls.Add(1)
+	authID := d.authID
+	if authID == "" {
+		authID = "home-auth-1"
+	}
 	raw, _ := json.Marshal(homeAuthDispatchResponse{
 		Auth: Auth{
-			ID:       "home-auth-1",
+			ID:       authID,
 			Provider: "home-loop-test",
 			Status:   StatusActive,
 			Metadata: map[string]any{"email": "loop@example.com"},
@@ -92,5 +98,79 @@ func TestManagerExecuteHomeStopsWhenDispatchRepeatsTriedAuth(t *testing.T) {
 	}
 	if got := dispatcher.calls.Load(); got != 2 {
 		t.Fatalf("home dispatch calls = %d, want 2", got)
+	}
+}
+
+func TestManagerExecuteHomePinnedAuthMismatchFailsClosed(t *testing.T) {
+	dispatcher := &repeatedHomeAuthDispatcher{authID: "home-auth-other"}
+	oldCurrentHomeDispatcher := currentHomeDispatcher
+	currentHomeDispatcher = func() homeAuthDispatcher {
+		return dispatcher
+	}
+	t.Cleanup(func() {
+		currentHomeDispatcher = oldCurrentHomeDispatcher
+	})
+
+	executor := &unauthorizedHomeExecutor{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+	manager.RegisterExecutor(executor)
+
+	_, err := manager.Execute(
+		context.Background(),
+		[]string{"home-loop-test"},
+		cliproxyexecutor.Request{Model: "gemini-3.5-flash-low"},
+		cliproxyexecutor.Options{Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey:    "home-auth-pinned",
+			cliproxyexecutor.SingleAttemptMetadataKey: true,
+		}},
+	)
+	if err == nil {
+		t.Fatal("Execute error = nil, want pinned auth mismatch")
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr.Code != "pinned_auth_mismatch" {
+		t.Fatalf("Execute error = %v, want pinned_auth_mismatch", err)
+	}
+	if got := executor.calls.Load(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0", got)
+	}
+	if got := dispatcher.calls.Load(); got != 1 {
+		t.Fatalf("home dispatch calls = %d, want 1", got)
+	}
+}
+
+func TestManagerExecuteHomeSingleAttemptDoesNotRefreshOrRedispatch(t *testing.T) {
+	dispatcher := &repeatedHomeAuthDispatcher{authID: "home-auth-pinned"}
+	oldCurrentHomeDispatcher := currentHomeDispatcher
+	currentHomeDispatcher = func() homeAuthDispatcher {
+		return dispatcher
+	}
+	t.Cleanup(func() {
+		currentHomeDispatcher = oldCurrentHomeDispatcher
+	})
+
+	executor := &unauthorizedHomeExecutor{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+	manager.RegisterExecutor(executor)
+
+	_, err := manager.Execute(
+		context.Background(),
+		[]string{"home-loop-test"},
+		cliproxyexecutor.Request{Model: "gemini-3.5-flash-low"},
+		cliproxyexecutor.Options{Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey:    "home-auth-pinned",
+			cliproxyexecutor.SingleAttemptMetadataKey: true,
+		}},
+	)
+	if err == nil || statusCodeFromError(err) != http.StatusUnauthorized {
+		t.Fatalf("Execute error = %v, want unauthorized", err)
+	}
+	if got := executor.calls.Load(); got != 1 {
+		t.Fatalf("executor calls = %d, want 1", got)
+	}
+	if got := dispatcher.calls.Load(); got != 1 {
+		t.Fatalf("home dispatch calls = %d, want 1", got)
 	}
 }

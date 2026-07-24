@@ -173,21 +173,25 @@ func TestHostInjectedHTTPClientIsNotEncodedInPluginJSON(t *testing.T) {
 
 func TestHostModelTypesPreserveFields(t *testing.T) {
 	request := HostModelExecutionRequest{
-		EntryProtocol: "openai",
-		ExitProtocol:  "claude",
-		Model:         "gpt-test",
-		Stream:        true,
-		Body:          []byte(`{"input":"hello"}`),
-		Headers:       http.Header{"X-Test": []string{"one", "two"}},
-		Query:         url.Values{"alt": []string{"beta"}},
-		Alt:           "chat",
+		EntryProtocol:   "openai",
+		ExitProtocol:    "claude",
+		ForcedProvider:  "claude",
+		AuthID:          "claude-account-1",
+		SingleAttempt:   true,
+		AllowImageModel: true,
+		Model:           "gpt-test",
+		Stream:          true,
+		Body:            []byte(`{"input":"hello"}`),
+		Headers:         http.Header{"X-Test": []string{"one", "two"}},
+		Query:           url.Values{"alt": []string{"beta"}},
+		Alt:             "chat",
 	}
 	rawRequest, errMarshalRequest := json.Marshal(request)
 	if errMarshalRequest != nil {
 		t.Fatalf("marshal HostModelExecutionRequest: %v", errMarshalRequest)
 	}
 	requestJSON := string(rawRequest)
-	for _, field := range []string{"entry_protocol", "exit_protocol", "model", "stream", "body", "headers", "query", "alt"} {
+	for _, field := range []string{"entry_protocol", "exit_protocol", "forced_provider", "auth_id", "single_attempt", "allow_image_model", "model", "stream", "body", "headers", "query", "alt"} {
 		if !strings.Contains(requestJSON, `"`+field+`"`) {
 			t.Fatalf("HostModelExecutionRequest JSON missing field %q: %s", field, requestJSON)
 		}
@@ -198,6 +202,10 @@ func TestHostModelTypesPreserveFields(t *testing.T) {
 	}
 	if decodedRequest.EntryProtocol != request.EntryProtocol ||
 		decodedRequest.ExitProtocol != request.ExitProtocol ||
+		decodedRequest.ForcedProvider != request.ForcedProvider ||
+		decodedRequest.AuthID != request.AuthID ||
+		decodedRequest.SingleAttempt != request.SingleAttempt ||
+		decodedRequest.AllowImageModel != request.AllowImageModel ||
 		decodedRequest.Model != request.Model ||
 		decodedRequest.Stream != request.Stream ||
 		string(decodedRequest.Body) != string(request.Body) ||
@@ -279,14 +287,22 @@ func TestHostModelTypesPreserveFields(t *testing.T) {
 	readResponse := HostModelStreamReadResponse{
 		Payload: []byte("data: test\n\n"),
 		Error:   "temporary stream error",
-		Done:    true,
+		ErrorDetail: &HostModelExecutionError{
+			Code:       "rate_limited",
+			Message:    "temporary stream error",
+			HTTPStatus: http.StatusTooManyRequests,
+			Retryable:  true,
+			Headers:    http.Header{"Retry-After": []string{"9"}},
+			RetryAfter: "9",
+		},
+		Done: true,
 	}
 	rawReadResponse, errMarshalReadResponse := json.Marshal(readResponse)
 	if errMarshalReadResponse != nil {
 		t.Fatalf("marshal HostModelStreamReadResponse: %v", errMarshalReadResponse)
 	}
 	readResponseJSON := string(rawReadResponse)
-	for _, field := range []string{"payload", "error", "done"} {
+	for _, field := range []string{"payload", "error", "error_detail", "done"} {
 		if !strings.Contains(readResponseJSON, `"`+field+`"`) {
 			t.Fatalf("HostModelStreamReadResponse JSON missing field %q: %s", field, readResponseJSON)
 		}
@@ -297,6 +313,12 @@ func TestHostModelTypesPreserveFields(t *testing.T) {
 	}
 	if string(decodedReadResponse.Payload) != string(readResponse.Payload) ||
 		decodedReadResponse.Error != readResponse.Error ||
+		decodedReadResponse.ErrorDetail == nil ||
+		decodedReadResponse.ErrorDetail.Code != "rate_limited" ||
+		decodedReadResponse.ErrorDetail.HTTPStatus != http.StatusTooManyRequests ||
+		!decodedReadResponse.ErrorDetail.Retryable ||
+		decodedReadResponse.ErrorDetail.Headers.Get("Retry-After") != "9" ||
+		decodedReadResponse.ErrorDetail.RetryAfter != "9" ||
 		decodedReadResponse.Done != readResponse.Done {
 		t.Fatalf("HostModelStreamReadResponse round trip = %#v", decodedReadResponse)
 	}

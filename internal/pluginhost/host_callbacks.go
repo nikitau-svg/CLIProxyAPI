@@ -99,6 +99,8 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 	switch method {
 	case pluginabi.MethodHostModelExecute:
 		return h.callHostModelExecute(ctx, request)
+	case pluginabi.MethodHostModelCountTokens:
+		return h.callHostModelCountTokens(ctx, request)
 	case pluginabi.MethodHostModelExecuteStream:
 		return h.callHostModelExecuteStream(ctx, request)
 	case pluginabi.MethodHostModelStreamRead:
@@ -125,8 +127,12 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 		return h.callHostAuthGet(ctx, request)
 	case pluginabi.MethodHostAuthGetRuntime:
 		return h.callHostAuthGetRuntime(ctx, request)
+	case pluginabi.MethodHostAuthQuotaGet:
+		return h.callHostAuthQuotaGet(ctx, request)
 	case pluginabi.MethodHostAuthSave:
 		return h.callHostAuthSave(ctx, request)
+	case pluginabi.MethodHostPluginConfigListMutate:
+		return h.callHostPluginConfigListMutate(ctx, request)
 	default:
 		return nil, fmt.Errorf("unsupported host callback %s", method)
 	}
@@ -291,10 +297,43 @@ func (h *Host) callHostModelExecute(ctx context.Context, request []byte) ([]byte
 	})
 }
 
+func (h *Host) callHostModelCountTokens(ctx context.Context, request []byte) ([]byte, error) {
+	var req rpcHostModelExecutionRequest
+	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host model count tokens request: %w", errUnmarshal)
+	}
+	if req.Stream {
+		return nil, fmt.Errorf("host.model.count_tokens requires stream=false")
+	}
+	executor := h.currentModelExecutor()
+	if executor == nil {
+		return nil, fmt.Errorf("host model executor is unavailable")
+	}
+	counter, ok := executor.(modelTokenCounter)
+	if !ok || counter == nil {
+		return nil, fmt.Errorf("host model token counter is unavailable")
+	}
+	skipPluginID := h.callbackCallerPluginID(ctx, req.HostCallbackID)
+	ctx = h.resolveCallbackContext(req.HostCallbackID, ctx)
+	resp, errMsg := counter.CountModelTokens(ctx, modelExecutionRequestFromPlugin(req.HostModelExecutionRequest, skipPluginID))
+	if errMsg != nil {
+		return nil, modelExecutionError(errMsg)
+	}
+	return marshalRPCResult(pluginapi.HostModelExecutionResponse{
+		StatusCode: resp.StatusCode,
+		Headers:    cloneHeader(resp.Headers),
+		Body:       append([]byte(nil), resp.Body...),
+	})
+}
+
 func modelExecutionRequestFromPlugin(req pluginapi.HostModelExecutionRequest, skipPluginID string) handlers.ModelExecutionRequest {
 	return handlers.ModelExecutionRequest{
 		EntryProtocol:           req.EntryProtocol,
 		ExitProtocol:            req.ExitProtocol,
+		ForcedProvider:          req.ForcedProvider,
+		AuthID:                  req.AuthID,
+		SingleAttempt:           req.SingleAttempt,
+		AllowImageModel:         req.AllowImageModel,
 		Model:                   req.Model,
 		Stream:                  req.Stream,
 		Body:                    append([]byte(nil), req.Body...),
@@ -307,16 +346,7 @@ func modelExecutionRequestFromPlugin(req pluginapi.HostModelExecutionRequest, sk
 }
 
 func modelExecutionError(errMsg *interfaces.ErrorMessage) error {
-	if errMsg == nil {
-		return nil
-	}
-	if errMsg.Error != nil {
-		return errMsg.Error
-	}
-	if errMsg.StatusCode > 0 {
-		return fmt.Errorf("model execution failed with status %d", errMsg.StatusCode)
-	}
-	return fmt.Errorf("model execution failed")
+	return newHostModelCallbackError(errMsg)
 }
 
 func (h *Host) callHostLog(ctx context.Context, request []byte) ([]byte, error) {

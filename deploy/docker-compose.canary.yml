@@ -1,14 +1,20 @@
 services:
   cli-proxy-api-canary:
-    # Local image ID: sha256:ed6c0d326e0750d22697d9ea0b9cd86c1c1e967477dbb5f09d92f9c8e4769e8c
-    image: cliproxyapi-local:v7.2.94-multiorg1
+    image: ${CLIPROXYAPI_IMAGE:-cliproxyapi-local:v7.2.94-bravo-native0.5.0}
     pull_policy: never
     container_name: CLIProxyAPI-Canary
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/CLIProxyAPI/cliproxy-healthcheck"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 10s
     ports:
-      - "192.168.1.114:18319:8317"
+      - "${CLIPROXYAPI_BIND_ADDRESS:-127.0.0.1}:${CLIPROXYAPI_CANARY_PORT:-18319}:8317"
     volumes:
       - "./config.yaml:/CLIProxyAPI/config.yaml"
       - "./auths:/root/.cli-proxy-api"
+      - "./bravo-data:/CLIProxyAPI/bravo-data"
       - "./logs:/CLIProxyAPI/logs"
       - "./plugins:/CLIProxyAPI/plugins"

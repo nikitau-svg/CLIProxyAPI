@@ -11,6 +11,37 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+type codedClaudeHandlerError struct {
+	code    string
+	message string
+}
+
+func (e codedClaudeHandlerError) Error() string     { return e.message }
+func (e codedClaudeHandlerError) ErrorCode() string { return e.code }
+
+func TestClaudeErrorPreservesExecutorErrorCode(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusUnprocessableEntity,
+		Error: codedClaudeHandlerError{
+			code:    "bravo_contract_unverified",
+			message: "manual thinking budgets are not contract-preserving",
+		},
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Type != "invalid_request_error" {
+		t.Fatalf("error.type = %q, want invalid_request_error", got.Error.Type)
+	}
+	if got.Error.Code != "bravo_contract_unverified" {
+		t.Fatalf("error.code = %q, want bravo_contract_unverified", got.Error.Code)
+	}
+	if got.Error.Message != "manual thinking budgets are not contract-preserving" {
+		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+}
+
 func TestClaudeErrorExtractsOpenAIStyleUpstreamJSON(t *testing.T) {
 	handler := &ClaudeCodeAPIHandler{}
 	msg := &interfaces.ErrorMessage{
@@ -28,6 +59,9 @@ func TestClaudeErrorExtractsOpenAIStyleUpstreamJSON(t *testing.T) {
 	}
 	if got.Error.Message != "Your input exceeds the context window of this model. Please adjust your input and try again." {
 		t.Fatalf("error.message = %q", got.Error.Message)
+	}
+	if got.Error.Code != "context_too_large" {
+		t.Fatalf("error.code = %q, want context_too_large", got.Error.Code)
 	}
 }
 

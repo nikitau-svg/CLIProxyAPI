@@ -600,6 +600,14 @@ type HostModelExecutionRequest struct {
 	EntryProtocol string `json:"entry_protocol"`
 	// ExitProtocol is the target provider protocol format.
 	ExitProtocol string `json:"exit_protocol"`
+	// ForcedProvider restricts execution to one built-in provider key.
+	ForcedProvider string `json:"forced_provider,omitempty"`
+	// AuthID pins execution to one host auth record.
+	AuthID string `json:"auth_id,omitempty"`
+	// SingleAttempt disables nested model, credential, refresh, and bootstrap retries.
+	SingleAttempt bool `json:"single_attempt,omitempty"`
+	// AllowImageModel permits execution of registry models marked image-only.
+	AllowImageModel bool `json:"allow_image_model,omitempty"`
 	// Model is the requested model identifier.
 	Model string `json:"model"`
 	// Stream reports whether the request expects streaming output.
@@ -646,8 +654,26 @@ type HostModelStreamReadResponse struct {
 	Payload []byte `json:"payload"`
 	// Error reports a stream error associated with this read.
 	Error string `json:"error"`
+	// ErrorDetail preserves structured execution failure metadata.
+	ErrorDetail *HostModelExecutionError `json:"error_detail,omitempty"`
 	// Done reports whether the stream has ended.
 	Done bool `json:"done"`
+}
+
+// HostModelExecutionError preserves machine-readable host execution failures.
+type HostModelExecutionError struct {
+	// Code is the stable machine-readable error code.
+	Code string `json:"code,omitempty"`
+	// Message is the human-readable error message.
+	Message string `json:"message"`
+	// HTTPStatus is the upstream or normalized HTTP status.
+	HTTPStatus int `json:"http_status,omitempty"`
+	// Retryable reports whether another candidate may safely be attempted.
+	Retryable bool `json:"retryable,omitempty"`
+	// Headers contains relevant upstream response headers.
+	Headers http.Header `json:"headers,omitempty"`
+	// RetryAfter preserves the Retry-After header value when present.
+	RetryAfter string `json:"retry_after,omitempty"`
 }
 
 // HostModelStreamCloseRequest asks the host to close a model stream.
@@ -689,7 +715,8 @@ type HostAuthFileEntry struct {
 	Unavailable bool `json:"unavailable,omitempty"`
 	// RuntimeOnly reports whether the credential has no backing auth file.
 	RuntimeOnly bool `json:"runtime_only,omitempty"`
-	// Source reports whether the credential came from file or memory.
+	// Source reports the normalized credential source kind, such as file,
+	// memory, or config.
 	Source string `json:"source,omitempty"`
 	// Path is the backing auth file path when available.
 	Path string `json:"path,omitempty"`
@@ -749,6 +776,92 @@ type HostAuthGetResponse struct {
 type HostAuthGetRuntimeResponse struct {
 	// Auth is the runtime credential entry.
 	Auth HostAuthFileEntry `json:"auth"`
+}
+
+const (
+	// HostAuthQuotaConfidenceConfirmed means every returned quota window was
+	// validated from a live provider response.
+	HostAuthQuotaConfidenceConfirmed = "confirmed"
+	// HostAuthQuotaConfidenceUnknown means no quota percentage is safe to use.
+	HostAuthQuotaConfidenceUnknown = "unknown"
+
+	// HostAuthQuotaWindowKindSession identifies a short rolling usage window.
+	HostAuthQuotaWindowKindSession = "session"
+	// HostAuthQuotaWindowKindWeekly identifies the account-wide long usage window.
+	HostAuthQuotaWindowKindWeekly = "weekly"
+	// HostAuthQuotaWindowKindModelWeekly identifies a model-family long usage window.
+	HostAuthQuotaWindowKindModelWeekly = "model_weekly"
+
+	// HostAuthQuotaResetModeScheduled means ResetAt contains a live provider
+	// reset instant.
+	HostAuthQuotaResetModeScheduled = "scheduled"
+	// HostAuthQuotaResetModeInactive means the provider confirmed an unused
+	// rolling window whose reset clock has not started yet.
+	HostAuthQuotaResetModeInactive = "inactive"
+	// HostAuthQuotaResetModeNotApplicable means the provider does not expose
+	// this class of quota window for the current plan.
+	HostAuthQuotaResetModeNotApplicable = "not_applicable"
+)
+
+// HostAuthQuotaRequest asks the host to acquire live quota for one exact runtime
+// credential. Plugins cannot provide an upstream URL or request headers.
+type HostAuthQuotaRequest struct {
+	// AuthIndex identifies the exact runtime credential.
+	AuthIndex string `json:"auth_index"`
+}
+
+// HostAuthQuotaError is a safe, machine-readable acquisition failure. It never
+// contains credential material, upstream bodies, or filesystem paths.
+type HostAuthQuotaError struct {
+	// Code is the stable failure code.
+	Code string `json:"code"`
+	// Message is a safe human-readable description.
+	Message string `json:"message"`
+}
+
+// HostAuthQuotaWindow is a normalized, provider-confirmed quota window.
+type HostAuthQuotaWindow struct {
+	// ID is the stable provider-window identifier.
+	ID string `json:"id"`
+	// Kind is session, weekly, or model_weekly.
+	Kind string `json:"kind"`
+	// ModelFamily identifies the constrained family for model_weekly windows.
+	ModelFamily string `json:"model_family,omitempty"`
+	// UsedPercent is the validated provider-reported utilization.
+	UsedPercent float64 `json:"used_percent"`
+	// RemainingPercent is 100 minus UsedPercent.
+	RemainingPercent float64 `json:"remaining_percent"`
+	// ResetAt is the provider-reported reset instant. It is zero only when
+	// ResetMode is inactive or not_applicable.
+	ResetAt time.Time `json:"reset_at"`
+	// ResetMode explains whether ResetAt is scheduled, not started yet, or not
+	// applicable to this provider plan.
+	ResetMode string `json:"reset_mode"`
+}
+
+// HostAuthQuotaResponse contains only normalized quota and safe display labels.
+// Unknown responses always have an empty Windows slice and a typed Error.
+type HostAuthQuotaResponse struct {
+	// AuthIndex identifies the exact runtime credential.
+	AuthIndex string `json:"auth_index"`
+	// AuthID identifies the host auth record without exposing its backing path.
+	AuthID string `json:"auth_id"`
+	// Provider is claude or codex.
+	Provider string `json:"provider"`
+	// WorkspaceLabel is a safe organization/workspace display label.
+	WorkspaceLabel string `json:"workspace_label"`
+	// AccountLabel is a safe account display label.
+	AccountLabel string `json:"account_label"`
+	// PlanLabel is a safe provider plan display label.
+	PlanLabel string `json:"plan_label"`
+	// ObservedAt is when the live provider response was validated.
+	ObservedAt time.Time `json:"observed_at"`
+	// Confidence is confirmed or unknown.
+	Confidence string `json:"confidence"`
+	// Error explains why Confidence is unknown.
+	Error *HostAuthQuotaError `json:"error,omitempty"`
+	// Windows contains only fully validated windows.
+	Windows []HostAuthQuotaWindow `json:"windows"`
 }
 
 // HostAuthSaveRequest asks the host to persist credential JSON to a physical auth file.

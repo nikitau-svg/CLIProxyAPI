@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,103 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+type codedHandlerResponseError struct {
+	code    string
+	message string
+}
+
+func (e codedHandlerResponseError) Error() string     { return e.message }
+func (e codedHandlerResponseError) ErrorCode() string { return e.code }
+
+func TestWriteErrorResponsePreservesExecutorErrorCode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusUnprocessableEntity,
+		Error: codedHandlerResponseError{
+			code:    "bravo_effort_invalid",
+			message: `reasoning_effort has unsupported effort "turbo"`,
+		},
+	})
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnprocessableEntity)
+	}
+	var response ErrorResponse
+	if errUnmarshal := json.Unmarshal(recorder.Body.Bytes(), &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if response.Error.Code != "bravo_effort_invalid" {
+		t.Fatalf("error.code = %q, want bravo_effort_invalid; body=%s", response.Error.Code, recorder.Body.Bytes())
+	}
+	if response.Error.Message != `reasoning_effort has unsupported effort "turbo"` {
+		t.Fatalf("error.message = %q", response.Error.Message)
+	}
+}
+
+func TestWriteErrorResponseKeepsLegacyStatusCodesForGenericAuthErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		sourceCode string
+		wantCode   string
+	}{
+		{
+			name:       "unauthorized",
+			status:     http.StatusUnauthorized,
+			sourceCode: "unauthorized",
+			wantCode:   "invalid_api_key",
+		},
+		{
+			name:       "rate limited",
+			status:     http.StatusTooManyRequests,
+			sourceCode: "rate_limited",
+			wantCode:   "rate_limit_exceeded",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+			handler := NewBaseAPIHandlers(nil, nil)
+			handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+				StatusCode: testCase.status,
+				Error: &coreauth.Error{
+					Code:       testCase.sourceCode,
+					Message:    "generic auth failure",
+					HTTPStatus: testCase.status,
+				},
+			})
+
+			var response ErrorResponse
+			if errUnmarshal := json.Unmarshal(recorder.Body.Bytes(), &response); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			if response.Error.Code != testCase.wantCode {
+				t.Fatalf("error.code = %q, want %q; body=%s", response.Error.Code, testCase.wantCode, recorder.Body.Bytes())
+			}
+		})
+	}
+}
+
+func TestPreservedErrorCodeDoesNotExposeRequestScopeMarker(t *testing.T) {
+	got := PreservedErrorCode(http.StatusUnprocessableEntity, codedHandlerResponseError{
+		code:    "request_scoped",
+		message: "unprocessable request",
+	})
+	if got != "" {
+		t.Fatalf("PreservedErrorCode() = %q, want empty code", got)
+	}
+}
 
 func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
 	gin.SetMode(gin.TestMode)

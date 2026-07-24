@@ -36,5 +36,5 @@ func (e *Error) StatusCode() int {
 // IsRequestScoped reports whether the failure is tied to the current request
 // rather than the selected credential.
 func (e *Error) IsRequestScoped() bool {
-	return e != nil && e.Code == requestScopedErrorCode
+	return isRequestScopedResultError(e)
 }

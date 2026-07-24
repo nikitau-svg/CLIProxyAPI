@@ -1,0 +1,8 @@
+# Runtime-only canary image. Build the Linux/arm64 artifacts into
+# .canary-dist first; Dockerfile.canary remains the reproducible source build.
+FROM eceasy/cli-proxy-api@sha256:5f261f6ca5505fbe4ba0bc30cc615a4d3925c99ad6ae686411e43cf32135bb5d
+
+COPY .canary-dist/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
+COPY .canary-dist/cliproxy-healthcheck /CLIProxyAPI/cliproxy-healthcheck
+COPY .canary-dist/bravo-v0.5.0.so /CLIProxyAPI/plugin-dist/bravo-v0.5.0.so
+COPY .canary-dist/management.html /CLIProxyAPI/static/management.html

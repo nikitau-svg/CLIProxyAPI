@@ -55,6 +55,12 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	out := []byte(fmt.Sprintf(`{"model":"","max_tokens":32000,"messages":[],"metadata":{"user_id":"%s"}}`, userID))
 
 	root := gjson.ParseBytes(rawJSON)
+	if input := root.Get("input"); input.Type == gjson.String {
+		message := []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]`)
+		message, _ = sjson.SetBytes(message, "0.content.0.text", input.String())
+		rawJSON, _ = sjson.SetRawBytes(rawJSON, "input", message)
+		root = gjson.ParseBytes(rawJSON)
+	}
 
 	// Convert OpenAI Responses reasoning.effort to Claude thinking config.
 	if v := root.Get("reasoning.effort"); v.Exists() {

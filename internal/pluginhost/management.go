@@ -252,7 +252,8 @@ func (h *Host) ServeManagementHTTP(w http.ResponseWriter, r *http.Request) bool 
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
-	resp, errHandle := h.callManagementHandler(r.Context(), record, pluginapi.ManagementRequest{
+	managementCtx := withPluginManagementMutation(r.Context())
+	resp, errHandle := h.callManagementHandler(managementCtx, record, pluginapi.ManagementRequest{
 		Method:  r.Method,
 		Path:    r.URL.Path,
 		Headers: cloneHeader(r.Header),

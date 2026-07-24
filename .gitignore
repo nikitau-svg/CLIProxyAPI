@@ -13,6 +13,9 @@ conv/*
 temp/*
 refs/*
 plugins/*
+!plugins/bravo/
+!plugins/bravo/**
+.canary-dist/
 examples/plugin/bin/*
 
 # Storage backends

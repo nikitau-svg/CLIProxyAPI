@@ -562,7 +562,12 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			if errMsg.Error != nil && errMsg.Error.Error() != "" {
 				errText = errMsg.Error.Error()
 			}
-			chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, 0)
+			chunk := handlers.BuildOpenAIResponsesStreamErrorChunkWithCode(
+				status,
+				errText,
+				handlers.PreservedErrorCode(status, errMsg.Error),
+				0,
+			)
 			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
 		},
 		WriteDone: func() {

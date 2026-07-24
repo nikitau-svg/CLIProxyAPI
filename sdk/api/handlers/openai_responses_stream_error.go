@@ -43,6 +43,14 @@ func openAIResponsesStreamErrorCode(status int) string {
 // non-streaming responses, but streaming clients validate SSE `data:` payloads against a union
 // of chunks that requires a top-level `type` field.
 func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNumber int) []byte {
+	return BuildOpenAIResponsesStreamErrorChunkWithCode(status, errText, "", sequenceNumber)
+}
+
+// BuildOpenAIResponsesStreamErrorChunkWithCode preserves an executor's typed
+// code for statuses where the Responses stream contract has no more specific
+// legacy code. A code already present in a valid upstream JSON error remains
+// authoritative.
+func BuildOpenAIResponsesStreamErrorChunkWithCode(status int, errText, explicitCode string, sequenceNumber int) []byte {
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}
@@ -55,7 +63,10 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 		message = http.StatusText(status)
 	}
 
-	code := openAIResponsesStreamErrorCode(status)
+	code := strings.TrimSpace(explicitCode)
+	if code == "" {
+		code = openAIResponsesStreamErrorCode(status)
+	}
 
 	trimmed := strings.TrimSpace(errText)
 	if trimmed != "" && json.Valid([]byte(trimmed)) {

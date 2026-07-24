@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
@@ -24,6 +25,7 @@ import (
 type fakeHostModelExecutor struct {
 	executeModel       func(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage)
 	executeModelStream func(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage)
+	countModelTokens   func(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage)
 }
 
 func (e *fakeHostModelExecutor) ExecuteModel(ctx context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
@@ -32,6 +34,10 @@ func (e *fakeHostModelExecutor) ExecuteModel(ctx context.Context, req handlers.M
 
 func (e *fakeHostModelExecutor) ExecuteModelStream(ctx context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage) {
 	return e.executeModelStream(ctx, req)
+}
+
+func (e *fakeHostModelExecutor) CountModelTokens(ctx context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
+	return e.countModelTokens(ctx, req)
 }
 
 func TestHostHTTPDoCallbackUsesHostHTTPClient(t *testing.T) {
@@ -249,13 +255,17 @@ func TestHostModelExecuteCallback(t *testing.T) {
 
 	rawReq, errMarshal := json.Marshal(rpcHostModelExecutionRequest{
 		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
-			EntryProtocol: "openai",
-			ExitProtocol:  "claude",
-			Model:         "model-1",
-			Body:          []byte(`{"request":true}`),
-			Headers:       http.Header{"X-Request": []string{"yes"}},
-			Query:         url.Values{"alt": []string{"sse"}},
-			Alt:           "raw",
+			EntryProtocol:   "openai",
+			ExitProtocol:    "claude",
+			ForcedProvider:  "claude",
+			AuthID:          "claude-account-1",
+			SingleAttempt:   true,
+			AllowImageModel: true,
+			Model:           "model-1",
+			Body:            []byte(`{"request":true}`),
+			Headers:         http.Header{"X-Request": []string{"yes"}},
+			Query:           url.Values{"alt": []string{"sse"}},
+			Alt:             "raw",
 		},
 	})
 	if errMarshal != nil {
@@ -279,6 +289,9 @@ func TestHostModelExecuteCallback(t *testing.T) {
 	if got.EntryProtocol != "openai" || got.ExitProtocol != "claude" || got.Model != "model-1" || got.Stream {
 		t.Fatalf("request protocols/model/stream = %#v", got)
 	}
+	if got.ForcedProvider != "claude" || got.AuthID != "claude-account-1" || !got.SingleAttempt || !got.AllowImageModel {
+		t.Fatalf("request execution controls = %#v", got)
+	}
 	if string(got.Body) != `{"request":true}` {
 		t.Fatalf("request body = %q, want original body", got.Body)
 	}
@@ -290,6 +303,121 @@ func TestHostModelExecuteCallback(t *testing.T) {
 	}
 	if got.Alt != "raw" {
 		t.Fatalf("alt = %q, want raw", got.Alt)
+	}
+}
+
+func TestHostModelExecuteCallbackPreservesTypedErrorMetadata(t *testing.T) {
+	host := New()
+	host.SetModelExecutor(&fakeHostModelExecutor{
+		executeModel: func(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
+			return handlers.ModelExecutionResponse{}, &interfaces.ErrorMessage{
+				StatusCode: http.StatusTooManyRequests,
+				Error: &coreauth.Error{
+					Code:       "rate_limited",
+					Message:    "quota exhausted",
+					Retryable:  true,
+					HTTPStatus: http.StatusTooManyRequests,
+				},
+				Addon: http.Header{
+					"Retry-After":  []string{"17"},
+					"X-Request-Id": []string{"req-typed"},
+				},
+			}
+		},
+	})
+	rawReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{
+		EntryProtocol: "openai",
+		ExitProtocol:  "openai",
+		Model:         "model-1",
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal request: %v", errMarshal)
+	}
+	_, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostModelExecute, rawReq)
+	if errCall == nil {
+		t.Fatal("callFromPlugin() error = nil")
+	}
+	rawEnvelope := marshalHostCallbackError(errCall)
+	var envelope pluginabi.Envelope
+	if errUnmarshal := json.Unmarshal(rawEnvelope, &envelope); errUnmarshal != nil {
+		t.Fatalf("unmarshal callback envelope: %v", errUnmarshal)
+	}
+	if envelope.OK || envelope.Error == nil {
+		t.Fatalf("callback envelope = %#v", envelope)
+	}
+	if envelope.Error.Code != "rate_limited" ||
+		envelope.Error.Message != "rate_limited: quota exhausted" ||
+		envelope.Error.HTTPStatus != http.StatusTooManyRequests ||
+		!envelope.Error.Retryable ||
+		envelope.Error.Headers.Get("Retry-After") != "17" ||
+		envelope.Error.Headers.Get("X-Request-Id") != "req-typed" ||
+		envelope.Error.RetryAfter != "17" {
+		t.Fatalf("callback error = %#v", envelope.Error)
+	}
+}
+
+func TestHostModelCallbackErrorPreservesRetryAfterWithoutHeader(t *testing.T) {
+	errCall := newHostModelCallbackError(&interfaces.ErrorMessage{
+		Error: rpcPluginError{
+			code:       "rate_limited",
+			message:    "try later",
+			statusCode: http.StatusTooManyRequests,
+			retryable:  true,
+			retryAfter: "23",
+		},
+	})
+	rawEnvelope := marshalHostCallbackError(errCall)
+	var envelope pluginabi.Envelope
+	if errUnmarshal := json.Unmarshal(rawEnvelope, &envelope); errUnmarshal != nil {
+		t.Fatalf("unmarshal callback envelope: %v", errUnmarshal)
+	}
+	if envelope.Error == nil ||
+		envelope.Error.Code != "rate_limited" ||
+		envelope.Error.HTTPStatus != http.StatusTooManyRequests ||
+		!envelope.Error.Retryable ||
+		envelope.Error.RetryAfter != "23" {
+		t.Fatalf("callback error = %#v", envelope.Error)
+	}
+}
+
+func TestHostModelCountTokensCallback(t *testing.T) {
+	host := New()
+	var got handlers.ModelExecutionRequest
+	host.SetModelExecutor(&fakeHostModelExecutor{
+		countModelTokens: func(_ context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
+			got = req
+			return handlers.ModelExecutionResponse{
+				StatusCode: http.StatusOK,
+				Headers:    http.Header{"X-Count": []string{"ok"}},
+				Body:       []byte(`{"input_tokens":42}`),
+			}, nil
+		},
+	})
+	rawReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{
+		EntryProtocol:  "claude",
+		ExitProtocol:   "claude",
+		ForcedProvider: "claude",
+		AuthID:         "claude-account-1",
+		SingleAttempt:  true,
+		Model:          "claude-test",
+		Body:           []byte(`{"messages":[]}`),
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal request: %v", errMarshal)
+	}
+	rawResp, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostModelCountTokens, rawReq)
+	if errCall != nil {
+		t.Fatalf("callFromPlugin() error = %v", errCall)
+	}
+	resp, errDecode := decodeRPCEnvelope[pluginapi.HostModelExecutionResponse](rawResp)
+	if errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if resp.StatusCode != http.StatusOK || string(resp.Body) != `{"input_tokens":42}` || resp.Headers.Get("X-Count") != "ok" {
+		t.Fatalf("response = %#v", resp)
+	}
+	if got.ForcedProvider != "claude" || got.AuthID != "claude-account-1" || !got.SingleAttempt || got.Model != "claude-test" {
+		t.Fatalf("count request = %#v", got)
 	}
 }
 
@@ -597,8 +725,12 @@ func TestHostModelStreamReadReturnsPayloadAndTerminalError(t *testing.T) {
 	chunks := make(chan handlers.ModelExecutionChunk, 2)
 	chunks <- handlers.ModelExecutionChunk{Payload: []byte("first")}
 	chunks <- handlers.ModelExecutionChunk{Err: &handlers.ModelExecutionStreamError{
+		Code:       "upstream_unavailable",
 		StatusCode: http.StatusBadGateway,
 		Message:    "terminal boom",
+		Retryable:  true,
+		Headers:    http.Header{"Retry-After": []string{"3"}},
+		RetryAfter: "3",
 	}}
 	host.SetModelExecutor(&fakeHostModelExecutor{
 		executeModelStream: func(ctx context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage) {
@@ -637,6 +769,14 @@ func TestHostModelStreamReadReturnsPayloadAndTerminalError(t *testing.T) {
 	}
 	if !terminal.Done || terminal.Error != "terminal boom" || len(terminal.Payload) != 0 {
 		t.Fatalf("terminal read = %#v, want done terminal error", terminal)
+	}
+	if terminal.ErrorDetail == nil ||
+		terminal.ErrorDetail.Code != "upstream_unavailable" ||
+		terminal.ErrorDetail.HTTPStatus != http.StatusBadGateway ||
+		!terminal.ErrorDetail.Retryable ||
+		terminal.ErrorDetail.Headers.Get("Retry-After") != "3" ||
+		terminal.ErrorDetail.RetryAfter != "3" {
+		t.Fatalf("terminal error detail = %#v", terminal.ErrorDetail)
 	}
 }
 

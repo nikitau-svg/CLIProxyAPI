@@ -32,6 +32,10 @@ type modelExecutor interface {
 	ExecuteModelStream(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage)
 }
 
+type modelTokenCounter interface {
+	CountModelTokens(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage)
+}
+
 type pluginUnloadTarget struct {
 	id      string
 	name    string
@@ -41,36 +45,37 @@ type pluginUnloadTarget struct {
 }
 
 type Host struct {
-	applyMu                sync.Mutex
-	mu                     sync.Mutex
-	loader                 pluginLoader
-	loaded                 map[string]*loadedPlugin
-	retired                map[string][]*loadedPlugin
-	loading                map[string]struct{}
-	fused                  map[string]string
-	pluginFileVersions     map[string]string
-	activePluginVersions   map[string]string
-	activePluginPaths      map[string]string
-	cleanupFilesPending    bool
-	runtimeConfig          *config.Config
-	authManager            *coreauth.Manager
-	modelExecutor          modelExecutor
-	modelClientIDs         map[string]struct{}
-	executorModelClientIDs map[string]struct{}
-	modelProviders         map[string]string
-	modelRegistrations     map[string]pluginModelRegistration
-	providerModels         map[string][]*registryModelInfo
-	executorProviders      map[string]struct{}
-	accessProviderKeys     map[string]struct{}
-	commandLineFlags       map[string]commandLineFlagRecord
-	commandLineHits        map[string]struct{}
-	managementRoutes       map[string]managementRouteRecord
-	resourceRoutes         map[string]resourceRouteRecord
-	streams                *streamBridge
-	httpStreams            *hostHTTPStreamBridge
-	modelStreams           *modelStreamBridge
-	callbackContexts       *callbackContextRegistry
-	snapshot               atomic.Value
+	applyMu                 sync.Mutex
+	mu                      sync.Mutex
+	loader                  pluginLoader
+	loaded                  map[string]*loadedPlugin
+	retired                 map[string][]*loadedPlugin
+	loading                 map[string]struct{}
+	fused                   map[string]string
+	pluginFileVersions      map[string]string
+	activePluginVersions    map[string]string
+	activePluginPaths       map[string]string
+	cleanupFilesPending     bool
+	runtimeConfig           *config.Config
+	authManager             *coreauth.Manager
+	modelExecutor           modelExecutor
+	modelClientIDs          map[string]struct{}
+	executorModelClientIDs  map[string]struct{}
+	modelProviders          map[string]string
+	modelRegistrations      map[string]pluginModelRegistration
+	providerModels          map[string][]*registryModelInfo
+	executorProviders       map[string]struct{}
+	accessProviderKeys      map[string]struct{}
+	commandLineFlags        map[string]commandLineFlagRecord
+	commandLineHits         map[string]struct{}
+	managementRoutes        map[string]managementRouteRecord
+	resourceRoutes          map[string]resourceRouteRecord
+	pluginConfigListMutator PluginConfigListMutator
+	streams                 *streamBridge
+	httpStreams             *hostHTTPStreamBridge
+	modelStreams            *modelStreamBridge
+	callbackContexts        *callbackContextRegistry
+	snapshot                atomic.Value
 }
 
 func New() *Host {

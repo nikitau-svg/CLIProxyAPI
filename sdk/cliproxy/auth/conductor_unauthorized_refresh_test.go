@@ -13,13 +13,15 @@ import (
 type unauthorizedRefreshExecutor struct {
 	id string
 
-	mu            sync.Mutex
-	executeCalls  []string
-	streamCalls   []string
-	refreshCalls  int
-	tokenInvalid  map[string]struct{}
-	refreshFail   bool
-	refreshTokens map[string]string
+	mu                   sync.Mutex
+	executeCalls         []string
+	streamCalls          []string
+	countCalls           []string
+	refreshCalls         int
+	tokenInvalid         map[string]struct{}
+	refreshFail          bool
+	streamBootstrapError bool
+	refreshTokens        map[string]string
 }
 
 func (e *unauthorizedRefreshExecutor) Identifier() string { return e.id }
@@ -44,8 +46,18 @@ func (e *unauthorizedRefreshExecutor) ExecuteStream(_ context.Context, auth *Aut
 	e.streamCalls = append(e.streamCalls, auth.ID)
 	token := authAccessToken(auth)
 	_, invalid := e.tokenInvalid[token]
+	bootstrapError := e.streamBootstrapError
 	e.mu.Unlock()
 	if invalid {
+		if bootstrapError {
+			ch := make(chan cliproxyexecutor.StreamChunk, 1)
+			ch <- cliproxyexecutor.StreamChunk{Err: &Error{
+				HTTPStatus: http.StatusUnauthorized,
+				Message:    "Your authentication token has been invalidated. Please try signing in again.",
+			}}
+			close(ch)
+			return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+		}
 		return nil, &Error{
 			HTTPStatus: http.StatusUnauthorized,
 			Message:    "Your authentication token has been invalidated. Please try signing in again.",
@@ -75,8 +87,19 @@ func (e *unauthorizedRefreshExecutor) Refresh(_ context.Context, auth *Auth) (*A
 	return auth, nil
 }
 
-func (e *unauthorizedRefreshExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "not implemented"}
+func (e *unauthorizedRefreshExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.countCalls = append(e.countCalls, auth.ID)
+	token := authAccessToken(auth)
+	_, invalid := e.tokenInvalid[token]
+	e.mu.Unlock()
+	if invalid {
+		return cliproxyexecutor.Response{}, &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    "Your authentication token has been invalidated. Please try signing in again.",
+		}
+	}
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID + ":" + token)}, nil
 }
 
 func (e *unauthorizedRefreshExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
@@ -96,6 +119,14 @@ func (e *unauthorizedRefreshExecutor) StreamCalls() []string {
 	defer e.mu.Unlock()
 	out := make([]string, len(e.streamCalls))
 	copy(out, e.streamCalls)
+	return out
+}
+
+func (e *unauthorizedRefreshExecutor) CountCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.countCalls))
+	copy(out, e.countCalls)
 	return out
 }
 
@@ -223,6 +254,85 @@ func TestManager_ExecuteStream_UnauthorizedRefreshesCurrentAuthBeforeFallback(t 
 	for _, id := range executor.StreamCalls() {
 		if id == backup.ID {
 			t.Fatalf("backup auth should not be used when refresh recovers primary")
+		}
+	}
+}
+
+func TestManager_Execute_SingleAttemptPinsAuthAndDisablesRefreshAndFallback(t *testing.T) {
+	m, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, false)
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.PinnedAuthMetadataKey:    primary.ID,
+		cliproxyexecutor.SingleAttemptMetadataKey: true,
+	}}
+
+	_, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, opts)
+	if errExecute == nil {
+		t.Fatal("Execute error = nil, want pinned auth failure")
+	}
+	if got := executor.ExecuteCalls(); len(got) != 1 || got[0] != primary.ID {
+		t.Fatalf("Execute calls = %v, want one pinned primary call", got)
+	}
+	if got := executor.RefreshCalls(); got != 0 {
+		t.Fatalf("Refresh calls = %d, want 0", got)
+	}
+	for _, id := range executor.ExecuteCalls() {
+		if id == backup.ID {
+			t.Fatalf("backup auth was called in single-attempt mode")
+		}
+	}
+}
+
+func TestManager_ExecuteStream_SingleAttemptPinsAuthAndDisablesRefreshAndFallback(t *testing.T) {
+	m, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, false)
+	executor.streamBootstrapError = true
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.PinnedAuthMetadataKey:    primary.ID,
+		cliproxyexecutor.SingleAttemptMetadataKey: true,
+	}}
+
+	stream, errStream := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, opts)
+	if errStream == nil {
+		if stream == nil || stream.Chunks == nil {
+			t.Fatal("ExecuteStream returned neither an error nor an error stream")
+		}
+		chunk, ok := <-stream.Chunks
+		if !ok || chunk.Err == nil {
+			t.Fatalf("ExecuteStream bootstrap result = %#v, want terminal error chunk", chunk)
+		}
+	}
+	if got := executor.StreamCalls(); len(got) != 1 || got[0] != primary.ID {
+		t.Fatalf("Stream calls = %v, want one pinned primary call", got)
+	}
+	if got := executor.RefreshCalls(); got != 0 {
+		t.Fatalf("Refresh calls = %d, want 0", got)
+	}
+	for _, id := range executor.StreamCalls() {
+		if id == backup.ID {
+			t.Fatalf("backup auth was called in single-attempt mode")
+		}
+	}
+}
+
+func TestManager_ExecuteCount_SingleAttemptPinsAuthAndDisablesRefreshAndFallback(t *testing.T) {
+	m, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, false)
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.PinnedAuthMetadataKey:    primary.ID,
+		cliproxyexecutor.SingleAttemptMetadataKey: true,
+	}}
+
+	_, errCount := m.ExecuteCount(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, opts)
+	if errCount == nil {
+		t.Fatal("ExecuteCount error = nil, want pinned auth failure")
+	}
+	if got := executor.CountCalls(); len(got) != 1 || got[0] != primary.ID {
+		t.Fatalf("Count calls = %v, want one pinned primary call", got)
+	}
+	if got := executor.RefreshCalls(); got != 0 {
+		t.Fatalf("Refresh calls = %d, want 0", got)
+	}
+	for _, id := range executor.CountCalls() {
+		if id == backup.ID {
+			t.Fatalf("backup auth was called in single-attempt mode")
 		}
 	}
 }

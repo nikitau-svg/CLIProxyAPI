@@ -1,6 +1,9 @@
 package pluginabi
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"net/http"
+)
 
 const (
 	// ABIVersion tracks the native C ABI shape (native plugin exports).
@@ -67,6 +70,7 @@ const (
 	MethodHostHTTPStreamRead     = "host.http.stream_read"
 	MethodHostHTTPStreamClose    = "host.http.stream_close"
 	MethodHostModelExecute       = "host.model.execute"
+	MethodHostModelCountTokens   = "host.model.count_tokens"
 	MethodHostModelExecuteStream = "host.model.execute_stream"
 	MethodHostModelStreamRead    = "host.model.stream_read"
 	MethodHostModelStreamClose   = "host.model.stream_close"
@@ -76,7 +80,12 @@ const (
 	MethodHostAuthList           = "host.auth.list"
 	MethodHostAuthGet            = "host.auth.get"
 	MethodHostAuthGetRuntime     = "host.auth.get_runtime"
+	MethodHostAuthQuotaGet       = "host.auth.quota_get"
 	MethodHostAuthSave           = "host.auth.save"
+	// MethodHostPluginConfigListMutate atomically mutates one array field in the
+	// calling plugin's persisted configuration. The callback is available only
+	// while handling an authenticated plugin Management API request.
+	MethodHostPluginConfigListMutate = "host.plugin.config.list_mutate"
 )
 
 type Envelope struct {
@@ -86,8 +95,10 @@ type Envelope struct {
 }
 
 type Error struct {
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	Retryable  bool   `json:"retryable,omitempty"`
-	HTTPStatus int    `json:"http_status,omitempty"`
+	Code       string      `json:"code"`
+	Message    string      `json:"message"`
+	Retryable  bool        `json:"retryable,omitempty"`
+	HTTPStatus int         `json:"http_status,omitempty"`
+	Headers    http.Header `json:"headers,omitempty"`
+	RetryAfter string      `json:"retry_after,omitempty"`
 }

@@ -10,6 +10,27 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
+func TestConvertOpenAIResponsesRequestToClaude_NormalizesStringInput(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-haiku-4-5",
+		"input": "hello from a string",
+		"max_output_tokens": 128
+	}`
+
+	result := ConvertOpenAIResponsesRequestToClaude("claude-haiku-4-5", []byte(inputJSON), false)
+	root := gjson.ParseBytes(result)
+
+	if got := root.Get("messages.#").Int(); got != 1 {
+		t.Fatalf("messages count = %d, want 1. Output: %s", got, string(result))
+	}
+	if got := root.Get("messages.0.role").String(); got != "user" {
+		t.Fatalf("message role = %q, want user. Output: %s", got, string(result))
+	}
+	if got := root.Get("messages.0.content").String(); got != "hello from a string" {
+		t.Fatalf("content text = %q, want original input", got)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_SanitizesToolCallIDsForClaude(t *testing.T) {
 	inputJSON := `{
 		"model": "gpt-4.1",

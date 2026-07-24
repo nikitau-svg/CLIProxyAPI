@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +80,114 @@ func TestHostAuthListCallbackUsesAuthManager(t *testing.T) {
 	entry := resp.Files[0]
 	if entry.AuthIndex != auth.Index || entry.Name != "demo-a.json" || entry.Email != "a@example.com" {
 		t.Fatalf("entry = %#v, want auth index and file metadata", entry)
+	}
+}
+
+func TestHostAuthCallbacksExposeConfigAPIKeyIdentityWithoutSecretMaterial(t *testing.T) {
+	const (
+		secretAPIKey = "sk-ant-api03-secret-must-not-leak"
+		sourceToken  = "private-config-source-token"
+		baseURL      = "https://private-upstream.example"
+	)
+	configAuth := &coreauth.Auth{
+		ID:       "claude-config-auth",
+		Provider: "claude",
+		Label:    "claude-apikey",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeSource: "config:claude[" + sourceToken + "]",
+			coreauth.AttributeAPIKey: secretAPIKey,
+			"base_url":               baseURL,
+			"priority":               "7",
+			"header:X-Private":       "private-header-value",
+		},
+		Metadata: map[string]any{
+			"api_key": secretAPIKey,
+		},
+	}
+	configAuth.EnsureIndex()
+	if configAuth.AuthSourceKind() != coreauth.AuthSourceConfig || !coreauth.IsConfigAPIKeyAuth(configAuth) {
+		t.Fatalf("test auth was not classified as a config API key: %#v", configAuth)
+	}
+
+	// Pathless records that merely claim another source or are not API-key
+	// credentials stay outside this narrowly scoped exception.
+	pathlessMemory := &coreauth.Auth{
+		ID:       "pathless-memory",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeSource: coreauth.AuthSourceMemory,
+			coreauth.AttributeAPIKey: "memory-secret",
+		},
+	}
+	pathlessConfigOAuth := &coreauth.Auth{
+		ID:       "pathless-config-oauth",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeSource: "config:claude[oauth]",
+		},
+		Metadata: map[string]any{"access_token": "oauth-secret"},
+	}
+
+	host := New()
+	host.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+	for _, auth := range []*coreauth.Auth{configAuth, pathlessMemory, pathlessConfigOAuth} {
+		if _, errRegister := host.currentAuthManager().Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, errRegister)
+		}
+	}
+
+	rawResp, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostAuthList, nil)
+	if errCall != nil {
+		t.Fatalf("host auth list: %v", errCall)
+	}
+	resp, errDecode := decodeRPCEnvelope[rpcHostAuthListResponse](rawResp)
+	if errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if len(resp.Files) != 1 {
+		t.Fatalf("files = %#v, want only the config API-key entry", resp.Files)
+	}
+	entry := resp.Files[0]
+	if entry.ID != configAuth.ID ||
+		entry.AuthIndex != configAuth.Index ||
+		entry.Name != configAuth.ID ||
+		entry.Provider != "claude" ||
+		entry.Source != coreauth.AuthSourceConfig ||
+		entry.RuntimeOnly ||
+		entry.Path != "" ||
+		entry.Priority != 7 {
+		t.Fatalf("safe config entry = %#v", entry)
+	}
+	encoded, errMarshal := json.Marshal(resp)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	for _, forbidden := range []string{secretAPIKey, sourceToken, baseURL, "private-header-value", "api_key", "base_url"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("host auth list leaked %q: %s", forbidden, encoded)
+		}
+	}
+
+	request, errMarshal := json.Marshal(pluginapi.HostAuthGetRequest{AuthIndex: configAuth.Index})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	runtimeRaw, errRuntime := host.callFromPlugin(context.Background(), pluginabi.MethodHostAuthGetRuntime, request)
+	if errRuntime != nil {
+		t.Fatalf("host auth runtime info: %v", errRuntime)
+	}
+	runtimeEntry, errDecode := decodeRPCEnvelope[pluginapi.HostAuthGetRuntimeResponse](runtimeRaw)
+	if errDecode != nil {
+		t.Fatalf("decode runtime response: %v", errDecode)
+	}
+	if runtimeEntry.Auth.ID != configAuth.ID || runtimeEntry.Auth.Source != coreauth.AuthSourceConfig {
+		t.Fatalf("runtime entry = %#v", runtimeEntry.Auth)
+	}
+	if _, errPhysical := host.callFromPlugin(context.Background(), pluginabi.MethodHostAuthGet, request); errPhysical == nil {
+		t.Fatal("pathless config API key unexpectedly exposed a physical JSON payload")
 	}
 }
 

@@ -297,7 +297,8 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() && len(tools.Array()) > 0 {
 		var anthropicTools [][]byte
 		tools.ForEach(func(_, tool gjson.Result) bool {
-			if tool.Get("type").String() == "function" {
+			switch tool.Get("type").String() {
+			case "function":
 				function := tool.Get("function")
 				anthropicTool := []byte(`{"name":"","description":""}`)
 				anthropicTool, _ = sjson.SetBytes(anthropicTool, "name", function.Get("name").String())
@@ -314,6 +315,17 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					anthropicTool = common.AttachCacheControl(anthropicTool, function)
 				}
 
+				anthropicTools = append(anthropicTools, anthropicTool)
+			case "web_search", "web_search_preview", "web_search_preview_2025_03_11":
+				// OpenAI Chat clients may send Responses-compatible built-in
+				// tools. Preserve web search as Claude's server-side tool
+				// instead of dropping it while still mapping "required" to
+				// tool_choice.any, which would create an invalid request.
+				anthropicTool := []byte(`{"type":"web_search_20250305","name":"web_search"}`)
+				if maxUses := tool.Get("max_uses"); maxUses.Exists() {
+					anthropicTool, _ = sjson.SetBytes(anthropicTool, "max_uses", maxUses.Int())
+				}
+				anthropicTool = common.AttachCacheControl(anthropicTool, tool)
 				anthropicTools = append(anthropicTools, anthropicTool)
 			}
 			return true

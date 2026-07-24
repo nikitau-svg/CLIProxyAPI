@@ -2,10 +2,15 @@ package handlers
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"golang.org/x/net/context"
 )
 
@@ -21,6 +26,8 @@ type modelExecutionOptions struct {
 	SkipInterceptorPluginID string
 	SkipRouterPluginID      string
 	ForcedProvider          string
+	PinnedAuthID            string
+	SingleAttempt           bool
 	AuthSelectionModel      string
 }
 
@@ -29,6 +36,8 @@ type ProtocolExecutionRequest struct {
 	EntryProtocol      string
 	ExitProtocol       string
 	ForcedProvider     string
+	AuthID             string
+	SingleAttempt      bool
 	AuthSelectionModel string
 	Model              string
 	Stream             bool
@@ -42,6 +51,10 @@ type ProtocolExecutionRequest struct {
 type ModelExecutionRequest struct {
 	EntryProtocol           string
 	ExitProtocol            string
+	ForcedProvider          string
+	AuthID                  string
+	SingleAttempt           bool
+	AllowImageModel         bool
 	Model                   string
 	Stream                  bool
 	Body                    []byte
@@ -74,9 +87,12 @@ type ModelExecutionChunk struct {
 
 // ModelExecutionStreamError carries a JSON-friendly terminal stream error.
 type ModelExecutionStreamError struct {
+	Code       string      `json:"code,omitempty"`
 	StatusCode int         `json:"status_code"`
 	Message    string      `json:"message"`
+	Retryable  bool        `json:"retryable,omitempty"`
 	Headers    http.Header `json:"headers"`
+	RetryAfter string      `json:"retry_after,omitempty"`
 }
 
 // Error returns the stream error message or the HTTP status text.
@@ -98,10 +114,39 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 	if req.Stream {
 		return ModelExecutionResponse{}, modelExecutionModeError("ExecuteModel requires Stream=false")
 	}
-	body, headers, errMsg := h.executeWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, false, modelExecutionOptions{
+	body, headers, errMsg := h.executeWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, req.AllowImageModel, modelExecutionOptions{
 		Headers:                 req.Headers,
 		Query:                   req.Query,
 		InternalSource:          true,
+		ForcedProvider:          req.ForcedProvider,
+		PinnedAuthID:            req.AuthID,
+		SingleAttempt:           req.SingleAttempt,
+		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
+		SkipRouterPluginID:      req.SkipRouterPluginID,
+	})
+	if errMsg != nil {
+		return ModelExecutionResponse{}, errMsg
+	}
+	return ModelExecutionResponse{
+		StatusCode: http.StatusOK,
+		Headers:    cloneHeader(headers),
+		Body:       cloneBytes(body),
+	}, nil
+}
+
+// CountModelTokens counts tokens for an internal model request using the same
+// provider and auth execution controls as ExecuteModel.
+func (h *BaseAPIHandler) CountModelTokens(ctx context.Context, req ModelExecutionRequest) (ModelExecutionResponse, *interfaces.ErrorMessage) {
+	if req.Stream {
+		return ModelExecutionResponse{}, modelExecutionModeError("CountModelTokens requires Stream=false")
+	}
+	body, headers, errMsg := h.executeCountWithAuthManager(ctx, req.EntryProtocol, req.Model, cloneBytes(req.Body), req.Alt, modelExecutionOptions{
+		Headers:                 req.Headers,
+		Query:                   req.Query,
+		InternalSource:          true,
+		ForcedProvider:          req.ForcedProvider,
+		PinnedAuthID:            req.AuthID,
+		SingleAttempt:           req.SingleAttempt,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
 		SkipRouterPluginID:      req.SkipRouterPluginID,
 	})
@@ -123,10 +168,13 @@ func (h *BaseAPIHandler) ExecuteModelStream(ctx context.Context, req ModelExecut
 	if !req.Stream {
 		return ModelExecutionStream{}, modelExecutionModeError("ExecuteModelStream requires Stream=true")
 	}
-	dataChan, headers, errChan := h.executeStreamWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, false, modelExecutionOptions{
+	dataChan, headers, errChan := h.executeStreamWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, req.AllowImageModel, modelExecutionOptions{
 		Headers:                 req.Headers,
 		Query:                   req.Query,
 		InternalSource:          true,
+		ForcedProvider:          req.ForcedProvider,
+		PinnedAuthID:            req.AuthID,
+		SingleAttempt:           req.SingleAttempt,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
 		SkipRouterPluginID:      req.SkipRouterPluginID,
 	})
@@ -150,6 +198,8 @@ func (h *BaseAPIHandler) ExecuteProtocolWithAuthManager(ctx context.Context, req
 		Headers:            req.Headers,
 		Query:              req.Query,
 		ForcedProvider:     req.ForcedProvider,
+		PinnedAuthID:       req.AuthID,
+		SingleAttempt:      req.SingleAttempt,
 		AuthSelectionModel: req.AuthSelectionModel,
 	})
 	if errMsg != nil {
@@ -171,6 +221,8 @@ func (h *BaseAPIHandler) ExecuteProtocolStreamWithAuthManager(ctx context.Contex
 		Headers:            req.Headers,
 		Query:              req.Query,
 		ForcedProvider:     req.ForcedProvider,
+		PinnedAuthID:       req.AuthID,
+		SingleAttempt:      req.SingleAttempt,
 		AuthSelectionModel: req.AuthSelectionModel,
 	})
 	chunks, errMsg := prepareModelExecutionStream(ctx, dataChan, errChan)
@@ -315,10 +367,100 @@ func modelExecutionStreamErrorFromMessage(errMsg *interfaces.ErrorMessage) *Mode
 	if errMsg.Error != nil {
 		message = errMsg.Error.Error()
 	}
+	statusCode := errMsg.StatusCode
+	headers := cloneHeader(errMsg.Addon)
+	code := ""
+	retryable := false
+	retryableKnown := false
+
+	var authErr *coreauth.Error
+	if errors.As(errMsg.Error, &authErr) && authErr != nil {
+		code = strings.TrimSpace(authErr.Code)
+		retryable = authErr.Retryable
+		retryableKnown = true
+		if statusCode == 0 {
+			statusCode = authErr.HTTPStatus
+		}
+	}
+	var coded interface{ ErrorCode() string }
+	if code == "" && errors.As(errMsg.Error, &coded) && coded != nil {
+		code = strings.TrimSpace(coded.ErrorCode())
+	}
+	var statusProvider interface{ StatusCode() int }
+	if statusCode == 0 && errors.As(errMsg.Error, &statusProvider) && statusProvider != nil {
+		statusCode = statusProvider.StatusCode()
+	}
+	var retryableProvider interface{ Retryable() bool }
+	if !retryableKnown && errors.As(errMsg.Error, &retryableProvider) && retryableProvider != nil {
+		retryable = retryableProvider.Retryable()
+		retryableKnown = true
+	}
+	var headerProvider interface{ Headers() http.Header }
+	if errors.As(errMsg.Error, &headerProvider) && headerProvider != nil {
+		headers = mergeModelExecutionErrorHeaders(headers, headerProvider.Headers())
+	}
+	if !retryableKnown {
+		retryable = isRetryableModelExecutionStatus(statusCode)
+	}
+	retryAfter := strings.TrimSpace(headers.Get("Retry-After"))
+	if retryAfter == "" {
+		var retryAfterValueProvider interface{ RetryAfterValue() string }
+		if errors.As(errMsg.Error, &retryAfterValueProvider) && retryAfterValueProvider != nil {
+			retryAfter = strings.TrimSpace(retryAfterValueProvider.RetryAfterValue())
+		}
+	}
+	if retryAfter == "" {
+		var retryAfterDurationProvider interface{ RetryAfter() *time.Duration }
+		if errors.As(errMsg.Error, &retryAfterDurationProvider) && retryAfterDurationProvider != nil {
+			if duration := retryAfterDurationProvider.RetryAfter(); duration != nil {
+				seconds := int64(math.Ceil(duration.Seconds()))
+				if seconds < 0 {
+					seconds = 0
+				}
+				retryAfter = strconv.FormatInt(seconds, 10)
+			}
+		}
+	}
+	if code == "" {
+		code = "model_execution_failed"
+	}
 	return &ModelExecutionStreamError{
-		StatusCode: errMsg.StatusCode,
+		Code:       code,
+		StatusCode: statusCode,
 		Message:    message,
-		Headers:    cloneHeader(errMsg.Addon),
+		Retryable:  retryable,
+		Headers:    headers,
+		RetryAfter: retryAfter,
+	}
+}
+
+func mergeModelExecutionErrorHeaders(base, extra http.Header) http.Header {
+	if len(extra) == 0 {
+		return base
+	}
+	if base == nil {
+		base = make(http.Header, len(extra))
+	}
+	for key, values := range extra {
+		base.Del(key)
+		for _, value := range values {
+			base.Add(key, value)
+		}
+	}
+	return base
+}
+
+func isRetryableModelExecutionStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
 	}
 }
 

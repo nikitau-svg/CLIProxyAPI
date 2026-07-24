@@ -388,16 +388,22 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 	}
 	auth.EnsureIndex()
 	runtimeOnly := isRuntimeOnlyAuth(auth)
+	sourceKind := auth.AuthSourceKind()
+	configAPIKey := sourceKind == coreauth.AuthSourceConfig && coreauth.IsConfigAPIKeyAuth(auth)
 	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
 		return nil
 	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" && !runtimeOnly {
+	if path == "" && !runtimeOnly && !configAPIKey {
 		return nil
 	}
 	name := strings.TrimSpace(auth.FileName)
 	if name == "" {
 		name = auth.ID
+	}
+	entrySource := coreauth.AuthSourceMemory
+	if configAPIKey {
+		entrySource = coreauth.AuthSourceConfig
 	}
 	entry := &pluginapi.HostAuthFileEntry{
 		ID:             auth.ID,
@@ -411,7 +417,7 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 		Disabled:       auth.Disabled,
 		Unavailable:    auth.Unavailable,
 		RuntimeOnly:    runtimeOnly,
-		Source:         "memory",
+		Source:         entrySource,
 		Success:        auth.Success,
 		Failed:         auth.Failed,
 		RecentRequests: hostRecentRequests(auth),
@@ -422,9 +428,14 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 	if projectID := authProjectID(auth); projectID != "" {
 		entry.ProjectID = projectID
 	}
-	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
-		entry.AccountType = accountType
-		entry.Account = account
+	// AccountInfo() intentionally identifies API-key auths by the key itself.
+	// Config credentials are listable for routing, but their secret must never
+	// cross the metadata-only host callback.
+	if !configAPIKey {
+		if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
+			entry.AccountType = accountType
+			entry.Account = account
+		}
 	}
 	if !auth.CreatedAt.IsZero() {
 		entry.CreatedAt = auth.CreatedAt
@@ -449,7 +460,7 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
 				return nil
 			}
-			entry.Source = "memory"
+			entry.Source = coreauth.AuthSourceMemory
 		}
 	}
 	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {

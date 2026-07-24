@@ -380,6 +380,7 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 type claudeErrorDetail struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+	Code    string `json:"code,omitempty"`
 }
 
 type claudeErrorResponse struct {
@@ -390,23 +391,29 @@ type claudeErrorResponse struct {
 func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claudeErrorResponse {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
+	errorCode := ""
 	if msg != nil {
 		if msg.StatusCode > 0 {
 			status = msg.StatusCode
 			errText = http.StatusText(status)
 		}
 		if msg.Error != nil {
+			errorCode = handlers.PreservedErrorCode(status, msg.Error)
 			if v := strings.TrimSpace(msg.Error.Error()); v != "" {
 				errText = v
 			}
 		}
 	}
-	errType, message := claudeErrorDetailFromText(status, errText)
+	errType, message, payloadCode := claudeErrorDetailFromText(status, errText)
+	if errorCode == "" {
+		errorCode = payloadCode
+	}
 	return claudeErrorResponse{
 		Type: "error",
 		Error: claudeErrorDetail{
 			Type:    errType,
 			Message: message,
+			Code:    errorCode,
 		},
 	}
 }
@@ -440,12 +447,13 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	_, _ = c.Writer.Write(body)
 }
 
-func claudeErrorDetailFromText(status int, errText string) (string, string) {
+func claudeErrorDetailFromText(status int, errText string) (string, string, string) {
 	message := strings.TrimSpace(errText)
 	if message == "" {
 		message = http.StatusText(status)
 	}
 	errType := claudeErrorTypeFromStatus(status)
+	errorCode := ""
 
 	var payload map[string]any
 	if json.Valid([]byte(message)) {
@@ -459,6 +467,9 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 				} else if c, ok := e["code"].(string); ok && strings.TrimSpace(c) != "" {
 					message = strings.TrimSpace(c)
 				}
+				if c, ok := e["code"].(string); ok {
+					errorCode = strings.TrimSpace(c)
+				}
 			} else {
 				if t, ok := payload["type"].(string); ok && strings.TrimSpace(t) != "" && strings.TrimSpace(t) != "error" {
 					errType = strings.TrimSpace(t)
@@ -466,11 +477,14 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 				if m, ok := payload["message"].(string); ok && strings.TrimSpace(m) != "" {
 					message = strings.TrimSpace(m)
 				}
+				if c, ok := payload["code"].(string); ok {
+					errorCode = strings.TrimSpace(c)
+				}
 			}
 		}
 	}
 
-	return errType, message
+	return errType, message, errorCode
 }
 
 func claudeErrorTypeFromStatus(status int) string {

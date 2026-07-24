@@ -36,16 +36,36 @@ type rpcThinkingApplier struct {
 }
 
 type rpcPluginError struct {
+	code       string
 	message    string
 	statusCode int
+	retryable  bool
+	headers    http.Header
+	retryAfter string
 }
 
 func (e rpcPluginError) Error() string {
 	return e.message
 }
 
+func (e rpcPluginError) ErrorCode() string {
+	return e.code
+}
+
 func (e rpcPluginError) StatusCode() int {
 	return e.statusCode
+}
+
+func (e rpcPluginError) Retryable() bool {
+	return e.retryable
+}
+
+func (e rpcPluginError) Headers() http.Header {
+	return cloneHeader(e.headers)
+}
+
+func (e rpcPluginError) RetryAfterValue() string {
+	return e.retryAfter
 }
 
 type rpcResponseNormalizer struct {
@@ -292,10 +312,14 @@ func decodeEnvelopeResult[T any](envelope pluginabi.Envelope) (T, error) {
 			if message == "" {
 				message = "plugin call failed"
 			}
-			if envelope.Error.HTTPStatus > 0 {
-				return zero, rpcPluginError{message: message, statusCode: envelope.Error.HTTPStatus}
+			return zero, rpcPluginError{
+				code:       strings.TrimSpace(envelope.Error.Code),
+				message:    message,
+				statusCode: envelope.Error.HTTPStatus,
+				retryable:  envelope.Error.Retryable,
+				headers:    cloneHeader(envelope.Error.Headers),
+				retryAfter: strings.TrimSpace(envelope.Error.RetryAfter),
 			}
-			return zero, fmt.Errorf("%s", message)
 		}
 		return zero, fmt.Errorf("plugin call failed")
 	}

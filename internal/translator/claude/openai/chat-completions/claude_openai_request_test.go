@@ -382,6 +382,40 @@ func TestConvertOpenAIRequestToClaude_PreservesToolCacheControl(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIRequestToClaude_PreservesBuiltinWebSearchWithRequiredChoice(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-haiku-4-5-20251001",
+		"messages": [{"role": "user", "content": "Search the web"}],
+		"tools": [
+			{
+				"type": "web_search",
+				"max_uses": 1,
+				"cache_control": {"type": "ephemeral"}
+			}
+		],
+		"tool_choice": "required"
+	}`
+
+	result := ConvertOpenAIRequestToClaude("claude-haiku-4-5-20251001", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+
+	if got := resultJSON.Get("tools.0.type").String(); got != "web_search_20250305" {
+		t.Fatalf("tools.0.type = %q, want web_search_20250305. Output: %s", got, result)
+	}
+	if got := resultJSON.Get("tools.0.name").String(); got != "web_search" {
+		t.Fatalf("tools.0.name = %q, want web_search. Output: %s", got, result)
+	}
+	if got := resultJSON.Get("tools.0.max_uses").Int(); got != 1 {
+		t.Fatalf("tools.0.max_uses = %d, want 1. Output: %s", got, result)
+	}
+	if got := resultJSON.Get("tools.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("tools.0.cache_control.type = %q, want ephemeral. Output: %s", got, result)
+	}
+	if got := resultJSON.Get("tool_choice.type").String(); got != "any" {
+		t.Fatalf("tool_choice.type = %q, want any. Output: %s", got, result)
+	}
+}
+
 func TestConvertOpenAIRequestToClaude_PartCacheControlWinsOverMessageLevel(t *testing.T) {
 	inputJSON := `{
 		"model": "gpt-4.1",

@@ -313,7 +313,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
-	body = normalizeClaudeSamplingForUpstream(body)
+	if err = validateClaudeSamplingForUpstream(body, upstreamModel); err != nil {
+		return resp, err
+	}
 	// Claude OAuth (and this executor's redact-thinking beta) returns signature-only
 	// thinking blocks unless display is set to "summarized".
 	body = ensureClaudeThinkingDisplay(body)
@@ -508,7 +510,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
-	body = normalizeClaudeSamplingForUpstream(body)
+	if err = validateClaudeSamplingForUpstream(body, upstreamModel); err != nil {
+		return nil, err
+	}
 	// Claude OAuth (and this executor's redact-thinking beta) returns signature-only
 	// thinking blocks unless display is set to "summarized".
 	body = ensureClaudeThinkingDisplay(body)
@@ -969,18 +973,88 @@ func disableThinkingIfToolChoiceForced(body []byte) []byte {
 	return body
 }
 
-// normalizeClaudeSamplingForUpstream keeps Anthropic message requests valid.
-func normalizeClaudeSamplingForUpstream(body []byte) []byte {
-	body, _ = sjson.DeleteBytes(body, "temperature")
-	body, _ = sjson.DeleteBytes(body, "top_p")
-
+// validateClaudeSamplingForUpstream rejects sampling controls that Anthropic
+// does not allow while extended thinking is active. Sampling controls are
+// otherwise preserved exactly as supplied by the client.
+func validateClaudeSamplingForUpstream(body []byte, model string) error {
 	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
+	thinkingActive := false
+	defaultSamplingOnly := claudeModelUsesDefaultSamplingOnly(model)
 	switch thinkingType {
 	case "enabled", "adaptive", "auto":
-		body, _ = sjson.DeleteBytes(body, "top_p")
-		body, _ = sjson.DeleteBytes(body, "top_k")
+		thinkingActive = true
+	default:
+		if !defaultSamplingOnly {
+			return nil
+		}
 	}
-	return body
+	if !thinkingActive && !defaultSamplingOnly {
+		return nil
+	}
+
+	if temperature := gjson.GetBytes(body, "temperature"); temperature.Exists() && temperature.Raw != "null" {
+		if temperature.Type != gjson.Number {
+			return newClaudeRequestValidationError("temperature must be a number for this Claude request")
+		}
+		if temperature.Float() != 1 {
+			return newClaudeRequestValidationError("temperature may only be set to 1 for this Claude request")
+		}
+	}
+	if topK := gjson.GetBytes(body, "top_k"); topK.Exists() && topK.Raw != "null" {
+		if defaultSamplingOnly {
+			return newClaudeRequestValidationError("top_k is not supported by this Claude model")
+		}
+		return newClaudeRequestValidationError("top_k is not supported when thinking is enabled")
+	}
+	if topP := gjson.GetBytes(body, "top_p"); topP.Exists() && topP.Raw != "null" {
+		if topP.Type != gjson.Number {
+			return newClaudeRequestValidationError("top_p must be a number when thinking is enabled")
+		}
+		value := topP.Float()
+		minimum := 0.95
+		if defaultSamplingOnly {
+			minimum = 0.99
+		}
+		if value < minimum || value > 1 {
+			return newClaudeRequestValidationError(
+				fmt.Sprintf("top_p must be between %.2f and 1 for this Claude request", minimum),
+			)
+		}
+	}
+	return nil
+}
+
+func claudeModelUsesDefaultSamplingOnly(model string) bool {
+	const claudeOpus47Created = int64(1776297600)
+	info := registry.LookupModelInfo(strings.TrimSpace(model), "claude")
+	if info == nil {
+		return false
+	}
+	return strings.EqualFold(info.Type, "claude") &&
+		info.Created >= claudeOpus47Created
+}
+
+type claudeRequestValidationError struct {
+	message string
+}
+
+func newClaudeRequestValidationError(message string) error {
+	return &claudeRequestValidationError{message: message}
+}
+
+func (e *claudeRequestValidationError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return "invalid_request_error: " + e.message
+}
+
+func (e *claudeRequestValidationError) StatusCode() int {
+	return http.StatusBadRequest
+}
+
+func (e *claudeRequestValidationError) IsRequestScoped() bool {
+	return true
 }
 
 // ensureClaudeThinkingDisplay defaults thinking.display to "summarized" when thinking

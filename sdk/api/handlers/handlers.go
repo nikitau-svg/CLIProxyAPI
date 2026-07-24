@@ -165,6 +165,18 @@ func WithDisallowFreeAuth(ctx context.Context) context.Context {
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
 // If errText is already valid JSON, it is returned as-is to preserve upstream error payloads.
 func BuildErrorResponseBody(status int, errText string) []byte {
+	return buildErrorResponseBody(status, errText, "")
+}
+
+// BuildErrorResponseBodyWithCode builds an OpenAI-compatible JSON error
+// response while preserving a machine-readable code supplied by an executor
+// or plugin. Existing JSON error payloads remain authoritative and are
+// returned unchanged.
+func BuildErrorResponseBodyWithCode(status int, errText, errorCode string) []byte {
+	return buildErrorResponseBody(status, errText, strings.TrimSpace(errorCode))
+}
+
+func buildErrorResponseBody(status int, errText, errorCode string) []byte {
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}
@@ -178,7 +190,7 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	}
 
 	errType := "invalid_request_error"
-	var code string
+	code := errorCode
 	switch status {
 	case http.StatusUnauthorized:
 		errType = "authentication_error"
@@ -210,6 +222,34 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"server_error","code":"internal_server_error"}}`, errText))
 	}
 	return payload
+}
+
+// ErrorCodeFromError returns a structured machine-readable error code exposed
+// explicitly by an executor or plugin without treating internal auth-manager
+// state markers as public API codes.
+func ErrorCodeFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var coded interface{ ErrorCode() string }
+	if errors.As(err, &coded) && coded != nil {
+		return strings.TrimSpace(coded.ErrorCode())
+	}
+	return ""
+}
+
+// PreservedErrorCode keeps precise Bravo and 422 contract codes while leaving
+// the established OpenAI status-derived codes in place for ordinary
+// authentication, permission, and rate-limit failures.
+func PreservedErrorCode(status int, err error) string {
+	code := ErrorCodeFromError(err)
+	if code == "" || strings.EqualFold(code, "request_scoped") {
+		return ""
+	}
+	if status == http.StatusUnprocessableEntity || strings.HasPrefix(strings.ToLower(code), "bravo_") {
+		return code
+	}
+	return ""
 }
 
 // StreamingKeepAliveInterval returns the SSE keep-alive interval for this server.
@@ -280,6 +320,22 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if requestPath != "" {
 		meta[coreexecutor.RequestPathMetadataKey] = requestPath
 	}
+	if ginCtx != nil {
+		accessProvider := ""
+		if rawProvider, ok := ginCtx.Get("accessProvider"); ok {
+			if provider := contextMetadataString(rawProvider); provider != "" {
+				accessProvider = provider
+				meta[coreexecutor.AccessProviderMetadataKey] = provider
+			}
+		}
+		if accessProvider == "plugin:bravo:bravo" {
+			if rawAccessMetadata, ok := ginCtx.Get("accessMetadata"); ok {
+				if accessMetadata := sanitizedAccessMetadata(rawAccessMetadata); len(accessMetadata) > 0 {
+					meta[coreexecutor.AccessMetadataMetadataKey] = accessMetadata
+				}
+			}
+		}
+	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
@@ -300,6 +356,70 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	return meta
 }
 
+func contextMetadataString(raw any) string {
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	default:
+		return ""
+	}
+}
+
+func sanitizedAccessMetadata(raw any) map[string]string {
+	out := make(map[string]string)
+	add := func(key, value string) {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || !validBravoAccessMetadata(key, value) {
+			return
+		}
+		out[key] = value
+	}
+	switch values := raw.(type) {
+	case map[string]string:
+		for key, value := range values {
+			add(key, value)
+		}
+	case map[string]any:
+		for key, rawValue := range values {
+			add(key, contextMetadataString(rawValue))
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func validBravoAccessMetadata(key, value string) bool {
+	switch key {
+	case "bravo_access_provider":
+		return value == "bravo"
+	case "bravo_project_id":
+		if len(value) > 128 {
+			return false
+		}
+		for _, char := range value {
+			if (char >= 'a' && char <= 'z') ||
+				(char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') ||
+				char == '_' || char == '-' {
+				continue
+			}
+			return false
+		}
+		return true
+	case "bravo_key_name":
+		return len([]rune(value)) <= 120
+	case "bravo_allowed_models":
+		return len(value) <= 32<<10
+	default:
+		return false
+	}
+}
+
 func addAuthSelectionModelMetadata(meta map[string]any, model string) {
 	if meta == nil {
 		return
@@ -309,6 +429,18 @@ func addAuthSelectionModelMetadata(meta map[string]any, model string) {
 		return
 	}
 	meta[coreexecutor.AuthSelectionModelMetadataKey] = model
+}
+
+func addExecutionControlMetadata(meta map[string]any, authID string, singleAttempt bool) {
+	if meta == nil {
+		return
+	}
+	if authID = strings.TrimSpace(authID); authID != "" {
+		meta[coreexecutor.PinnedAuthMetadataKey] = authID
+	}
+	if singleAttempt {
+		meta[coreexecutor.SingleAttemptMetadataKey] = true
+	}
 }
 
 func setReasoningEffortMetadata(meta map[string]any, handlerType, model string, rawJSON []byte) {
@@ -757,6 +889,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
+	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
@@ -826,6 +959,8 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
+	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
+	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	setGenerateMetadata(reqMeta, rawJSON)
@@ -913,6 +1048,7 @@ func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtoco
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
+	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, modelName, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
@@ -1161,6 +1297,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
+	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
@@ -1300,6 +1437,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		chunkIndex := 0
 		var historyChunks [][]byte
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+		if execOptions.SingleAttempt {
+			maxBootstrapRetries = 0
+		}
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
 			if ctx == nil {
@@ -2225,7 +2365,11 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 
-	body := BuildErrorResponseBody(status, errText)
+	errorCode := ""
+	if msg != nil {
+		errorCode = PreservedErrorCode(status, msg.Error)
+	}
+	body := BuildErrorResponseBodyWithCode(status, errText, errorCode)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {

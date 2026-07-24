@@ -32,8 +32,14 @@ const ServiceTierMetadataKey = "service_tier"
 const GenerateMetadataKey = "generate"
 
 const (
+	// AccessProviderMetadataKey stores the frontend authentication provider identifier.
+	AccessProviderMetadataKey = "access_provider"
+	// AccessMetadataMetadataKey stores a sanitized copy of frontend authentication metadata.
+	AccessMetadataMetadataKey = "access_metadata"
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// SingleAttemptMetadataKey restricts execution to one credential and one provider call.
+	SingleAttemptMetadataKey = "single_attempt"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.

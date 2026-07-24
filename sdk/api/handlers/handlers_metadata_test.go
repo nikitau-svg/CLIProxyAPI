@@ -3,6 +3,7 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -54,6 +55,92 @@ func TestRequestExecutionMetadataTraceCallbackWebsocketDetection(t *testing.T) {
 			t.Fatal("missing selected auth index callback for ordinary HTTP request")
 		}
 	})
+}
+
+func TestRequestExecutionMetadataIncludesSanitizedFrontendAuthContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ginCtx.Set("accessProvider", "plugin:bravo:bravo")
+	ginCtx.Set("userApiKey", "sk-plaintext-must-not-leak")
+	ginCtx.Set("accessMetadata", map[string]string{
+		"bravo_access_provider": "bravo",
+		"bravo_project_id":      "prj_primary",
+		"bravo_key_name":        "primary",
+		"bravo_allowed_models":  "opus,sonnet",
+		"principal":             "bravo:primary",
+		"api_key":               "sk-plaintext-must-not-leak",
+		"access_token":          "token-plaintext-must-not-leak",
+		"accessToken":           "camel-token-must-not-leak",
+		"clientSecret":          "camel-secret-must-not-leak",
+		"tenant":                "unneeded-routing-data",
+	})
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	meta := requestExecutionMetadata(ctx)
+
+	if got := meta[coreexecutor.AccessProviderMetadataKey]; got != "plugin:bravo:bravo" {
+		t.Fatalf("AccessProviderMetadataKey = %#v", got)
+	}
+	accessMetadata, ok := meta[coreexecutor.AccessMetadataMetadataKey].(map[string]string)
+	if !ok {
+		t.Fatalf("AccessMetadataMetadataKey = %#v", meta[coreexecutor.AccessMetadataMetadataKey])
+	}
+	if accessMetadata["bravo_key_name"] != "primary" ||
+		accessMetadata["bravo_project_id"] != "prj_primary" ||
+		accessMetadata["bravo_allowed_models"] != "opus,sonnet" ||
+		accessMetadata["bravo_access_provider"] != "bravo" {
+		t.Fatalf("sanitized access metadata = %#v", accessMetadata)
+	}
+	for _, sensitive := range []string{"principal", "api_key", "access_token", "accessToken", "clientSecret", "tenant"} {
+		if _, exists := accessMetadata[sensitive]; exists {
+			t.Fatalf("non-allowlisted access metadata key %q leaked: %#v", sensitive, accessMetadata)
+		}
+	}
+	for key, value := range meta {
+		if key == "userApiKey" ||
+			value == "sk-plaintext-must-not-leak" ||
+			value == "token-plaintext-must-not-leak" ||
+			value == "camel-token-must-not-leak" ||
+			value == "camel-secret-must-not-leak" {
+			t.Fatalf("plaintext credential leaked in execution metadata: %#v", meta)
+		}
+	}
+}
+
+func TestRequestExecutionMetadataDropsBravoFieldsFromOtherAccessProviders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ginCtx.Set("accessProvider", "config-inline")
+	ginCtx.Set("accessMetadata", map[string]string{
+		"bravo_access_provider": "bravo",
+		"bravo_project_id":      "prj_spoofed",
+	})
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	meta := requestExecutionMetadata(ctx)
+
+	if got := meta[coreexecutor.AccessProviderMetadataKey]; got != "config-inline" {
+		t.Fatalf("AccessProviderMetadataKey = %#v", got)
+	}
+	if _, exists := meta[coreexecutor.AccessMetadataMetadataKey]; exists {
+		t.Fatalf("untrusted access metadata crossed into execution metadata: %#v", meta)
+	}
+}
+
+func TestSanitizedAccessMetadataRejectsInvalidBravoConstraints(t *testing.T) {
+	tooLongName := strings.Repeat("a", 121)
+	tooLongModels := strings.Repeat("m", (32<<10)+1)
+	got := sanitizedAccessMetadata(map[string]string{
+		"bravo_access_provider": "not-bravo",
+		"bravo_project_id":      "contains/slash",
+		"bravo_key_name":        tooLongName,
+		"bravo_allowed_models":  tooLongModels,
+	})
+	if len(got) != 0 {
+		t.Fatalf("invalid Bravo metadata survived constraints: %#v", got)
+	}
 }
 
 func TestSetReasoningEffortMetadataUsesSuffixOverBody(t *testing.T) {

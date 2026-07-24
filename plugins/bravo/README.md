@@ -1,0 +1,313 @@
+# Bravo Smart Router
+
+Bravo is a native CLIProxyAPI plugin that turns a project API key into a smart,
+provider-independent routing policy. The same key and logical model work
+through OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
+
+The plugin owns retries and fallback. It tries every eligible account for the
+current physical model before moving to the next mapped model/provider, pins
+each nested call to one credential, and disables the host's implicit retry
+loops. A stream may fall back only before the first client-visible payload.
+
+## Client endpoints
+
+OpenAI-compatible clients:
+
+```text
+Base URL: http://<gateway-host>:8317/v1
+API key:  the project Bravo key
+Model:    bravo/fast
+```
+
+Anthropic-compatible clients:
+
+```text
+Base URL: http://<gateway-host>:8317
+API key:  the same project Bravo key
+Model:    bravo/fast
+```
+
+Claude Code can keep its normal aliases and effort controls:
+
+```bash
+export ANTHROPIC_BASE_URL=http://<gateway-host>:8317
+export ANTHROPIC_AUTH_TOKEN='<project Bravo key>'
+export ANTHROPIC_DEFAULT_OPUS_MODEL=bravo/opus
+export ANTHROPIC_DEFAULT_SONNET_MODEL=bravo/sonnet
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=bravo/haiku
+claude --model opus --effort xhigh
+```
+
+Inside Claude Code, `/effort low|medium|high|xhigh|max` is carried through the
+Bravo route. The same applies to `--effort` and
+`CLAUDE_CODE_EFFORT_LEVEL`. Claude Code sends adaptive thinking and named
+effort through the Anthropic contract; the user does not need a separate Bravo
+command. Claude Code 2.1.218 also sends `thinking.display: "omitted"`;
+Bravo accepts this live-verified presentation preference and strips the source
+thinking object before executing a physical candidate.
+
+Bravo 0.5.0 also preserves PNG/JPEG image blocks sent through Anthropic
+Messages, including images nested in an older Claude Code `tool_result`.
+This path is live-verified for both Claude and Codex physical candidates,
+with and without streaming. Images do not change effort routing.
+
+OpenAI Chat accepts `reasoning_effort` or `reasoning.effort`; OpenAI Responses
+accepts `reasoning.effort` and the compatibility form `reasoning_effort`.
+Explicit effort wins over the candidate's mapped default. `auto` uses each
+mapped physical candidate's default. When a physical model does not expose the
+exact requested level, Bravo uses the greatest supported level below it and
+reports `bravo_requested_effort` and `bravo_effective_effort` separately.
+Manual token budgets, reasoning summaries, `none`, and `minimal` remain
+fail-closed.
+
+A fresh adaptive/named-effort request can route to Claude or Codex. If a later
+Anthropic Messages turn replays a signed Claude `thinking` block, Bravo keeps
+that turn on native Claude candidates with verified thinking support. It skips
+Codex rather than dropping or rewriting the signature; if no compatible
+Claude candidate remains, the request fails closed with 422 before an
+upstream call.
+
+OpenAI Responses string `input` is normalized to a user
+`message`/`input_text` item before candidate translation, so the short and
+canonical input forms share the same fallback behavior.
+
+Image generation and edit use the ordinary OpenAI image endpoints with one of:
+
+```text
+bravo/image
+bravo/gpt-image-2
+bravo/gpt-image-1.5
+```
+
+The production dashboard is available at:
+
+```text
+http://<gateway-host>:8317/v0/resource/plugins/bravo/dashboard
+```
+
+## Create a project key
+
+Open the authenticated CLIProxyAPI panel:
+
+```text
+http://<gateway-host>:8317/management.html
+```
+
+Open Bravo in the plugin area, select **Create project**, name the project,
+choose all subscriptions or a strict personal/work subscription pool, choose
+all logical models or a model allowlist, and create it. A primary subscription
+must be inside the allowed pool and may belong to only one active project.
+Allowed secondary subscriptions may be shared by multiple projects. The
+plaintext `brv_...` key is displayed once. The same page can edit,
+enable/disable, rotate, or delete a project; project details are closed by
+default.
+
+Use the new key as either an OpenAI API key or an Anthropic API key. Rotating
+immediately replaces the old key. Deleting a project invalidates its key.
+Revoked projects cannot be re-enabled or rotated.
+
+## Smart-key configuration
+
+Only a SHA-256 digest is stored in YAML:
+
+```yaml
+plugins:
+  enabled: true
+  dir: plugin-dist
+  configs:
+    bravo:
+      enabled: true
+      prefix: bravo/
+      require_smart_key: true
+      max_attempts: 0
+      cooldown_seconds: 30
+      smart_keys:
+        - id: prj_example
+          name: default-project
+          sha256: "<sha256-of-the-project-key>"
+          enabled: true
+          status: active
+          models: ["*"]
+          allowed_auth_ids: []
+          primary_auth_ids: []
+          policy: {}
+```
+
+`max_attempts: 0` means all eligible accounts may be tried. Ordinary API keys
+keep native CLIProxyAPI routing and cannot enter the `bravo/*` namespace.
+
+The authenticated CLIProxyAPI Management API owns project-key persistence:
+
+```text
+GET    /v0/management/bravo/projects
+POST   /v0/management/bravo/projects
+PATCH  /v0/management/bravo/projects
+DELETE /v0/management/bravo/projects
+POST   /v0/management/bravo/projects/rotate
+```
+
+`POST` and `rotate` return `plaintext_key` exactly once. Only its SHA-256 digest
+is sent to the host configuration persistence callback and stored in YAML.
+`PATCH`, `DELETE`, and `rotate` take the stable project `id` in their JSON body;
+`DELETE` also accepts `?id=...`. Project configuration already reserves
+`allowed_auth_ids`, `primary_auth_ids`, and `policy` for the subscription
+allocator. An empty allowed list is the backward-compatible all-subscriptions
+mode. A non-empty list is a hard authorization boundary for every primary,
+retry, and fallback; stale entries fail closed.
+
+## Per-project allocation and live quota
+
+Version 0.5.0 applies project ownership, strict pools, and reserve policy:
+
+- the persistent usage ledger is keyed by stable project ID and exact
+  `auth_index`;
+- a project can own one or more primary subscriptions, tried before the shared
+  pool and permitted to drain to zero;
+- `allowed_auth_ids` limits every allocator path to the project's selected
+  personal/work pool;
+- secondary `x1` subscriptions default to 50% session/week floors and `x5`
+  subscriptions to 30%/30%; provider-aware Codex/OpenAI Pro uses `x20` with
+  20%/20%, while Claude Pro remains `x1`;
+- both windows must remain above their independent floor after in-flight and
+  pending reservation;
+- confirmed secondary candidates are ordered by normalized quota headroom,
+  tariff-normalized weekly tokens, reservations, and a deterministic
+  rendezvous tie-break;
+- unknown/stale quota is blocked for secondary use by default rather than
+  treated as full;
+- Claude accounts with an unused session (`utilization=0`, `resets_at=null`)
+  remain confirmed at 100% with an `inactive` reset mode; a missing Codex
+  window can be explicitly `not_applicable`.
+
+The authenticated allocator endpoints are:
+
+```text
+GET   /v0/management/bravo/subscriptions
+PATCH /v0/management/bravo/subscriptions
+PATCH /v0/management/bravo/tariffs
+POST  /v0/management/bravo/quotas/refresh
+```
+
+Project and credential usage summaries include requests, failures, latency,
+input/output/reasoning/cache tokens, and total tokens. State is atomically
+persisted outside the credential discovery directory in
+`bravo-data/bravo-state.json`.
+
+Schema v2 also retains hourly analytics for 31 days and daily analytics for
+400 days. The authenticated analytics endpoint supports project,
+subscription, provider, model, time-range, and interval filters while exposing
+only stable redacted subscription IDs:
+
+```text
+GET /v0/management/bravo/analytics
+```
+
+The native Management UI provides 24h/7d/30d/90d/custom periods,
+previous-period comparison, charts, tables, CSV export, and
+project/subscription/logical-model/physical-model drill-down.
+
+Global logical routes are editable at runtime with validation, non-persistent
+preview, and reset to built-in defaults:
+
+```text
+GET  /v0/management/bravo/routes
+PUT  /v0/management/bravo/routes
+POST /v0/management/bravo/routes/reset
+```
+
+Capabilities are intentionally read-only. An unverified contract is rejected
+instead of being promoted by configuration.
+
+## Verified contract
+
+Text logical models currently support:
+
+- text and streaming;
+- client-defined function tools;
+- synthetic tool results;
+- built-in web search;
+- PNG/JPEG vision through Anthropic Messages, including nested `tool_result`
+  history, on both Claude and Codex candidates;
+- Anthropic token counting;
+- OpenAI Chat, OpenAI Responses, and Anthropic Messages entry/exit protocols.
+
+Image logical models currently support non-streaming generation and edit.
+
+The plugin rejects unverified semantics instead of silently dropping them.
+This currently includes image streaming, web-search domain filters, arbitrary
+provider-built-in tools, manual reasoning budgets/summaries, cross-provider
+signed-thinking replay, OpenAI Chat/Responses vision, file/document inputs,
+structured output, and background execution. Named effort is supported and
+resolved against each physical model before execution; signed Claude thinking
+replay is supported only on the native Anthropic-Messages-to-Claude route.
+
+Machine-readable contract failures survive the core execution path and the
+OpenAI Chat, Responses, and Anthropic error envelopes. Clients can distinguish
+codes such as `bravo_effort_invalid` and `bravo_contract_unverified`; the
+errors remain request-scoped and do not mark the selected credential
+unhealthy. Existing status-derived OpenAI codes remain unchanged. Typed detail
+after a stream has already emitted client-visible payload still requires the
+planned stream-close ABI extension; the current ABI carries a legacy string at
+that point.
+
+## Verification
+
+```bash
+cd plugins/bravo/go
+go test -race -count=1 -timeout=5m ./...
+```
+
+`Dockerfile.canary` deliberately does not commit generated WebUI bytes. Build
+the matching Management Center checkout first and copy its single-file output
+into the ignored release-input directory:
+
+```bash
+# Expected layout:
+#   ./CLIProxyAPI
+#   ./Cli-Proxy-API-Management-Center
+cd Cli-Proxy-API-Management-Center
+bun install --frozen-lockfile
+bun run verify
+
+install -d ../CLIProxyAPI/.canary-dist
+install -m 0644 dist/index.html \
+  ../CLIProxyAPI/.canary-dist/management.html
+```
+
+Then, from the CLIProxyAPI repository root, build the 0.5.0 image:
+
+```bash
+docker build --platform linux/arm64 \
+  --build-arg VERSION=v7.2.94-bravo-native0.5.0 \
+  --build-arg COMMIT=bravo-native0.5.0 \
+  --build-arg BUILD_DATE=YYYY-MM-DD \
+  -f Dockerfile.canary \
+  -t cliproxyapi-local:v7.2.94-bravo-native0.5.0 .
+```
+
+Reusable live harnesses:
+
+```text
+scripts/bravo-smoke.rb
+scripts/bravo-image-smoke.rb
+scripts/bravo-management-smoke.rb
+scripts/bravo-claude-cli-smoke.rb
+scripts/bravo-quota-allocator-smoke.rb
+scripts/bravo-string-diagnostic.rb
+scripts/bravo-vision-smoke.rb
+```
+
+The live harnesses read credentials from files and avoid printing secrets or
+image payloads.
+
+The verified 0.5.0 Linux/arm64 release image is
+`cliproxyapi-local:v7.2.94-bravo-native0.5.0` with
+`bravo-v0.5.0.so`; its reference digest is
+`sha256:605c9888b2f58c2d3db37575efecd2663b90e298f60b005315b073672b420b18`.
+Release gates include the full Go suite, focused race tests, plugin race/vet,
+77 WebUI tests plus lint/typecheck/build, a 12-cell protocol smoke, a 9-check
+projects/pools/routes/analytics smoke, controlled pre-payload failover, real
+Claude Code with `--effort xhigh`, and Chrome/Playwright desktop/mobile QA.
+
+The operator-oriented Russian deployment template is
+[`BRAVO_PRODUCTION_RUNBOOK_RU.md`](../../BRAVO_PRODUCTION_RUNBOOK_RU.md).

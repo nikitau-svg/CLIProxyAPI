@@ -70,6 +70,14 @@ func (h *Host) callHostModelStreamRead(ctx context.Context, request []byte) ([]b
 	}
 	if chunk.Err != nil {
 		resp.Error = chunk.Err.Error()
+		resp.ErrorDetail = &pluginapi.HostModelExecutionError{
+			Code:       chunk.Err.Code,
+			Message:    chunk.Err.Error(),
+			HTTPStatus: chunk.Err.StatusCode,
+			Retryable:  chunk.Err.Retryable,
+			Headers:    cloneHeader(chunk.Err.Headers),
+			RetryAfter: chunk.Err.RetryAfter,
+		}
 		resp.Done = true
 	}
 	return marshalRPCResult(resp)

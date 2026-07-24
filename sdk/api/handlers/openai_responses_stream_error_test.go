@@ -46,3 +46,35 @@ func TestBuildOpenAIResponsesStreamErrorChunkExtractsHTTPErrorBody(t *testing.T)
 		t.Fatalf("message = %v, want %q", payload["message"], "oops")
 	}
 }
+
+func TestBuildOpenAIResponsesStreamErrorChunkPreservesExplicit422Code(t *testing.T) {
+	chunk := BuildOpenAIResponsesStreamErrorChunkWithCode(
+		http.StatusUnprocessableEntity,
+		`reasoning_effort has unsupported effort "turbo"`,
+		"bravo_effort_invalid",
+		0,
+	)
+	var payload map[string]any
+	if err := json.Unmarshal(chunk, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload["code"] != "bravo_effort_invalid" {
+		t.Fatalf("code = %v, want %q", payload["code"], "bravo_effort_invalid")
+	}
+}
+
+func TestBuildOpenAIResponsesStreamErrorChunkPrefersUpstreamJSONCode(t *testing.T) {
+	chunk := BuildOpenAIResponsesStreamErrorChunkWithCode(
+		http.StatusUnprocessableEntity,
+		`{"error":{"message":"upstream rejected request","code":"upstream_code"}}`,
+		"bravo_effort_invalid",
+		0,
+	)
+	var payload map[string]any
+	if err := json.Unmarshal(chunk, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload["code"] != "upstream_code" {
+		t.Fatalf("code = %v, want %q", payload["code"], "upstream_code")
+	}
+}

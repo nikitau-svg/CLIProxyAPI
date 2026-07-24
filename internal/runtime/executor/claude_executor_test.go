@@ -2712,64 +2712,144 @@ func TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWordsWhenModeOmi
 	}
 }
 
-func TestNormalizeClaudeSamplingForUpstream_RemovesTemperature(t *testing.T) {
-	payload := []byte(`{"temperature":0,"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`)
-	out := normalizeClaudeSamplingForUpstream(payload)
-
-	if gjson.GetBytes(out, "temperature").Exists() {
-		t.Fatalf("temperature should be removed")
-	}
-}
-
-func TestNormalizeClaudeSamplingForUpstream_RemovesTemperatureWithThinkingEnabled(t *testing.T) {
-	payload := []byte(`{"temperature":0.2,"thinking":{"type":"enabled","budget_tokens":2048}}`)
-	out := normalizeClaudeSamplingForUpstream(payload)
-
-	if gjson.GetBytes(out, "temperature").Exists() {
-		t.Fatalf("temperature should be removed")
-	}
-}
-
-func TestNormalizeClaudeSamplingForUpstream_RemovesTopPAndTopKForThinking(t *testing.T) {
-	payload := []byte(`{"temperature":0.2,"top_p":0.9,"top_k":40,"thinking":{"type":"adaptive"}}`)
-	out := normalizeClaudeSamplingForUpstream(payload)
-
-	if gjson.GetBytes(out, "temperature").Exists() {
-		t.Fatalf("temperature should be removed")
-	}
-	if gjson.GetBytes(out, "top_p").Exists() {
-		t.Fatalf("top_p should be removed when thinking is active")
-	}
-	if gjson.GetBytes(out, "top_k").Exists() {
-		t.Fatalf("top_k should be removed when thinking is active")
-	}
-}
-
-func TestNormalizeClaudeSamplingForUpstream_NoThinkingRemovesTemperatureAndTopP(t *testing.T) {
+func TestValidateClaudeSamplingForUpstream_NoThinkingPreservesSampling(t *testing.T) {
 	payload := []byte(`{"temperature":0,"top_p":0.9,"top_k":40,"messages":[{"role":"user","content":"hi"}]}`)
-	out := normalizeClaudeSamplingForUpstream(payload)
+	out := bytes.Clone(payload)
+	if err := validateClaudeSamplingForUpstream(out, "claude-opus-4-6"); err != nil {
+		t.Fatalf("validateClaudeSamplingForUpstream() error = %v", err)
+	}
 
-	if gjson.GetBytes(out, "temperature").Exists() {
-		t.Fatalf("temperature should be removed")
-	}
-	if gjson.GetBytes(out, "top_p").Exists() {
-		t.Fatalf("top_p should be removed")
-	}
-	if got := gjson.GetBytes(out, "top_k").Int(); got != 40 {
-		t.Fatalf("top_k = %v, want 40", got)
+	if !bytes.Equal(out, payload) {
+		t.Fatalf("payload changed:\n got: %s\nwant: %s", out, payload)
 	}
 }
 
-func TestNormalizeClaudeSamplingForUpstream_AfterForcedToolChoiceRemovesTemperature(t *testing.T) {
+func TestValidateClaudeSamplingForUpstream_DisabledThinkingPreservesSampling(t *testing.T) {
+	payload := []byte(`{"temperature":0.2,"top_p":0.9,"top_k":40,"thinking":{"type":"disabled"}}`)
+	if err := validateClaudeSamplingForUpstream(payload, "claude-opus-4-6"); err != nil {
+		t.Fatalf("validateClaudeSamplingForUpstream() error = %v", err)
+	}
+}
+
+func TestValidateClaudeSamplingForUpstream_AllowsDocumentedThinkingValues(t *testing.T) {
+	for _, topP := range []string{"0.95", "0.975", "1"} {
+		payload := []byte(fmt.Sprintf(
+			`{"temperature":1,"top_p":%s,"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`,
+			topP,
+		))
+		if err := validateClaudeSamplingForUpstream(payload, "claude-opus-4-6"); err != nil {
+			t.Fatalf("top_p=%s: validateClaudeSamplingForUpstream() error = %v", topP, err)
+		}
+	}
+}
+
+func TestValidateClaudeSamplingForUpstream_UsesModernModelLimits(t *testing.T) {
+	for _, model := range []string{
+		"claude-opus-4-7",
+		"claude-opus-4-8",
+		"claude-sonnet-5",
+		"claude-fable-5",
+	} {
+		model := model
+		t.Run(model, func(t *testing.T) {
+			allowed := []byte(`{"temperature":1,"top_p":0.99,"thinking":{"type":"adaptive"}}`)
+			if err := validateClaudeSamplingForUpstream(allowed, model); err != nil {
+				t.Fatalf("documented default-compatible sampling error = %v", err)
+			}
+
+			for _, payload := range []string{
+				`{"temperature":0.5,"messages":[{"role":"user","content":"hi"}]}`,
+				`{"top_p":0.95,"thinking":{"type":"adaptive"}}`,
+				`{"top_k":40,"messages":[{"role":"user","content":"hi"}]}`,
+			} {
+				err := validateClaudeSamplingForUpstream([]byte(payload), model)
+				if err == nil {
+					t.Fatalf("modern model accepted incompatible sampling: %s", payload)
+				}
+				status, ok := err.(interface{ StatusCode() int })
+				if !ok || status.StatusCode() != http.StatusBadRequest {
+					t.Fatalf("error status = %v, want %d", err, http.StatusBadRequest)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateClaudeSamplingForUpstream_RejectsInvalidThinkingSampling(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		message string
+	}{
+		{
+			name:    "temperature below one",
+			payload: `{"temperature":0.2,"thinking":{"type":"enabled","budget_tokens":2048}}`,
+			message: "temperature may only be set to 1",
+		},
+		{
+			name:    "temperature wrong type",
+			payload: `{"temperature":"1","thinking":{"type":"adaptive"}}`,
+			message: "temperature must be a number",
+		},
+		{
+			name:    "top k",
+			payload: `{"top_k":40,"thinking":{"type":"adaptive"}}`,
+			message: "top_k is not supported",
+		},
+		{
+			name:    "top p below range",
+			payload: `{"top_p":0.949,"thinking":{"type":"adaptive"}}`,
+			message: "top_p must be between 0.95 and 1",
+		},
+		{
+			name:    "top p above range",
+			payload: `{"top_p":1.01,"thinking":{"type":"adaptive"}}`,
+			message: "top_p must be between 0.95 and 1",
+		},
+		{
+			name:    "top p wrong type",
+			payload: `{"top_p":"0.95","thinking":{"type":"adaptive"}}`,
+			message: "top_p must be a number",
+		},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateClaudeSamplingForUpstream(
+				[]byte(testCase.payload),
+				"claude-opus-4-6",
+			)
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !strings.Contains(err.Error(), testCase.message) {
+				t.Fatalf("error = %q, want substring %q", err, testCase.message)
+			}
+			status, ok := err.(interface{ StatusCode() int })
+			if !ok || status.StatusCode() != http.StatusBadRequest {
+				t.Fatalf("error status = %v, want %d", err, http.StatusBadRequest)
+			}
+			requestScoped, ok := err.(interface{ IsRequestScoped() bool })
+			if !ok || !requestScoped.IsRequestScoped() {
+				t.Fatalf("error should be request-scoped: %T %v", err, err)
+			}
+		})
+	}
+}
+
+func TestValidateClaudeSamplingForUpstream_AfterForcedToolChoicePreservesSampling(t *testing.T) {
 	payload := []byte(`{"temperature":0,"thinking":{"type":"adaptive"},"output_config":{"effort":"max"},"tool_choice":{"type":"any"}}`)
 	out := disableThinkingIfToolChoiceForced(payload)
-	out = normalizeClaudeSamplingForUpstream(out)
+	if err := validateClaudeSamplingForUpstream(out, "claude-opus-4-6"); err != nil {
+		t.Fatalf("validateClaudeSamplingForUpstream() error = %v", err)
+	}
 
 	if gjson.GetBytes(out, "thinking").Exists() {
 		t.Fatalf("thinking should be removed when tool_choice forces tool use")
 	}
-	if gjson.GetBytes(out, "temperature").Exists() {
-		t.Fatalf("temperature should be removed")
+	if got := gjson.GetBytes(out, "temperature").Float(); got != 0 {
+		t.Fatalf("temperature = %v, want 0", got)
 	}
 }
 

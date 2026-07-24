@@ -132,7 +132,8 @@ func (e *modelExecutionCaptureExecutor) Refresh(ctx context.Context, auth *corea
 	return auth, nil
 }
 
-func (e *modelExecutionCaptureExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+func (e *modelExecutionCaptureExecutor) CountTokens(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+	e.capture(req, opts)
 	return coreexecutor.Response{Payload: []byte("0")}, nil
 }
 
@@ -203,12 +204,15 @@ func TestExecuteModelCarriesEntryAndExitProtocols(t *testing.T) {
 	handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
 
 	resp, errMsg := handler.ExecuteModel(context.Background(), ModelExecutionRequest{
-		EntryProtocol: "openai",
-		ExitProtocol:  "claude",
-		Model:         model,
-		Body:          requestBody,
-		Headers:       http.Header{"X-Callback": []string{"nonstream"}},
-		Query:         url.Values{"q": []string{"callback"}},
+		EntryProtocol:  "openai",
+		ExitProtocol:   "claude",
+		ForcedProvider: "codex",
+		AuthID:         "model-execution-" + model,
+		SingleAttempt:  true,
+		Model:          model,
+		Body:           requestBody,
+		Headers:        http.Header{"X-Callback": []string{"nonstream"}},
+		Query:          url.Values{"q": []string{"callback"}},
 	})
 	if errMsg != nil {
 		t.Fatalf("ExecuteModel() error = %+v", errMsg)
@@ -245,6 +249,12 @@ func TestExecuteModelCarriesEntryAndExitProtocols(t *testing.T) {
 	if gotOpts.Metadata[modelExecutionMetadataSourceKey] != modelExecutionInternalSource {
 		t.Fatalf("source metadata = %#v, want %q", gotOpts.Metadata[modelExecutionMetadataSourceKey], modelExecutionInternalSource)
 	}
+	if gotOpts.Metadata[coreexecutor.PinnedAuthMetadataKey] != "model-execution-"+model {
+		t.Fatalf("pinned auth metadata = %#v", gotOpts.Metadata[coreexecutor.PinnedAuthMetadataKey])
+	}
+	if gotOpts.Metadata[coreexecutor.SingleAttemptMetadataKey] != true {
+		t.Fatalf("single attempt metadata = %#v", gotOpts.Metadata[coreexecutor.SingleAttemptMetadataKey])
+	}
 	if gotOpts.Headers.Get("X-Callback") != "nonstream" {
 		t.Fatalf("executor headers = %#v, want callback header", gotOpts.Headers)
 	}
@@ -276,6 +286,62 @@ func TestExecuteModelSkipsOriginatingPluginInterceptors(t *testing.T) {
 	}
 	if skipHost.beforeSkip != "origin-plugin" || skipHost.afterSkip != "origin-plugin" || skipHost.respSkip != "origin-plugin" {
 		t.Fatalf("skip ids = before:%q after:%q response:%q, want origin-plugin", skipHost.beforeSkip, skipHost.afterSkip, skipHost.respSkip)
+	}
+}
+
+func TestCountModelTokensCarriesExecutionControls(t *testing.T) {
+	model := "model-execution-count-model"
+	executor := &modelExecutionCaptureExecutor{}
+	handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{})
+
+	resp, errMsg := handler.CountModelTokens(context.Background(), ModelExecutionRequest{
+		EntryProtocol:  "openai",
+		ExitProtocol:   "openai",
+		ForcedProvider: "codex",
+		AuthID:         "model-execution-" + model,
+		SingleAttempt:  true,
+		Model:          model,
+		Body:           []byte(fmt.Sprintf(`{"model":%q}`, model)),
+	})
+	if errMsg != nil {
+		t.Fatalf("CountModelTokens() error = %+v", errMsg)
+	}
+	if resp.StatusCode != http.StatusOK || string(resp.Body) != "0" {
+		t.Fatalf("CountModelTokens() response = %#v", resp)
+	}
+	gotReq, gotOpts := executor.captured()
+	if gotReq.Model != model {
+		t.Fatalf("count model = %q, want %q", gotReq.Model, model)
+	}
+	if gotOpts.Metadata[coreexecutor.PinnedAuthMetadataKey] != "model-execution-"+model ||
+		gotOpts.Metadata[coreexecutor.SingleAttemptMetadataKey] != true ||
+		gotOpts.Metadata[modelExecutionMetadataSourceKey] != modelExecutionInternalSource {
+		t.Fatalf("count metadata = %#v", gotOpts.Metadata)
+	}
+}
+
+func TestExecuteModelAllowsImageOnlyModelWhenRequested(t *testing.T) {
+	model := "gpt-image-2"
+	executor := &modelExecutionCaptureExecutor{}
+	handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{})
+	request := ModelExecutionRequest{
+		EntryProtocol:  "openai",
+		ExitProtocol:   "openai",
+		ForcedProvider: "codex",
+		Model:          model,
+		Body:           []byte(fmt.Sprintf(`{"model":%q}`, model)),
+	}
+
+	if _, errMsg := handler.ExecuteModel(context.Background(), request); errMsg == nil {
+		t.Fatal("ExecuteModel() accepted image-only model without AllowImageModel")
+	}
+	request.AllowImageModel = true
+	resp, errMsg := handler.ExecuteModel(context.Background(), request)
+	if errMsg != nil {
+		t.Fatalf("ExecuteModel() rejected allowed image model: %+v", errMsg)
+	}
+	if resp.StatusCode != http.StatusOK || string(resp.Body) != "model-execution-ok" {
+		t.Fatalf("ExecuteModel() response = %#v", resp)
 	}
 }
 
@@ -436,7 +502,10 @@ func TestExecuteModelStreamStartupError(t *testing.T) {
 func TestExecuteModelStreamTerminalError(t *testing.T) {
 	model := "model-execution-stream-terminal-error-model"
 	requestBody := []byte(fmt.Sprintf(`{"model":%q,"stream":true}`, model))
-	errorHeaders := http.Header{"X-Stream-Error": []string{"terminal"}}
+	errorHeaders := http.Header{
+		"X-Stream-Error": []string{"terminal"},
+		"Retry-After":    []string{"12"},
+	}
 	executor := &modelExecutionCaptureExecutor{
 		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 			chunks := make(chan coreexecutor.StreamChunk, 2)
@@ -495,6 +564,9 @@ func TestExecuteModelStreamTerminalError(t *testing.T) {
 	}
 	if chunk.Err.Headers.Get("X-Stream-Error") != "terminal" {
 		t.Fatalf("terminal headers = %#v, want stream error header", chunk.Err.Headers)
+	}
+	if chunk.Err.Code != "model_execution_failed" || !chunk.Err.Retryable || chunk.Err.RetryAfter != "12" {
+		t.Fatalf("terminal structured error = %#v", chunk.Err)
 	}
 	if chunk, ok = <-stream.Chunks; ok {
 		t.Fatalf("unexpected extra stream chunk: %+v", chunk)

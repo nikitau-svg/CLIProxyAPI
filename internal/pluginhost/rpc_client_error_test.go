@@ -25,7 +25,10 @@ func TestDecodeEnvelopeResultPreservesPluginHTTPStatus(t *testing.T) {
 		Error: &pluginabi.Error{
 			Code:       "plugin_error",
 			Message:    "license required",
+			Retryable:  true,
 			HTTPStatus: http.StatusForbidden,
+			Headers:    http.Header{"Retry-After": []string{"7"}},
+			RetryAfter: "7",
 		},
 	})
 	if errDecode == nil {
@@ -40,6 +43,22 @@ func TestDecodeEnvelopeResultPreservesPluginHTTPStatus(t *testing.T) {
 	}
 	if got := statusProvider.StatusCode(); got != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+	}
+	coded, ok := errDecode.(interface{ ErrorCode() string })
+	if !ok || coded.ErrorCode() != "plugin_error" {
+		t.Fatalf("error code provider = %#v", errDecode)
+	}
+	retryable, ok := errDecode.(interface{ Retryable() bool })
+	if !ok || !retryable.Retryable() {
+		t.Fatalf("retryable provider = %#v", errDecode)
+	}
+	headerProvider, ok := errDecode.(interface{ Headers() http.Header })
+	if !ok || headerProvider.Headers().Get("Retry-After") != "7" {
+		t.Fatalf("headers provider = %#v", errDecode)
+	}
+	retryAfterProvider, ok := errDecode.(interface{ RetryAfterValue() string })
+	if !ok || retryAfterProvider.RetryAfterValue() != "7" {
+		t.Fatalf("retry-after provider = %#v", errDecode)
 	}
 }
 
