@@ -11,7 +11,7 @@ Bravo.
 На AWS собирается **один согласованный Docker image** из двух форков:
 
 1. [`nikitau-svg/CLIProxyAPI`](https://github.com/nikitau-svg/CLIProxyAPI),
-   release tag `bravo-v0.5.0-aws.1` — patched host, Bravo 0.5.0,
+   release tag `bravo-v0.5.0-aws.2` — patched host, Bravo 0.5.0,
    healthcheck и этот AWS-installer.
 2. [`nikitau-svg/Cli-Proxy-API-Management-Center`](https://github.com/nikitau-svg/Cli-Proxy-API-Management-Center),
    commit `28f1f27092031f9c06e27e1736865818b0c5c4a2` — подходящая
@@ -117,7 +117,7 @@ sudo install -d -o ubuntu -g ubuntu /srv/bravo-build
 cd /srv/bravo-build
 
 git clone \
-  --branch bravo-v0.5.0-aws.1 \
+  --branch bravo-v0.5.0-aws.2 \
   --single-branch \
   https://github.com/nikitau-svg/CLIProxyAPI.git \
   CLIProxyAPI
@@ -315,6 +315,24 @@ http://127.0.0.1:8317/management.html
 не открыты Security Group. Если конкретный OAuth flow предлагает ручную вставку
 полного callback URL, можно использовать её вместо дополнительного tunnel.
 
+### Что будет с маршрутами на чистой установке
+
+Пустой runtime автоматически получает встроенные маршруты Bravo: `frontier`,
+`deep`, `balanced`, `fast`, `auto`, семейства `opus`, `sonnet`, `haiku`,
+`fable`/`fabulus`, `sol`, `terra`, `luna`, точные aliases физических моделей и
+image-маршруты. Поэтому перед первым запросом вручную заполнять YAML не нужно.
+
+В `management.html` откройте **Bravo → Маршруты логических моделей**. Там можно
+на горячую полностью изменить цепочку кандидатов существующего маршрута:
+provider, физическую модель, effort, порядок и приоритет. Перед сохранением
+маршрут проверяется; кнопка reset возвращает встроенный default. Изменения
+сохраняются в `config.yaml`.
+
+Текущий редактор 0.5.0 не создаёт совершенно новый logical ID вроде
+`bravo/my-own-route`: он безопасно переопределяет уже зарегистрированные
+маршруты и разрешает только проверенные provider/model/capability сочетания.
+Добавление произвольных logical IDs остаётся отдельным будущим улучшением.
+
 ## 9. Проверить новый project key
 
 Через пока ещё открытый SSH tunnel:
@@ -355,14 +373,15 @@ Model:    bravo/opus
 2. открыть Security Group TCP `80` и `443`;
 3. поставить Caddy на host;
 4. оставить Docker на `127.0.0.1:8317`;
-5. публично проксировать API, но блокировать management/plugin-admin paths.
+5. публично проксировать API, но блокировать весь интерфейс и служебные
+   маршруты управления.
 
 Пример `/etc/caddy/Caddyfile`:
 
 ```caddyfile
 bravo.example.com {
 	@private {
-		path /management.html /v0/management /v0/management/* /v0/resource/plugins /v0/resource/plugins/* /anthropic/callback /codex/callback /antigravity/callback
+		path /management.html /v0 /v0/* /anthropic/callback /codex/callback /antigravity/callback
 	}
 
 	respond @private 404

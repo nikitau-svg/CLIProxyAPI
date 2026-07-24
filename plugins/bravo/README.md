@@ -79,11 +79,14 @@ bravo/gpt-image-2
 bravo/gpt-image-1.5
 ```
 
-The production dashboard is available at:
+Manage Bravo from the standard authenticated CLIProxyAPI panel:
 
 ```text
-http://<gateway-host>:8317/v0/resource/plugins/bravo/dashboard
+http://<gateway-host>:8317/management.html
 ```
+
+Open **Bravo** in the panel navigation. Projects, subscription pools, routes,
+quotas, and analytics are all managed there.
 
 ## Create a project key
 
