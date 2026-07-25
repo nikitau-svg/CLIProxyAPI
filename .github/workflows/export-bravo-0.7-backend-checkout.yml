@@ -1,0 +1,34 @@
+name: Export Bravo 0.7 backend checkout
+
+on:
+  push:
+    branches:
+      - fix/bravo-0.7-claude-failover-spark-multiquota
+    paths:
+      - .github/workflows/export-bravo-0.7-backend-checkout.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/bravo-0.7-claude-failover-spark-multiquota
+          fetch-depth: 0
+      - name: Pack exact branch checkout
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tar --exclude=.git -czf /tmp/bravo-backend-checkout.tgz .
+          sha256sum /tmp/bravo-backend-checkout.tgz
+      - name: Upload exact checkout
+        uses: actions/upload-artifact@v4
+        with:
+          name: bravo-backend-checkout
+          path: /tmp/bravo-backend-checkout.tgz
+          if-no-files-found: error
+          retention-days: 1
