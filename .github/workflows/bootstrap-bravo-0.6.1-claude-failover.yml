@@ -1,24 +1,28 @@
 name: Bootstrap Bravo 0.6.1 Claude CLI failover
 
 on:
-  push:
+  pull_request:
     branches:
-      - fix/bravo-0.6.1-claude-stream-failover
-    paths:
-      - .github/workflows/bootstrap-bravo-0.6.1-claude-failover.yml
+      - agent/bravo-0.6-production
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
 
+concurrency:
+  group: bootstrap-bravo-0.6.1-claude-failover
+  cancel-in-progress: false
+
 jobs:
   apply-test-and-commit:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Checkout exact patch branch
         uses: actions/checkout@v4
         with:
-          ref: fix/bravo-0.6.1-claude-stream-failover
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
       - name: Verify expected Bravo base
@@ -81,6 +85,8 @@ jobs:
 
       - name: Remove temporary bootstrap files and commit verified patch
         shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           set -Eeuo pipefail
           git rm .github/bravo-bootstrap/backend-patch.zip.b64
@@ -90,4 +96,4 @@ jobs:
           git config user.email 'noreply@slowdive.app'
           git add -A
           git commit -m 'feat(bravo): harden Claude CLI failover and Spark quota routing'
-          git push origin HEAD:fix/bravo-0.6.1-claude-stream-failover
+          git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
