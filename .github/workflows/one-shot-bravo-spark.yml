@@ -1,0 +1,92 @@
+name: One-shot Bravo Spark and quota hardening
+
+on:
+  push:
+    branches:
+      - fix/bravo-0.7-claude-spark-failover
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-bravo-spark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout generator branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install repository Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Unpack reviewed patchers outside the checkout
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          install -d /tmp/bravo-patches
+          base64 --decode .github/one-shot/bravo-spark-patches.tgz.b64 |
+            tar -xz -C /tmp/bravo-patches
+          sha256sum /tmp/bravo-patches/apply_backend.py \
+            /tmp/bravo-patches/apply_backend_hardening.py \
+            /tmp/bravo-patches/apply_backend_limit_signals.py
+
+      - name: Return to the exact reviewed backend base
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git reset --hard 43adff54abe8e0ca72721cc8ad9d14607ca231e8
+          test "$(git rev-parse HEAD)" = "43adff54abe8e0ca72721cc8ad9d14607ca231e8"
+          test -z "$(git status --porcelain)"
+
+      - name: Apply Spark, independent quota and quota resilience patches
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 /tmp/bravo-patches/apply_backend.py .
+          python3 /tmp/bravo-patches/apply_backend_hardening.py . --allow-non-exact-base
+          python3 /tmp/bravo-patches/apply_backend_limit_signals.py . --allow-non-exact-base
+          gofmt -w \
+            sdk/pluginapi/types.go \
+            internal/pluginhost/auth_quota_callbacks.go \
+            internal/pluginhost/auth_quota_callbacks_test.go \
+            plugins/bravo/go/*.go
+          git diff --check
+
+      - name: Run focused backend gates
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test ./plugins/bravo/go -count=1
+          go test ./internal/pluginhost -count=1
+          go test ./sdk/pluginapi -count=1
+          go test -race ./plugins/bravo/go -count=1
+          go vet ./plugins/bravo/go/...
+
+      - name: Run complete Go test suite
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test ./... -count=1 -timeout=15m
+
+      - name: Commit the generated source changes
+        shell: bash
+        env:
+          TARGET_BRANCH: fix/bravo-0.7-claude-spark-failover
+        run: |
+          set -Eeuo pipefail
+          test -n "$(git status --porcelain)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(bravo): add Spark independent quota routing"
+          git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
