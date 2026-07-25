@@ -1,0 +1,54 @@
+name: Verify Bravo 0.7 backend fix
+
+on:
+  push:
+    branches:
+      - fix/bravo-0.7-claude-failover-spark-multiquota
+    paths:
+      - .github/workflows/verify-bravo-0.7-backend.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: verify-bravo-0.7-backend
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/bravo-0.7-claude-failover-spark-multiquota
+          fetch-depth: 0
+
+      - name: Assert expected protocol and quota fixes exist
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          grep -R -q --exclude-dir=.git 'additional_rate_limits' .
+          grep -R -q --exclude-dir=.git 'bravo_pool_exhausted' .
+          grep -R -q --exclude-dir=.git -E 'Retry-After|retry_after' .
+          grep -R -q --exclude-dir=.git -E 'spark' .
+          find . -name '*_test.go' -print0 | xargs -0 grep -q -E 'bravo_pool_exhausted|additional_rate_limits|/v1/messages|anthropic|Claude'
+          git diff --check
+
+      - name: Run backend tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test ./...
+
+      - name: Record verified head
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf 'verified_sha=%s\nverified_at=%s\n' "$(git rev-parse HEAD)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .github/bravo-backend-verified.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/bravo-backend-verified.txt
+          git commit -m 'ci: record verified Bravo backend fix'
+          git push origin HEAD:fix/bravo-0.7-claude-failover-spark-multiquota
