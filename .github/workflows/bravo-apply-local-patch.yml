@@ -1,0 +1,85 @@
+name: Apply and verify Bravo failover patch
+
+on:
+  push:
+    branches:
+      - fix/bravo-0.7-claude-spark-failover
+    paths:
+      - ".github/bravo-patch/**"
+      - ".github/workflows/bravo-apply-local-patch.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bravo-apply-local-patch
+  cancel-in-progress: false
+
+jobs:
+  apply-test-and-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the patch branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Reconstruct and apply the reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/bravo-patch/part-* > /tmp/bravo-final.patch.gz.b64
+          echo "84be229a467bc864959accb139ed004ce168f5368288a709acf5cfc1fbeca5bc  /tmp/bravo-final.patch.gz.b64" | sha256sum -c -
+          base64 -d /tmp/bravo-final.patch.gz.b64 | gzip -d > /tmp/bravo-final.patch
+          echo "2a353ee2e151c1e9d063f200132a9deea1ec5200f017dee7528aa3450cb8774c  /tmp/bravo-final.patch" | sha256sum -c -
+          git apply --index /tmp/bravo-final.patch
+          git diff --cached --check
+
+      - name: Verify Go formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.go')
+          if [ -n "$files" ]; then
+            unformatted=$(gofmt -l $files)
+            test -z "$unformatted" || {
+              printf 'Unformatted Go files:\n%s\n' "$unformatted"
+              exit 1
+            }
+          fi
+
+      - name: Test host quota and plugin contracts
+        run: go test ./internal/pluginhost/... ./sdk/pluginapi/... -count=1 -timeout=10m
+
+      - name: Test Bravo plugin
+        working-directory: plugins/bravo/go
+        run: go test ./... -count=1 -timeout=10m
+
+      - name: Race-test Bravo plugin
+        working-directory: plugins/bravo/go
+        run: go test -race ./... -count=1 -timeout=15m
+
+      - name: Vet Bravo plugin
+        working-directory: plugins/bravo/go
+        run: go vet ./...
+
+      - name: Build CLIProxyAPI server
+        run: go build ./cmd/server
+
+      - name: Commit the verified source and remove staging files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm -r .github/bravo-patch
+          git rm .github/workflows/bravo-apply-local-patch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix(bravo): keep Claude routes alive across quota uncertainty"
+          git push origin HEAD:${GITHUB_REF_NAME}
