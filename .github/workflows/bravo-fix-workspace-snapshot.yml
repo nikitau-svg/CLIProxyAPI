@@ -20,7 +20,7 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      - name: Apply verified consolidated Bravo patch
+      - name: Reconstruct and verify payload
         shell: bash
         run: |
           set -euo pipefail
@@ -28,13 +28,33 @@ jobs:
           echo '2d180a330292aca144862a11a3362aa2eb769045278698cc5170cf94134f152c  /tmp/bravo-fix.patch.xz.b64' | sha256sum --check --strict
           base64 --decode /tmp/bravo-fix.patch.xz.b64 | xz --decompress > /tmp/bravo-fix.patch
           echo 'a9ee1e39fb67f796fd55f54808053158f7744ef621cf3d56b3eb39e9e60736dc  /tmp/bravo-fix.patch' | sha256sum --check --strict
+
+      - name: Validate and apply source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check /tmp/bravo-fix.patch
           git apply --index /tmp/bravo-fix.patch
+          git diff --cached --check
+
+      - name: Remove one-shot transport files
+        shell: bash
+        run: |
+          set -euo pipefail
           rm -rf .bravo-patch .github/one-shot
           rm -f .github/workflows/bravo-fix-workspace-snapshot.yml
           rm -f .github/workflows/one-shot-bravo-spark.yml
           git add -A
           git diff --cached --check
+
+      - name: Commit consolidated fix
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -m 'fix(bravo): restore Claude failover and independent Spark quota'
-          git push origin HEAD:${{ github.head_ref }}
+
+      - name: Push consolidated fix
+        shell: bash
+        run: git push origin HEAD:${{ github.head_ref }}
