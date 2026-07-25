@@ -24,6 +24,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
+          show-progress: false
 
       - name: Verify expected Bravo base
         shell: bash
@@ -45,21 +46,38 @@ jobs:
       - name: Decode and apply reviewed backend patch set
         shell: bash
         run: |
-          set -Eeuo pipefail
-          rm -rf /tmp/bravo-backend-patch
-          mkdir -p /tmp/bravo-backend-patch
-          base64 --decode .github/bravo-bootstrap/backend-patch.zip.b64 > /tmp/bravo-backend-patch.zip
-          unzip -q /tmp/bravo-backend-patch.zip -d /tmp/bravo-backend-patch
-          python3 /tmp/bravo-backend-patch/apply_backend.py "$GITHUB_WORKSPACE" --allow-non-exact-base
-          python3 /tmp/bravo-backend-patch/apply_backend_hardening.py "$GITHUB_WORKSPACE" --allow-non-exact-base
-          python3 /tmp/bravo-backend-patch/apply_backend_limit_signals.py "$GITHUB_WORKSPACE" --allow-non-exact-base
-          python3 /tmp/bravo-backend-patch/apply_cli_failover.py "$GITHUB_WORKSPACE"
-          python3 /tmp/bravo-backend-patch/finalize_release.py "$GITHUB_WORKSPACE" c7e2213686630a0b3a2a0631447c1116d1275acf
-          mapfile -t go_files < <(git diff --name-only -- '*.go')
-          if ((${#go_files[@]})); then
-            gofmt -w "${go_files[@]}"
-          fi
-          git diff --check
+          set -o pipefail
+          {
+            set -Eeuo pipefail
+            rm -rf /tmp/bravo-backend-patch
+            mkdir -p /tmp/bravo-backend-patch
+            wc -c .github/bravo-bootstrap/backend-patch.zip.b64
+            sha256sum .github/bravo-bootstrap/backend-patch.zip.b64
+            base64 --decode .github/bravo-bootstrap/backend-patch.zip.b64 > /tmp/bravo-backend-patch.zip
+            file /tmp/bravo-backend-patch.zip
+            unzip -t /tmp/bravo-backend-patch.zip
+            unzip -q /tmp/bravo-backend-patch.zip -d /tmp/bravo-backend-patch
+            find /tmp/bravo-backend-patch -maxdepth 2 -type f -printf '%P\n' | sort
+            python3 /tmp/bravo-backend-patch/apply_backend.py "$GITHUB_WORKSPACE" --allow-non-exact-base
+            python3 /tmp/bravo-backend-patch/apply_backend_hardening.py "$GITHUB_WORKSPACE" --allow-non-exact-base
+            python3 /tmp/bravo-backend-patch/apply_backend_limit_signals.py "$GITHUB_WORKSPACE" --allow-non-exact-base
+            python3 /tmp/bravo-backend-patch/apply_cli_failover.py "$GITHUB_WORKSPACE"
+            python3 /tmp/bravo-backend-patch/finalize_release.py "$GITHUB_WORKSPACE" c7e2213686630a0b3a2a0631447c1116d1275acf
+            mapfile -t go_files < <(git diff --name-only -- '*.go')
+            if ((${#go_files[@]})); then
+              gofmt -w "${go_files[@]}"
+            fi
+            git diff --check
+          } 2>&1 | tee /tmp/bravo-bootstrap.log
+
+      - name: Upload bootstrap diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bravo-bootstrap-diagnostics-${{ github.sha }}
+          path: /tmp/bravo-bootstrap.log
+          if-no-files-found: warn
+          retention-days: 1
 
       - name: Run targeted Claude CLI and quota regressions
         shell: bash
