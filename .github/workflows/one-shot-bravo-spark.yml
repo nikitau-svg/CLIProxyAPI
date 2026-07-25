@@ -1,15 +1,16 @@
 name: One-shot Bravo Spark and quota hardening
 
 on:
-  push:
+  pull_request:
     branches:
-      - fix/bravo-0.7-claude-spark-failover
+      - agent/bravo-0.6-production
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
 
 concurrency:
-  group: one-shot-bravo-spark-${{ github.ref }}
+  group: one-shot-bravo-spark
   cancel-in-progress: false
 
 jobs:
@@ -21,6 +22,7 @@ jobs:
       - name: Checkout generator branch
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
       - name: Install repository Go toolchain
@@ -81,7 +83,7 @@ jobs:
       - name: Commit the generated source changes
         shell: bash
         env:
-          TARGET_BRANCH: fix/bravo-0.7-claude-spark-failover
+          TARGET_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           set -Eeuo pipefail
           test -n "$(git status --porcelain)"
