@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -146,7 +147,7 @@ func eligibleAuths(item candidate, auths []pluginapi.HostAuthFileEntry, now time
 		if authProvider != provider {
 			continue
 		}
-		if classifyBravoAuthHealth(provider, auth, now) != bravoAuthReady {
+		if classifyBravoAuthHealthForModel(provider, auth, item.Model, now) != bravoAuthReady {
 			continue
 		}
 		id := strings.TrimSpace(auth.ID)
@@ -208,12 +209,33 @@ func pinnedAuthID(auth pluginapi.HostAuthFileEntry) string {
 	return strings.TrimSpace(auth.ID)
 }
 
-func cooldownKey(provider, authID string) string {
-	return normalizeProvider(provider) + "\x00" + strings.TrimSpace(authID)
+// cooldownKey scopes a cooldown to a provider, an account and — for model
+// scoped failures — the physical model that produced it. An empty model keeps
+// the legacy account-wide scope, which is what credential-level failures
+// (401/403) still require.
+func cooldownKey(provider, authID, model string) string {
+	key := normalizeProvider(provider) + "\x00" + strings.TrimSpace(authID)
+	if scoped := strings.TrimSpace(model); scoped != "" {
+		key += "\x00" + scoped
+	}
+	return key
 }
 
-func cooldownActive(provider, authID string, now time.Time) bool {
-	key := cooldownKey(provider, authID)
+// cooldownActive reports whether the account is cooling for the given model.
+// An account-wide cooldown suppresses every model, while a model-scoped one
+// only suppresses its own model so a rate limit on Opus never takes Haiku or
+// Sonnet down with it.
+func cooldownActive(provider, authID, model string, now time.Time) bool {
+	if cooldownEntryActive(cooldownKey(provider, authID, ""), now) {
+		return true
+	}
+	if strings.TrimSpace(model) == "" {
+		return false
+	}
+	return cooldownEntryActive(cooldownKey(provider, authID, model), now)
+}
+
+func cooldownEntryActive(key string, now time.Time) bool {
 	runtimeState.RLock()
 	entry, ok := runtimeState.Cooldowns[key]
 	runtimeState.RUnlock()
@@ -229,13 +251,25 @@ func cooldownActive(provider, authID string, now time.Time) bool {
 	return false
 }
 
-func setCooldown(provider, authID, reason string, until time.Time) {
+func setCooldown(provider, authID, model, reason string, until time.Time) {
 	if until.IsZero() || !until.After(time.Now()) {
 		return
 	}
 	runtimeState.Lock()
-	runtimeState.Cooldowns[cooldownKey(provider, authID)] = cooldownEntry{Until: until, Reason: reason}
+	runtimeState.Cooldowns[cooldownKey(provider, authID, model)] = cooldownEntry{Until: until, Reason: reason}
 	runtimeState.Unlock()
+}
+
+// accountWideCooldownStatuses lists the failures that invalidate the whole
+// credential rather than a single model. Everything else (rate limits, quota
+// exhaustion, transient upstream errors) is scoped to the model that failed.
+func accountWideCooldownStatus(status int) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return true
+	default:
+		return false
+	}
 }
 
 func appendAttempt(record attemptRecord) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,8 +20,11 @@ type rpcStreamEmitRequest struct {
 }
 
 type rpcStreamCloseRequest struct {
-	StreamID string `json:"stream_id"`
-	Error    string `json:"error,omitempty"`
+	StreamID    string `json:"stream_id"`
+	Error       string `json:"error,omitempty"`
+	ErrorStatus int    `json:"error_status,omitempty"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	RetryAfter  string `json:"retry_after,omitempty"`
 }
 
 func executeStream(raw []byte) ([]byte, error) {
@@ -67,15 +71,14 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 
 	logicalName, model, cfg, failure := prepareBravoExecution(req)
 	if failure != nil {
-		closePluginStream(pluginStreamID, failure.Code+": "+failure.Message)
+		closePluginStreamFailure(pluginStreamID, *failure)
 		return
 	}
 	body := executionBody(req)
 	protocol := requestProtocol(req.ExecutorRequest)
 	contract, errDetect := detectRequestContract(protocol, body, true)
 	if errDetect != nil {
-		failure := contractFailure(errDetect)
-		closePluginStream(pluginStreamID, failure.Code+": "+failure.Message)
+		closePluginStreamFailure(pluginStreamID, contractFailure(errDetect))
 		return
 	}
 	candidateSourceBody, errStrip := stripRequestEffort(body, protocol, contract.Effort)
@@ -85,7 +88,12 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 	}
 	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
 	if errPlan != nil {
-		closePluginStream(pluginStreamID, "bravo_no_eligible_account: "+errPlan.Error())
+		closePluginStreamFailure(pluginStreamID, executionFailure{
+			Code:      "bravo_no_eligible_account",
+			Message:   errPlan.Error(),
+			Status:    http.StatusServiceUnavailable,
+			Retryable: true,
+		})
 		return
 	}
 	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
@@ -120,7 +128,7 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 			if failure.Retryable {
 				continue
 			}
-			closePluginStream(pluginStreamID, failure.Code+": "+failure.Message)
+			closePluginStreamFailure(pluginStreamID, failure)
 			return
 		}
 
@@ -173,7 +181,7 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 		}
 		lastFailure = *streamFailure
 		if !streamFailure.Retryable {
-			closePluginStream(pluginStreamID, streamFailure.Code+": "+streamFailure.Message)
+			closePluginStreamFailure(pluginStreamID, *streamFailure)
 			return
 		}
 	}
@@ -185,7 +193,7 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 			Status:  http.StatusUnprocessableEntity,
 		}
 	}
-	closePluginStream(pluginStreamID, lastFailure.Code+": "+lastFailure.Message)
+	closePluginStreamFailure(pluginStreamID, lastFailure)
 }
 
 func forwardCandidateStream(ctx context.Context, hostStreamID, pluginStreamID, protocol, physicalModel, logicalModel string) (bool, *executionFailure) {
@@ -277,6 +285,52 @@ func closePluginStream(streamID, errorMessage string) {
 		StreamID: streamID,
 		Error:    strings.TrimSpace(errorMessage),
 	})
+}
+
+// closePluginStreamFailure closes a stream that never produced bytes, carrying
+// the HTTP semantics the client needs. Streaming is the dominant traffic shape,
+// so without this a pool exhaustion reaches the SDK as a bare 500 and triggers
+// an immediate retry into the same exhausted pool.
+func closePluginStreamFailure(streamID string, failure executionFailure) {
+	status := failure.Status
+	if status <= 0 {
+		status = http.StatusServiceUnavailable
+	}
+	status = normalizedFailureStatus(status)
+	retryAfter := strings.TrimSpace(failure.RetryAfter)
+	if retryAfter == "" && status == http.StatusServiceUnavailable {
+		retryAfter = strconv.Itoa(defaultRetryAfterSeconds(failure))
+	}
+	_, _ = callHost(pluginabi.MethodHostStreamClose, rpcStreamCloseRequest{
+		StreamID:    streamID,
+		Error:       strings.TrimSpace(failure.Code + ": " + failure.Message),
+		ErrorStatus: status,
+		ErrorCode:   strings.TrimSpace(failure.Code),
+		RetryAfter:  retryAfter,
+	})
+}
+
+// normalizedFailureStatus reports pool-level exhaustion as 503 rather than 500.
+// A 500 reads as "the server is broken, retry now"; 503 with Retry-After tells
+// the client the pool is temporarily saturated and when to come back.
+func normalizedFailureStatus(status int) int {
+	if status == http.StatusInternalServerError {
+		return http.StatusServiceUnavailable
+	}
+	return status
+}
+
+// defaultRetryAfterSeconds derives a backoff hint from the configured cooldown
+// so clients wait roughly as long as the credential is actually parked.
+func defaultRetryAfterSeconds(failure executionFailure) int {
+	seconds := loadedConfig().CooldownSeconds
+	if seconds <= 0 {
+		seconds = 30
+	}
+	if seconds > 300 {
+		seconds = 300
+	}
+	return seconds
 }
 
 func closeHostModelStream(streamID string) error {

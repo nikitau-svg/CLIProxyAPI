@@ -424,7 +424,13 @@ func applyFailureCooldown(attempt executionAttempt, failure executionFailure) {
 	if until.IsZero() {
 		until = time.Now().Add(time.Duration(loadedConfig().CooldownSeconds) * time.Second)
 	}
-	setCooldown(attempt.Candidate.Provider, pinnedAuthID(attempt.Auth), failure.Code, until)
+	// Credential-level rejections disable the account everywhere; a rate limit
+	// or upstream fault only disables the model that hit it.
+	model := attempt.Candidate.Model
+	if accountWideCooldownStatus(failure.Status) {
+		model = ""
+	}
+	setCooldown(attempt.Candidate.Provider, pinnedAuthID(attempt.Auth), model, failure.Code, until)
 }
 
 func retryAfterTime(value string, now time.Time) time.Time {

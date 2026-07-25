@@ -194,22 +194,30 @@ func acquireAttemptLease(attempt executionAttempt) (func(bool), bool) {
 	cfg := loadedConfig()
 	authIndex := strings.TrimSpace(attempt.Auth.AuthIndex)
 	allocatorRuntime.Lock()
-	if !attempt.Primary {
-		quota := quotaSnapshot(authIndex)
-		tariff := tariffByID(cfg, attempt.TariffID)
-		if quotaConfidence(quota) != "confirmed" {
-			if cfg.UnknownSecondaryPolicy != "allow" {
-				allocatorRuntime.Unlock()
-				return func(bool) {}, false
-			}
-		} else {
-			session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
-			reserved := allocatorRuntime.InFlightPercent[authIndex] + allocatorRuntime.PendingPercent[authIndex]
-			if session.RemainingPercent-reserved-attempt.ReservationPercent <= tariff.SessionFloorPercent ||
-				weekly.RemainingPercent-reserved-attempt.ReservationPercent <= tariff.WeeklyFloorPercent {
-				allocatorRuntime.Unlock()
-				return func(bool) {}, false
-			}
+	quota := quotaSnapshot(authIndex)
+	tariff := tariffByID(cfg, attempt.TariffID)
+	if quotaConfidence(quota) != "confirmed" {
+		// An unknown snapshot only blocks secondaries; a pinned primary is
+		// still trusted while quota discovery catches up.
+		if !attempt.Primary && cfg.UnknownSecondaryPolicy != "allow" {
+			allocatorRuntime.Unlock()
+			return func(bool) {}, false
+		}
+	} else {
+		session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
+		reserved := allocatorRuntime.InFlightPercent[authIndex] + allocatorRuntime.PendingPercent[authIndex]
+		// Being primary grants priority and the right to spend the reserve
+		// below the configured floor — it is not an exemption from the quota
+		// itself. Without this a pinned credential keeps being retried at 0%
+		// remaining, which only produces upstream rate limits.
+		sessionFloor, weeklyFloor := tariff.SessionFloorPercent, tariff.WeeklyFloorPercent
+		if attempt.Primary {
+			sessionFloor, weeklyFloor = 0, 0
+		}
+		if session.RemainingPercent-reserved-attempt.ReservationPercent <= sessionFloor ||
+			weekly.RemainingPercent-reserved-attempt.ReservationPercent <= weeklyFloor {
+			allocatorRuntime.Unlock()
+			return func(bool) {}, false
 		}
 	}
 	allocatorRuntime.InFlightPercent[authIndex] += attempt.ReservationPercent

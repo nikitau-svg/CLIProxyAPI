@@ -67,6 +67,7 @@ const (
 	bravoAuthDisabled    bravoAuthHealth = "disabled"
 	bravoAuthUnavailable bravoAuthHealth = "unavailable"
 	bravoAuthError       bravoAuthHealth = "error"
+	bravoAuthExhausted   bravoAuthHealth = "quota_exhausted"
 
 	bravoStatusAuthUnavailable = "auth_status_unavailable"
 )
@@ -301,10 +302,45 @@ func classifyBravoAuthHealth(provider string, auth pluginapi.HostAuthFileEntry, 
 	if authID == "" {
 		return bravoAuthUnavailable
 	}
-	if cooldownActive(provider, authID, now) {
+	if cooldownActive(provider, authID, "", now) {
 		return bravoAuthCooldown
 	}
 	return bravoAuthReady
+}
+
+// classifyBravoAuthHealthForModel narrows credential health to a single model.
+// Planning uses it so that a model-scoped cooldown or an exhausted quota keeps
+// the credential usable for the models that are still within budget.
+//
+// Quota is deliberately excluded from classifyBravoAuthHealth itself: the quota
+// refresher gates on that function, so treating an exhausted account as unhealthy
+// there would stop the refresh that later restores it.
+func classifyBravoAuthHealthForModel(provider string, auth pluginapi.HostAuthFileEntry, model string, now time.Time) bravoAuthHealth {
+	if health := classifyBravoAuthHealth(provider, auth, now); health != bravoAuthReady {
+		return health
+	}
+	if cooldownActive(provider, strings.TrimSpace(auth.ID), model, now) {
+		return bravoAuthCooldown
+	}
+	if quotaExhaustedForModel(auth.AuthIndex, model) {
+		return bravoAuthExhausted
+	}
+	return bravoAuthReady
+}
+
+// quotaExhaustedForModel reports a confirmed zero-headroom quota. Unknown or
+// stale snapshots never exhaust an account here — that call belongs to the
+// allocator, which weighs it against the configured floors.
+func quotaExhaustedForModel(authIndex, model string) bool {
+	if strings.TrimSpace(authIndex) == "" {
+		return false
+	}
+	quota := quotaSnapshot(authIndex)
+	if quotaConfidence(quota) != "confirmed" {
+		return false
+	}
+	session, weekly := effectiveQuotaWindows(quota, model)
+	return session.RemainingPercent <= 0 || weekly.RemainingPercent <= 0
 }
 
 func redactedBravoConfig(cfg pluginConfig) map[string]any {

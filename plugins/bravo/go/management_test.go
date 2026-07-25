@@ -180,12 +180,61 @@ func TestClassifyBravoAuthHealthMatchesRouterEligibility(t *testing.T) {
 	}
 
 	cooldownAuth := pluginapi.HostAuthFileEntry{ID: "plugin-cooldown", Provider: "claude"}
-	setCooldown("claude", cooldownAuth.ID, "rate_limit", now.Add(time.Minute))
+	setCooldown("claude", cooldownAuth.ID, "", "rate_limit", now.Add(time.Minute))
 	if got := classifyBravoAuthHealth("claude", cooldownAuth, now); got != bravoAuthCooldown {
 		t.Fatalf("plugin cooldown health = %q, want %q", got, bravoAuthCooldown)
 	}
 	if eligible := eligibleAuths(item, []pluginapi.HostAuthFileEntry{cooldownAuth}, now); len(eligible) != 0 {
 		t.Fatal("router accepted an account in the Bravo cooldown map")
+	}
+}
+
+// A rate limit on one model must not disable the account's other models. The
+// account-wide cooldown cascaded a single 429 on Opus into an empty pool for
+// Sonnet and Haiku on the same subscription.
+func TestCooldownIsScopedToTheModelThatFailed(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	auth := pluginapi.HostAuthFileEntry{ID: "scoped-cooldown", Provider: "claude"}
+	setCooldown("claude", auth.ID, "claude-opus-5", "rate_limit", now.Add(time.Minute))
+
+	limited := candidate{Provider: "claude", Model: "claude-opus-5"}
+	if eligible := eligibleAuths(limited, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 0 {
+		t.Fatal("router kept the rate-limited model eligible on its own account")
+	}
+
+	sibling := candidate{Provider: "claude", Model: "claude-sonnet-5"}
+	if eligible := eligibleAuths(sibling, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 1 {
+		t.Fatal("a per-model cooldown disabled a sibling model on the same account")
+	}
+}
+
+// Credential-level rejections are not model-specific, so an empty model scope
+// must still disable every model on the account.
+func TestAccountWideCooldownDisablesEveryModel(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	auth := pluginapi.HostAuthFileEntry{ID: "account-cooldown", Provider: "claude"}
+	setCooldown("claude", auth.ID, "", "unauthorized", now.Add(time.Minute))
+
+	for _, model := range []string{"claude-opus-5", "claude-sonnet-5"} {
+		item := candidate{Provider: "claude", Model: model}
+		if eligible := eligibleAuths(item, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 0 {
+			t.Fatalf("account-wide cooldown left %s eligible", model)
+		}
+	}
+}
+
+func TestAccountWideCooldownStatusCoversCredentialRejections(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		if !accountWideCooldownStatus(status) {
+			t.Fatalf("status %d must disable the whole account", status)
+		}
+	}
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway} {
+		if accountWideCooldownStatus(status) {
+			t.Fatalf("status %d must only disable the model that failed", status)
+		}
 	}
 }
 
