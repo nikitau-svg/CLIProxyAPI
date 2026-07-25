@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .bravo-patch/part-* > /tmp/bravo-fix.patch.xz.b64
+          cat .bravo-patch/part-* | tr -d '[:space:]' > /tmp/bravo-fix.patch.xz.b64
           echo '2d180a330292aca144862a11a3362aa2eb769045278698cc5170cf94134f152c  /tmp/bravo-fix.patch.xz.b64' | sha256sum --check --strict
           base64 --decode /tmp/bravo-fix.patch.xz.b64 | xz --decompress > /tmp/bravo-fix.patch
           echo 'a9ee1e39fb67f796fd55f54808053158f7744ef621cf3d56b3eb39e9e60736dc  /tmp/bravo-fix.patch' | sha256sum --check --strict
