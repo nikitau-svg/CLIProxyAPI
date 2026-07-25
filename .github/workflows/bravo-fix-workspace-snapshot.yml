@@ -65,8 +65,23 @@ jobs:
         run: go test ./internal/pluginhost/... ./sdk/pluginapi/... -count=1 -timeout=10m
 
       - name: Test Bravo plugin
+        shell: bash
         working-directory: plugins/bravo/go
-        run: go test ./... -count=1 -timeout=10m
+        run: |
+          set +e
+          go test ./... -count=1 -timeout=10m > /tmp/bravo-test.log 2>&1
+          status=$?
+          tail -n 120 /tmp/bravo-test.log
+          exit "$status"
+
+      - name: Upload Bravo test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bravo-test-diagnostics-${{ github.run_id }}
+          path: /tmp/bravo-test.log
+          if-no-files-found: warn
+          retention-days: 1
 
       - name: Race-test Bravo plugin
         working-directory: plugins/bravo/go
