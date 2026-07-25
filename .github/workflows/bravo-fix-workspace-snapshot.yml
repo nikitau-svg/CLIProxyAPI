@@ -48,6 +48,60 @@ jobs:
           git apply --index --exclude='.github/workflows/*' /tmp/bravo-final.patch
           git diff --cached --check
 
+      - name: Align legacy route tests with the Spark-only route
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('plugins/bravo/go/bravo_test.go')
+          text = path.read_text()
+          text = text.replace(
+              '\t\t"gpt-5.5", "gpt-5.4", "gpt-5.4-mini",\n\t}\n',
+              '\t\t"gpt-5.5", "gpt-5.4", "gpt-5.4-mini",\n\t\t"spark", "gpt-5.3-codex-spark",\n\t}\n',
+              1,
+          )
+          text = text.replace(
+              '\tfor _, unsupported := range []string{"gpt-5.3-codex-spark", "codex-auto-review"} {\n',
+              '\tfor _, unsupported := range []string{"codex-auto-review"} {\n',
+              1,
+          )
+          text = text.replace(
+              '\tfor name, model := range cfg.Models {\n\t\tfor _, item := range model.Candidates {\n',
+              '\tfor name, model := range cfg.Models {\n\t\tif name == "spark" || name == codexSparkModelFamily {\n\t\t\tcontinue\n\t\t}\n\t\tfor _, item := range model.Candidates {\n',
+              1,
+          )
+          text = text.replace(
+              '\tfor name, model := range cfg.Models {\n\t\tif routeClassCapability(model) == capabilityImageGeneration {\n\t\t\tcontinue\n\t\t}\n',
+              '\tfor name, model := range cfg.Models {\n\t\tif routeClassCapability(model) == capabilityImageGeneration || name == "spark" || name == codexSparkModelFamily {\n\t\t\tcontinue\n\t\t}\n',
+              1,
+          )
+          path.write_text(text)
+
+          path = Path('plugins/bravo/go/compatibility_management_test.go')
+          text = path.read_text()
+          text = text.replace(
+              '\t\tif item.Provider == "gemini" || item.Model == "codex-auto-review" || item.Model == "gpt-5.3-codex-spark" {\n',
+              '\t\tif item.Provider == "gemini" || item.Model == "codex-auto-review" {\n',
+              1,
+          )
+          marker = '\tunknown := compatibilityModelByID(t, response, "claude", "claude-opus-6")\n'
+          replacement = (
+              '\tspark := compatibilityModelByID(t, response, "codex", codexSparkModelFamily)\n'
+              '\tif spark.Classification != compatibilityYAMLFix || !spark.Detected.Host || spark.Detected.Bravo || spark.Detected.Route {\n'
+              '\t\tt.Fatalf("Spark compatibility classification = %#v", spark)\n'
+              '\t}\n'
+              + marker
+          )
+          if marker not in text:
+              raise SystemExit('compatibility test marker not found')
+          path.write_text(text.replace(marker, replacement, 1))
+          PY
+          gofmt -w plugins/bravo/go/bravo_test.go plugins/bravo/go/compatibility_management_test.go
+          git add plugins/bravo/go/bravo_test.go plugins/bravo/go/compatibility_management_test.go
+          git diff --cached --check
+
       - name: Verify Go formatting
         shell: bash
         run: |
