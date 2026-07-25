@@ -1,0 +1,93 @@
+name: Bootstrap Bravo 0.6.1 Claude CLI failover
+
+on:
+  push:
+    branches:
+      - fix/bravo-0.6.1-claude-stream-failover
+    paths:
+      - .github/workflows/bootstrap-bravo-0.6.1-claude-failover.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-and-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact patch branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/bravo-0.6.1-claude-stream-failover
+          fetch-depth: 0
+
+      - name: Verify expected Bravo base
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BASE=43adff54abe8e0ca72721cc8ad9d14607ca231e8
+          git merge-base --is-ancestor "$BASE" HEAD
+          unexpected="$(git diff --name-only "$BASE"...HEAD -- . \
+            ':(exclude).github/bravo-bootstrap/backend-patch.zip.b64' \
+            ':(exclude).github/workflows/bootstrap-bravo-0.6.1-claude-failover.yml')"
+          test -z "$unexpected" || { printf 'Unexpected pre-patch files:\n%s\n' "$unexpected"; exit 1; }
+
+      - name: Set up repository Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Decode and apply reviewed backend patch set
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf /tmp/bravo-backend-patch
+          mkdir -p /tmp/bravo-backend-patch
+          base64 --decode .github/bravo-bootstrap/backend-patch.zip.b64 > /tmp/bravo-backend-patch.zip
+          unzip -q /tmp/bravo-backend-patch.zip -d /tmp/bravo-backend-patch
+          python3 /tmp/bravo-backend-patch/apply_backend.py "$GITHUB_WORKSPACE" --allow-non-exact-base
+          python3 /tmp/bravo-backend-patch/apply_backend_hardening.py "$GITHUB_WORKSPACE" --allow-non-exact-base
+          python3 /tmp/bravo-backend-patch/apply_backend_limit_signals.py "$GITHUB_WORKSPACE" --allow-non-exact-base
+          python3 /tmp/bravo-backend-patch/apply_cli_failover.py "$GITHUB_WORKSPACE"
+          python3 /tmp/bravo-backend-patch/finalize_release.py "$GITHUB_WORKSPACE" c7e2213686630a0b3a2a0631447c1116d1275acf
+          mapfile -t go_files < <(git diff --name-only -- '*.go')
+          if ((${#go_files[@]})); then
+            gofmt -w "${go_files[@]}"
+          fi
+          git diff --check
+
+      - name: Run targeted Claude CLI and quota regressions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test ./plugins/bravo/go -count=1 -run 'TestExecuteStreamReturnsNoEligibleAccountBeforeOpeningSSE|TestExecuteAggregatesRetryableSubscriptionFailures|TestDefaultUnknownSecondaryPolicyUsesSingleProbe|TestPrimarySubscriptionNeverRunsAtConfirmedHardZero|TestParseCodexAuthQuotaHonorsAllowedAndLimitReachedSignals'
+
+      - name: Run backend test suite
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test ./plugins/bravo/go -count=1
+          go test ./internal/pluginhost -count=1
+          go test ./sdk/pluginapi -count=1
+          go test ./... -count=1 -timeout=20m
+
+      - name: Run race and static analysis gates
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test -race ./plugins/bravo/go -count=1
+          go vet ./plugins/bravo/go/...
+
+      - name: Remove temporary bootstrap files and commit verified patch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git rm .github/bravo-bootstrap/backend-patch.zip.b64
+          git rm .github/workflows/bootstrap-bravo-0.6.1-claude-failover.yml
+          git diff --check
+          git config user.name 'Bravo Patch Bot'
+          git config user.email 'noreply@slowdive.app'
+          git add -A
+          git commit -m 'feat(bravo): harden Claude CLI failover and Spark quota routing'
+          git push origin HEAD:fix/bravo-0.6.1-claude-stream-failover
