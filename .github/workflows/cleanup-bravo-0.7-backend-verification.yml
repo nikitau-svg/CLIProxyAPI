@@ -1,0 +1,52 @@
+name: Cleanup Bravo 0.7 backend verification
+
+on:
+  push:
+    branches:
+      - fix/bravo-0.7-claude-failover-spark-multiquota
+    paths:
+      - .github/workflows/cleanup-bravo-0.7-backend-verification.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/bravo-0.7-claude-failover-spark-multiquota
+          fetch-depth: 0
+
+      - name: Confirm backend verification completed
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f .github/bravo-backend-verified.txt
+          grep -q '^verified_sha=' .github/bravo-backend-verified.txt
+          grep -R -q --exclude-dir=.git 'bravo_pool_exhausted' .
+          grep -R -q --exclude-dir=.git 'additional_rate_limits' .
+
+      - name: Remove temporary verification transport
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git rm -f .github/bravo-backend-verified.txt
+          git rm -f .github/workflows/verify-bravo-0.7-backend.yml
+          git rm -f .github/workflows/cleanup-bravo-0.7-backend-verification.yml
+          if [ -f .github/workflows/export-bravo-0.7-backend-checkout.yml ]; then
+            git rm -f .github/workflows/export-bravo-0.7-backend-checkout.yml
+          fi
+          git diff --cached --check
+
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m 'chore: remove temporary Bravo backend verification'
+          git push origin HEAD:fix/bravo-0.7-claude-failover-spark-multiquota
