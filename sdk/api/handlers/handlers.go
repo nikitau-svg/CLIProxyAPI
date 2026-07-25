@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -924,13 +926,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 				status = code
 			}
 		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: ErrorResponseAddon(err)}
 	}
 	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
 	rawResponseHeaders := cloneHeader(resp.Headers)
@@ -993,13 +989,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 				status = code
 			}
 		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: ErrorResponseAddon(err)}
 	}
 	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
 	rawResponseHeaders := cloneHeader(resp.Headers)
@@ -1106,13 +1096,45 @@ func executionErrorMessage(err error) *interfaces.ErrorMessage {
 			status = code
 		}
 	}
-	var addon http.Header
-	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-		if hdr := he.Headers(); hdr != nil {
-			addon = hdr.Clone()
+	return &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: ErrorResponseAddon(err)}
+}
+
+// ErrorResponseAddon returns the upstream response headers an error carries, or
+// nil when it has none. These stay subject to passthrough-headers: they are
+// verbatim upstream data, not headers the proxy authored.
+func ErrorResponseAddon(err error) http.Header {
+	if err == nil {
+		return nil
+	}
+	var headerProvider interface{ Headers() http.Header }
+	if errors.As(err, &headerProvider) && headerProvider != nil {
+		if hdr := headerProvider.Headers(); hdr != nil {
+			return hdr.Clone()
 		}
 	}
-	return &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+	return nil
+}
+
+// retryAfterHintFromError reads a Retry-After value from the typed accessors an
+// error may implement, preferring the verbatim header value over a duration.
+func retryAfterHintFromError(err error) string {
+	var valueProvider interface{ RetryAfterValue() string }
+	if errors.As(err, &valueProvider) && valueProvider != nil {
+		if value := strings.TrimSpace(valueProvider.RetryAfterValue()); value != "" {
+			return value
+		}
+	}
+	var durationProvider interface{ RetryAfter() *time.Duration }
+	if errors.As(err, &durationProvider) && durationProvider != nil {
+		if duration := durationProvider.RetryAfter(); duration != nil {
+			seconds := int64(math.Ceil(duration.Seconds()))
+			if seconds < 0 {
+				seconds = 0
+			}
+			return strconv.FormatInt(seconds, 10)
+		}
+	}
+	return ""
 }
 
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
@@ -1333,13 +1355,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				status = code
 			}
 		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: ErrorResponseAddon(err)}
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -1521,13 +1537,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 							status = code
 						}
 					}
-					var addon http.Header
-					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
-						if hdr := he.Headers(); hdr != nil {
-							addon = hdr.Clone()
-						}
-					}
-					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
+					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: ErrorResponseAddon(streamErr)})
 					return
 				}
 				if len(chunk.Payload) > 0 {
@@ -2340,6 +2350,28 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 	}
 }
 
+// WriteRetryAfterHeader emits Retry-After for a proxy-authored backoff hint.
+//
+// It is deliberately independent of passthrough-headers. That switch governs
+// forwarding *upstream* headers verbatim, so it only reads msg.Error's own
+// typed accessors — a hint the proxy itself computed (plugin stream failure,
+// pool exhaustion), never a copied upstream header. Without this a 503 reaches
+// the client bare, reads as permanent, and SDK clients retry immediately into
+// the pool that just told them to wait.
+func WriteRetryAfterHeader(c *gin.Context, msg *interfaces.ErrorMessage) {
+	if c == nil || msg == nil || msg.Error == nil || c.Writer.Written() {
+		return
+	}
+	if strings.TrimSpace(c.Writer.Header().Get("Retry-After")) != "" {
+		return
+	}
+	retryAfter := retryAfterHintFromError(msg.Error)
+	if retryAfter == "" {
+		return
+	}
+	c.Writer.Header().Set("Retry-After", retryAfter)
+}
+
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
 	status := http.StatusInternalServerError
@@ -2357,6 +2389,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 			}
 		}
 	}
+	WriteRetryAfterHeader(c, msg)
 
 	errText := http.StatusText(status)
 	if msg != nil && msg.Error != nil {
