@@ -359,10 +359,16 @@ image payloads.
 
 `bravo/stable` and `deploy/aws/release.env` are the installation channel.
 Release tags are retained only as immutable rollback points. Moving the stable
-channel requires the full Go suite, plugin race/vet, WebUI
-tests/lint/typecheck/build, protocol and management smoke checks, controlled
-pre-payload failover, real Claude Code, and Chrome/Playwright desktop/mobile
-QA.
+channel requires the full Go suite, plugin race/vet, risk-relevant protocol
+and management smoke checks, and controlled pre-payload failover. Real Claude
+Code is additionally required when client request/response translation,
+effort/tool handling, stream presentation, or deadline behavior changes; a
+provider-error-classification-only change may instead use the verbatim
+production error in a protocol-level canary. A release that changes Management
+UI bytes additionally requires WebUI tests/lint/typecheck/build and
+Chrome/Playwright desktop/mobile QA. A backend-only release may reuse the exact
+previously verified UI artifact when its pinned commit and SHA-256 are recorded
+and the served bytes are verified after cutover.
 
 The current clean-install guide is
 [`AWS_INSTALL_RU.md`](../../AWS_INSTALL_RU.md). The separate
