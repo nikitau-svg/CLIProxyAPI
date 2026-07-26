@@ -66,9 +66,26 @@ type analyticsBreakdownItem struct {
 	SubscriptionID string           `json:"subscription_id,omitempty"`
 	AuthIndex      string           `json:"auth_index,omitempty"`
 	Label          string           `json:"label,omitempty"`
+	DisplayName    string           `json:"display_name,omitempty"`
+	Note           string           `json:"note,omitempty"`
+	Email          string           `json:"email,omitempty"`
+	Workspace      string           `json:"workspace,omitempty"`
 	Provider       string           `json:"provider,omitempty"`
 	Model          string           `json:"model,omitempty"`
 	LogicalModel   string           `json:"logical_model,omitempty"`
+	Usage          analyticsMetrics `json:"usage"`
+}
+
+type analyticsSubscriptionTimelinePoint struct {
+	Start          time.Time        `json:"start"`
+	End            time.Time        `json:"end"`
+	SubscriptionID string           `json:"subscription_id"`
+	Label          string           `json:"label,omitempty"`
+	DisplayName    string           `json:"display_name,omitempty"`
+	Note           string           `json:"note,omitempty"`
+	Email          string           `json:"email,omitempty"`
+	Workspace      string           `json:"workspace,omitempty"`
+	Provider       string           `json:"provider,omitempty"`
 	Usage          analyticsMetrics `json:"usage"`
 }
 
@@ -85,20 +102,27 @@ type analyticsRetentionView struct {
 	DailyDays  int `json:"daily_days"`
 }
 
+type analyticsMetricSemantics struct {
+	LatencyMS        string `json:"latency_ms"`
+	AverageLatencyMS string `json:"average_latency_ms"`
+}
+
 type analyticsResponse struct {
-	SchemaVersion         int                    `json:"schema_version"`
-	From                  time.Time              `json:"from"`
-	To                    time.Time              `json:"to"`
-	Interval              string                 `json:"interval"`
-	Bucket                string                 `json:"bucket"`
-	Filters               analyticsFilterView    `json:"filters"`
-	Retention             analyticsRetentionView `json:"retention"`
-	CoverageFrom          *time.Time             `json:"coverage_from"`
-	BreakdownCoverageFrom *time.Time             `json:"breakdown_coverage_from"`
-	Summary               analyticsMetrics       `json:"summary"`
-	Series                []analyticsSeriesPoint `json:"series"`
-	Breakdown             analyticsBreakdown     `json:"breakdown"`
-	GeneratedAt           time.Time              `json:"generated_at"`
+	SchemaVersion         int                                  `json:"schema_version"`
+	From                  time.Time                            `json:"from"`
+	To                    time.Time                            `json:"to"`
+	Interval              string                               `json:"interval"`
+	Bucket                string                               `json:"bucket"`
+	Filters               analyticsFilterView                  `json:"filters"`
+	Retention             analyticsRetentionView               `json:"retention"`
+	MetricSemantics       analyticsMetricSemantics             `json:"metric_semantics"`
+	CoverageFrom          *time.Time                           `json:"coverage_from"`
+	BreakdownCoverageFrom *time.Time                           `json:"breakdown_coverage_from"`
+	Summary               analyticsMetrics                     `json:"summary"`
+	Series                []analyticsSeriesPoint               `json:"series"`
+	SubscriptionTimeline  []analyticsSubscriptionTimelinePoint `json:"subscription_timeline"`
+	Breakdown             analyticsBreakdown                   `json:"breakdown"`
+	GeneratedAt           time.Time                            `json:"generated_at"`
 }
 
 func handleAnalyticsManagement(req rpcManagementRequest) ([]byte, error) {
@@ -117,7 +141,8 @@ func handleAnalyticsManagement(req rpcManagementRequest) ([]byte, error) {
 	if errQuery != nil {
 		return analyticsFailureJSON(http.StatusBadRequest, "bravo_analytics_query_invalid", errQuery.Error())
 	}
-	return managementJSON(http.StatusOK, collectAnalytics(query, time.Now().UTC()))
+	presentations := analyticsSubscriptionPresentations(req.HostCallbackID)
+	return managementJSON(http.StatusOK, collectAnalyticsWithPresentations(query, time.Now().UTC(), presentations))
 }
 
 func parseAnalyticsQuery(values url.Values, now time.Time) (analyticsQuery, error) {
@@ -285,6 +310,14 @@ func parseAnalyticsBoundary(raw string, end bool) (time.Time, error) {
 }
 
 func collectAnalytics(query analyticsQuery, generatedAt time.Time) analyticsResponse {
+	return collectAnalyticsWithPresentations(query, generatedAt, nil)
+}
+
+func collectAnalyticsWithPresentations(
+	query analyticsQuery,
+	generatedAt time.Time,
+	presentations map[string]subscriptionPresentation,
+) analyticsResponse {
 	bravoUsageState.mu.RLock()
 	defer bravoUsageState.mu.RUnlock()
 
@@ -309,13 +342,39 @@ func collectAnalytics(query analyticsQuery, generatedAt time.Time) analyticsResp
 			HourlyDays: int(hourlyUsageRetention / (24 * time.Hour)),
 			DailyDays:  int(dailyUsageRetention / (24 * time.Hour)),
 		},
+		MetricSemantics: analyticsMetricSemantics{
+			LatencyMS:        "sum of complete provider-attempt durations, including streamed response consumption",
+			AverageLatencyMS: "latency_ms divided by requests; this is full attempt duration, not time to first token",
+		},
 		CoverageFrom:          coverage,
 		BreakdownCoverageFrom: breakdownCoverage,
 		Summary:               analyticsMetricsFromCounters(summary),
 		Series:                buildAnalyticsSeries(selected, query),
-		Breakdown:             buildAnalyticsBreakdown(state, query),
+		SubscriptionTimeline:  buildAnalyticsSubscriptionTimeline(state, query, presentations),
+		Breakdown:             buildAnalyticsBreakdown(state, query, presentations),
 		GeneratedAt:           generatedAt.UTC(),
 	}
+}
+
+func analyticsSubscriptionPresentations(hostCallbackID string) map[string]subscriptionPresentation {
+	if strings.TrimSpace(hostCallbackID) == "" {
+		return nil
+	}
+	auths, errList := listHostAuths(hostCallbackID)
+	if errList != nil {
+		// Analytics remains available if host metadata is temporarily unavailable.
+		// The redacted subscription ID still gives clients a stable join key.
+		return nil
+	}
+	presentations := make(map[string]subscriptionPresentation, len(auths))
+	for _, auth := range auths {
+		authIndex := strings.TrimSpace(auth.AuthIndex)
+		if authIndex == "" {
+			continue
+		}
+		presentations[authIndex] = subscriptionPresentationFor(auth, quotaSnapshot(authIndex))
+	}
+	return presentations
 }
 
 func selectAnalyticsAggregates(state *persistedUsageState, query analyticsQuery) []*usageAggregate {
@@ -503,7 +562,110 @@ func analyticsMetricsFromCounters(value usageCounters) analyticsMetrics {
 	return metrics
 }
 
-func buildAnalyticsBreakdown(state *persistedUsageState, query analyticsQuery) analyticsBreakdown {
+type analyticsSubscriptionTimelineAccumulator struct {
+	Start     time.Time
+	End       time.Time
+	AuthIndex string
+	Provider  string
+	Usage     usageCounters
+}
+
+func buildAnalyticsSubscriptionTimeline(
+	state *persistedUsageState,
+	query analyticsQuery,
+	presentations map[string]subscriptionPresentation,
+) []analyticsSubscriptionTimelinePoint {
+	if state == nil {
+		return []analyticsSubscriptionTimelinePoint{}
+	}
+	accumulators := make(map[string]*analyticsSubscriptionTimelineAccumulator)
+	for _, aggregate := range state.ProjectSubscriptionModelTotals {
+		if aggregate == nil || aggregate.AuthIndex == "" || !analyticsDimensionsMatch(query, aggregate) {
+			continue
+		}
+		forEachAnalyticsUsageBucket(&aggregate.Usage, query, func(start, end time.Time, value usageCounters) {
+			if usageCountersEmpty(value) {
+				return
+			}
+			provider := normalizeProvider(aggregate.Provider)
+			key := start.Format(time.RFC3339) + "\x1f" + aggregate.AuthIndex + "\x1f" + provider
+			accumulator := accumulators[key]
+			if accumulator == nil {
+				accumulator = &analyticsSubscriptionTimelineAccumulator{
+					Start:     start,
+					End:       end,
+					AuthIndex: aggregate.AuthIndex,
+					Provider:  provider,
+				}
+				accumulators[key] = accumulator
+			}
+			accumulator.Usage = mergeUsageCounters(accumulator.Usage, value)
+		})
+	}
+	out := make([]analyticsSubscriptionTimelinePoint, 0, len(accumulators))
+	for _, accumulator := range accumulators {
+		subscriptionID := analyticsSubscriptionID(accumulator.AuthIndex)
+		presentation := presentations[accumulator.AuthIndex]
+		provider := normalizeProvider(firstNonEmpty(accumulator.Provider, presentation.Provider))
+		displayName := strings.TrimSpace(presentation.DisplayName)
+		if displayName == "" {
+			displayName = analyticsSubscriptionLabel(subscriptionID, provider)
+		}
+		out = append(out, analyticsSubscriptionTimelinePoint{
+			Start:          accumulator.Start,
+			End:            accumulator.End,
+			SubscriptionID: subscriptionID,
+			Label:          displayName,
+			DisplayName:    displayName,
+			Note:           presentation.Note,
+			Email:          presentation.Email,
+			Workspace:      presentation.Workspace,
+			Provider:       provider,
+			Usage:          analyticsMetricsFromCounters(accumulator.Usage),
+		})
+	}
+	sort.Slice(out, func(left, right int) bool {
+		if !out[left].Start.Equal(out[right].Start) {
+			return out[left].Start.Before(out[right].Start)
+		}
+		if out[left].Usage.TotalTokens != out[right].Usage.TotalTokens {
+			return out[left].Usage.TotalTokens > out[right].Usage.TotalTokens
+		}
+		return out[left].SubscriptionID < out[right].SubscriptionID
+	})
+	return out
+}
+
+func forEachAnalyticsUsageBucket(
+	aggregate *usageAggregate,
+	query analyticsQuery,
+	visit func(start, end time.Time, value usageCounters),
+) {
+	if aggregate == nil || visit == nil {
+		return
+	}
+	if query.Interval == analyticsIntervalHour {
+		for key, value := range aggregate.Hourly {
+			start, errParse := time.Parse(time.RFC3339, key)
+			if errParse == nil && analyticsBucketOverlaps(start, start.Add(time.Hour), query.From, query.To) {
+				visit(start, start.Add(time.Hour), value)
+			}
+		}
+		return
+	}
+	for key, value := range aggregate.Daily {
+		start, errParse := time.Parse(dailyUsageBucketLayout, key)
+		if errParse == nil && analyticsBucketOverlaps(start, start.Add(24*time.Hour), query.From, query.To) {
+			visit(start, start.Add(24*time.Hour), value)
+		}
+	}
+}
+
+func buildAnalyticsBreakdown(
+	state *persistedUsageState,
+	query analyticsQuery,
+	presentations map[string]subscriptionPresentation,
+) analyticsBreakdown {
 	out := analyticsBreakdown{
 		Projects:                  []analyticsBreakdownItem{},
 		Subscriptions:             []analyticsBreakdownItem{},
@@ -517,6 +679,7 @@ func buildAnalyticsBreakdown(state *persistedUsageState, query analyticsQuery) a
 	projects := make(map[string]usageCounters)
 	subscriptions := make(map[string]usageCounters)
 	subscriptionProviders := make(map[string]string)
+	subscriptionAuthIndexes := make(map[string]string)
 	providers := make(map[string]usageCounters)
 	models := make(map[string]usageCounters)
 	modelDimensions := make(map[string]projectSubscriptionModelUsageAggregate)
@@ -536,6 +699,11 @@ func buildAnalyticsBreakdown(state *persistedUsageState, query analyticsQuery) a
 		if aggregate.AuthIndex != "" {
 			subscriptionID := analyticsSubscriptionID(aggregate.AuthIndex)
 			subscriptions[subscriptionID] = mergeUsageCounters(subscriptions[subscriptionID], value)
+			if subscriptionAuthIndexes[subscriptionID] == "" {
+				subscriptionAuthIndexes[subscriptionID] = aggregate.AuthIndex
+			} else if subscriptionAuthIndexes[subscriptionID] != aggregate.AuthIndex {
+				subscriptionAuthIndexes[subscriptionID] = ""
+			}
 			if subscriptionProviders[subscriptionID] == "" {
 				subscriptionProviders[subscriptionID] = aggregate.Provider
 			} else if subscriptionProviders[subscriptionID] != aggregate.Provider {
@@ -566,13 +734,17 @@ func buildAnalyticsBreakdown(state *persistedUsageState, query analyticsQuery) a
 	}
 	for subscriptionID, value := range subscriptions {
 		provider := subscriptionProviders[subscriptionID]
-		out.Subscriptions = append(out.Subscriptions, analyticsBreakdownItem{
+		displayName := analyticsSubscriptionLabel(subscriptionID, provider)
+		item := analyticsBreakdownItem{
 			SubscriptionID: subscriptionID,
 			AuthIndex:      subscriptionID,
-			Label:          analyticsSubscriptionLabel(subscriptionID, provider),
+			Label:          displayName,
+			DisplayName:    displayName,
 			Provider:       provider,
 			Usage:          analyticsMetricsFromCounters(value),
-		})
+		}
+		applyAnalyticsSubscriptionPresentation(&item, presentations[subscriptionAuthIndexes[subscriptionID]])
+		out.Subscriptions = append(out.Subscriptions, item)
 	}
 	for provider, value := range providers {
 		out.Providers = append(out.Providers, analyticsBreakdownItem{
@@ -592,19 +764,42 @@ func buildAnalyticsBreakdown(state *persistedUsageState, query analyticsQuery) a
 	for key, value := range cross {
 		dimensions := crossDimensions[key]
 		subscriptionID := analyticsSubscriptionID(dimensions.AuthIndex)
-		out.ProjectSubscriptionModels = append(out.ProjectSubscriptionModels, analyticsBreakdownItem{
+		displayName := analyticsSubscriptionLabel(subscriptionID, dimensions.Provider)
+		item := analyticsBreakdownItem{
 			ProjectID:      dimensions.ProjectID,
 			SubscriptionID: subscriptionID,
 			AuthIndex:      subscriptionID,
-			Label:          analyticsSubscriptionLabel(subscriptionID, dimensions.Provider),
+			Label:          displayName,
+			DisplayName:    displayName,
 			Provider:       dimensions.Provider,
 			Model:          dimensions.Model,
 			LogicalModel:   dimensions.LogicalModel,
 			Usage:          analyticsMetricsFromCounters(value),
-		})
+		}
+		applyAnalyticsSubscriptionPresentation(&item, presentations[dimensions.AuthIndex])
+		out.ProjectSubscriptionModels = append(out.ProjectSubscriptionModels, item)
 	}
 	sortAnalyticsBreakdown(&out)
 	return out
+}
+
+func applyAnalyticsSubscriptionPresentation(
+	item *analyticsBreakdownItem,
+	presentation subscriptionPresentation,
+) {
+	if item == nil {
+		return
+	}
+	if provider := normalizeProvider(firstNonEmpty(item.Provider, presentation.Provider)); provider != "" {
+		item.Provider = provider
+	}
+	if displayName := strings.TrimSpace(presentation.DisplayName); displayName != "" {
+		item.Label = displayName
+		item.DisplayName = displayName
+	}
+	item.Note = strings.TrimSpace(presentation.Note)
+	item.Email = strings.TrimSpace(presentation.Email)
+	item.Workspace = strings.TrimSpace(presentation.Workspace)
 }
 
 func sortAnalyticsBreakdown(out *analyticsBreakdown) {

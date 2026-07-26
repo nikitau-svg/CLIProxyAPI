@@ -43,6 +43,8 @@ type subscriptionView struct {
 	AuthID            string                `json:"auth_id,omitempty"`
 	Provider          string                `json:"provider,omitempty"`
 	Label             string                `json:"label,omitempty"`
+	DisplayName       string                `json:"display_name,omitempty"`
+	Note              string                `json:"note,omitempty"`
 	Email             string                `json:"email,omitempty"`
 	Workspace         string                `json:"workspace,omitempty"`
 	Plan              string                `json:"plan,omitempty"`
@@ -165,17 +167,19 @@ func buildSubscriptionView(
 	if tariffID == "" {
 		tariffID = "auto"
 	}
+	presentation := subscriptionPresentationFor(auth, quota)
 	return subscriptionView{
 		AuthIndex:   strings.TrimSpace(auth.AuthIndex),
 		AnalyticsID: analyticsSubscriptionID(auth.AuthIndex),
 		AuthID:      strings.TrimSpace(auth.ID),
 		Provider:    normalizeProvider(firstNonEmpty(auth.Provider, auth.Type, quota.Provider)),
-		// auth.Note comes before the quota AccountLabel on purpose: the latter is the
-		// provider's own email for the credential, and two subscriptions on one mailbox
-		// then render as the same name in this list. The note is the operator's label.
-		Label:             strings.TrimSpace(firstNonEmpty(auth.Note, auth.Label, quota.AccountLabel, auth.Email, auth.Name)),
-		Email:             strings.TrimSpace(auth.Email),
-		Workspace:         strings.TrimSpace(firstNonEmpty(quota.WorkspaceLabel, auth.ProjectID, auth.Account, auth.AccountType)),
+		// Label stays as a compatibility alias for older Management Center builds.
+		// New clients use DisplayName and render Note as its own, operator-authored field.
+		Label:             presentation.DisplayName,
+		DisplayName:       presentation.DisplayName,
+		Note:              presentation.Note,
+		Email:             presentation.Email,
+		Workspace:         presentation.Workspace,
 		Plan:              strings.TrimSpace(quota.Plan),
 		Tariff:            tariffID,
 		EffectiveTariff:   tariff.ID,
@@ -191,6 +195,56 @@ func buildSubscriptionView(
 			ModelWeekly: modelWeekly,
 		},
 		Usage: authUsageSummary(auth.AuthIndex, time.Now()),
+	}
+}
+
+type subscriptionPresentation struct {
+	DisplayName string
+	Note        string
+	Email       string
+	Workspace   string
+	Provider    string
+}
+
+func subscriptionPresentationFor(auth pluginapi.HostAuthFileEntry, quota credentialQuotaState) subscriptionPresentation {
+	note := strings.TrimSpace(auth.Note)
+	email := strings.TrimSpace(firstNonEmpty(auth.Email, quota.AccountLabel))
+	provider := normalizeProvider(firstNonEmpty(auth.Provider, auth.Type, quota.Provider))
+	workspace := strings.TrimSpace(firstNonEmpty(
+		quota.WorkspaceLabel,
+		auth.ProjectID,
+		auth.Account,
+		auth.AccountType,
+	))
+	displayName := note
+	if displayName == "" {
+		displayName = joinSubscriptionIdentity(workspace, email)
+	}
+	if displayName == "" {
+		displayName = analyticsSubscriptionLabel(analyticsSubscriptionID(auth.AuthIndex), provider)
+	}
+	if displayName == "" {
+		displayName = "Subscription"
+	}
+	return subscriptionPresentation{
+		DisplayName: displayName,
+		Note:        note,
+		Email:       email,
+		Workspace:   workspace,
+		Provider:    provider,
+	}
+}
+
+func joinSubscriptionIdentity(workspace, email string) string {
+	workspace = strings.TrimSpace(workspace)
+	email = strings.TrimSpace(email)
+	switch {
+	case workspace == "":
+		return email
+	case email == "" || strings.EqualFold(workspace, email):
+		return workspace
+	default:
+		return workspace + " · " + email
 	}
 }
 

@@ -167,10 +167,19 @@ func TestAnalyticsCrossDimensionAndSubscriptionRedaction(t *testing.T) {
 		response.Summary.CacheCreationTokens != 2 {
 		t.Fatalf("project token detail = %#v", response.Summary)
 	}
+	if response.Summary.AverageLatencyMS != 2000 ||
+		!strings.Contains(response.MetricSemantics.AverageLatencyMS, "full attempt duration") {
+		t.Fatalf("latency contract = %#v / %#v", response.Summary, response.MetricSemantics)
+	}
 	if len(response.Breakdown.Subscriptions) != 2 ||
 		len(response.Breakdown.Models) != 2 ||
 		len(response.Breakdown.ProjectSubscriptionModels) != 2 {
 		t.Fatalf("cross breakdown = %#v", response.Breakdown)
+	}
+	if len(response.SubscriptionTimeline) != 2 ||
+		response.SubscriptionTimeline[0].SubscriptionID != analyticsSubscriptionID("auth-alpha-secret") ||
+		response.SubscriptionTimeline[1].SubscriptionID != analyticsSubscriptionID("auth-beta-secret") {
+		t.Fatalf("subscription timeline = %#v", response.SubscriptionTimeline)
 	}
 	encoded, errMarshal := json.Marshal(response)
 	if errMarshal != nil {
@@ -189,6 +198,66 @@ func TestAnalyticsCrossDimensionAndSubscriptionRedaction(t *testing.T) {
 	}
 	if filteredResponse.Breakdown.Subscriptions[0].AuthIndex != subscriptionID {
 		t.Fatal("auth_index compatibility field is not redacted")
+	}
+}
+
+func TestAnalyticsSubscriptionTimelineUsesPresentationWithoutPersistingIt(t *testing.T) {
+	restore := isolateBravoUsageState(t)
+	defer restore()
+
+	at := time.Date(2026, 7, 25, 9, 10, 0, 0, time.UTC)
+	recordAnalyticsUsage(bravoUsageState, at, "prj_alpha", "auth-alpha-secret", "anthropic", "opus", "bravo/opus", 10)
+	recordAnalyticsUsage(bravoUsageState, at.Add(20*time.Minute), "prj_alpha", "auth-alpha-secret", "anthropic", "sonnet", "bravo/sonnet", 20)
+	recordAnalyticsUsage(bravoUsageState, at.Add(time.Hour), "prj_alpha", "auth-alpha-secret", "anthropic", "sonnet", "bravo/sonnet", 30)
+
+	query := analyticsQuery{
+		From:      at.Truncate(time.Hour),
+		To:        at.Truncate(time.Hour).Add(2 * time.Hour),
+		Interval:  analyticsIntervalHour,
+		ProjectID: "prj_alpha",
+	}
+	presentations := map[string]subscriptionPresentation{
+		"auth-alpha-secret": {
+			DisplayName: "Рабочая подписка",
+			Note:        "Рабочая подписка",
+			Email:       "member@example.com",
+			Workspace:   "Workspace A",
+			Provider:    "claude",
+		},
+	}
+	response := collectAnalyticsWithPresentations(query, at.Add(2*time.Hour), presentations)
+	if len(response.SubscriptionTimeline) != 2 {
+		t.Fatalf("timeline = %#v, want one compact point per used hour", response.SubscriptionTimeline)
+	}
+	first := response.SubscriptionTimeline[0]
+	if first.Usage.Requests != 2 || first.Usage.TotalTokens != 30 ||
+		first.DisplayName != "Рабочая подписка" || first.Note != "Рабочая подписка" ||
+		first.Email != "member@example.com" || first.Workspace != "Workspace A" {
+		t.Fatalf("first timeline point = %#v", first)
+	}
+	if response.SubscriptionTimeline[1].Usage.Requests != 1 ||
+		response.SubscriptionTimeline[1].Usage.TotalTokens != 30 {
+		t.Fatalf("second timeline point = %#v", response.SubscriptionTimeline[1])
+	}
+	if len(response.Breakdown.Subscriptions) != 1 ||
+		response.Breakdown.Subscriptions[0].DisplayName != "Рабочая подписка" {
+		t.Fatalf("subscription presentation = %#v", response.Breakdown.Subscriptions)
+	}
+	encodedState, errMarshal := json.Marshal(bravoUsageState.state)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	for _, presentationValue := range []string{"Рабочая подписка", "member@example.com", "Workspace A"} {
+		if strings.Contains(string(encodedState), presentationValue) {
+			t.Fatalf("persisted analytics state unexpectedly contains presentation %q", presentationValue)
+		}
+	}
+	encodedResponse, errMarshal := json.Marshal(response)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	if strings.Contains(string(encodedResponse), "auth-alpha-secret") {
+		t.Fatal("timeline response exposed a raw auth index")
 	}
 }
 
