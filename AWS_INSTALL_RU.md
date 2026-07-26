@@ -459,9 +459,13 @@ ledger на диск.
 
 Сейчас Bravo image не опубликован в GHCR/Docker Hub, поэтому на AWS он
 собирается из согласованных исходников и используется с `pull_policy: never`.
-Ветка `bravo/stable` двигается только после canary и production smoke. Файл
-`deploy/aws/release.env` внутри неё является единственным manifest совместимых
-версий; старые release tags сохраняются для точного отката.
+Runtime-изменение публикуется в `bravo/stable` после зелёной изолированной
+canary, затем именно из опубликованного commit собирается production image.
+Результат production smoke фиксируется отдельным docs-only commit; уже
+развёрнутый image остаётся привязан к отдельно записанному и протестированному
+runtime source SHA и не требует пересборки из-за одних заметок. Файл
+`deploy/aws/release.env` внутри stable является единственным manifest
+совместимых версий; старые release tags сохраняются для точного отката.
 
 До появления release image:
 

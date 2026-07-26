@@ -183,7 +183,7 @@ shared Docker prune commands are forbidden.
   return a precise 422 before any upstream call.
 - Linux/arm64 shared-plugin build in the canary Dockerfile.
 
-## Bravo 0.7.7 source and canary evidence
+## Bravo 0.7.7 source, canary, and production evidence
 
 - The test plan is recorded in
   `plugins/bravo/QUOTA_FAILOVER_TEST_PLAN.md`. Before the classifier changed,
@@ -208,6 +208,13 @@ shared Docker prune commands are forbidden.
   test suite, explicit hard-cap tests for execute/count/stream, the Bravo race
   detector, vet, and shared-plugin build. The full CLIProxyAPI Go test suite
   and repository-wide build also passed sequentially.
+- GitHub PR
+  [`#8`](https://github.com/nikitau-svg/CLIProxyAPI/pull/8) merged the tested
+  feature commit
+  `183fa79e4a2382ed0d35a26f26234dee2cdd55b9` as runtime source commit
+  `ef08c3a9736f8ee63c2bd168f35c001f770aa72e`. Both `bravo/stable` and
+  `clean/bravo-0.7-production` pointed to that merge before the final image
+  was built; `main` remained unchanged.
 - The pre-publish Linux/arm64 canary image was
   `cliproxyapi-local:v7.2.94-bravo-native0.7.7-canary-review3-ui9578c1a`
   (`sha256:250a33332fbf5dc543693939d0b6a99d9c9f262852eaf69fbe8e0a1e8fff00a7`).
@@ -230,7 +237,42 @@ shared Docker prune commands are forbidden.
   service recovery. Refreshing quotas completed in roughly two seconds; all
   five accounts showed provider-confirmed `только что`, the refresh button
   re-enabled, no UI alert appeared, and the 1470 px viewport had no horizontal
-  overflow. No subscription or project setting was changed.
+  overflow. No subscription or project setting was changed. That interactive
+  check ran against the preceding 0.7.6 runtime; the final image embeds the
+  identical UI bytes, and the post-cutover HTTP checksum matched.
+- The final Linux/arm64 image
+  `cliproxyapi-local:v7.2.94-bravo-native0.7.7`
+  (`sha256:394234330795a0f70bd4d06db7ce97b132983db7d7a5d865ff8698231bf2d017`)
+  was built from the published merge, not retagged from the pre-publish
+  candidate. Its binary reports
+  `v7.2.94-bravo-native0.7.7`,
+  `ef08c3a9736f8ee63c2bd168f35c001f770aa72e`, and
+  `2026-07-26T22:17:46Z`; the embedded Management UI checksum is
+  `a971f98da6f816d67604d461c76d592b102a4c3c1c428f52e065581ad22a55be`.
+- The strict zero-credential canary was repeated against that exact final
+  image. It again observed exactly Claude Sonnet HTTP 400, Codex Terra
+  success, then Codex Luna success while the cooled Claude account was
+  skipped. Bravo reported 0.7.7, the container was healthy with zero
+  restarts, the disposable project was removed, and ports 18319/18991 were
+  released before production changed.
+- Production moved once from
+  `cliproxyapi-local:v7.2.94-bravo-native0.7.6-uihotfix1-9578c1a`
+  (`sha256:52a160b0e81b001bb3dced881eb06dac998be1228dc56294f77e6c8915ea426e`)
+  to the final 0.7.7 image. A mode-0700 forensic backup is retained at
+  `backups/pre-bravo-0.7.7-20260726T222935Z`; rollback would restore only the
+  old compose/image unless state corruption were proven.
+- The post-cutover read-only smoke reported 8 projects, 5 subscriptions,
+  39 routes, 64 ordinary-key models, and compatibility 23/23 with no action
+  required, identical to the baseline. The config checksum remained
+  `b39df08c7fd83f8003851a6a152065be657ee14f238c87ef6f6d9a913ffbd6fc`,
+  the served Management UI checksum matched the pinned bytes, and production
+  remained healthy with zero restarts and a zero healthcheck failing streak.
+- Cleanup removed the disposable canary/mock, candidate compose, pre-publish
+  image, task-owned source/artifact/runtime directories, and the private
+  BuildKit cache records created by the final build. No broad Docker prune was
+  used. The previous production image and backup remain available for
+  rollback; the Mac mini remained above the 10 GiB build-safety floor after
+  cleanup.
 
 ### Release safety incident and guard
 
