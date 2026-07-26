@@ -427,16 +427,9 @@ func (s *FileTokenStore) labelFor(metadata map[string]any) string {
 	if metadata == nil {
 		return ""
 	}
-	if v, ok := metadata["label"].(string); ok && v != "" {
-		return v
-	}
-	if v, ok := metadata["email"].(string); ok && v != "" {
-		return v
-	}
-	if project, ok := metadata["project_id"].(string); ok && project != "" {
-		return project
-	}
-	return ""
+	// Note first: see cliproxyauth.DisplayLabelFromMetadata for why an operator
+	// note outranks the email a credential was created under.
+	return cliproxyauth.DisplayLabelFromMetadata(metadata)
 }
 
 func (s *FileTokenStore) baseDirSnapshot() string {

@@ -551,7 +551,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		"name":           name,
 		"type":           strings.TrimSpace(auth.Provider),
 		"provider":       strings.TrimSpace(auth.Provider),
-		"label":          auth.Label,
+		"label":          authDisplayLabel(auth),
 		"status":         auth.Status,
 		"status_message": auth.StatusMessage,
 		"disabled":       auth.Disabled,
@@ -760,6 +760,24 @@ func authEmail(auth *coreauth.Auth) string {
 		}
 	}
 	return ""
+}
+
+// authDisplayLabel resolves the credential name shown in the management UI. The
+// note wins over the email: one mailbox can back several credentials, and a list
+// keyed on email shows the same string twice for accounts that differ only by
+// workspace. Attributes are consulted first because the note is editable through
+// the management API, which writes it there.
+func authDisplayLabel(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if note := strings.TrimSpace(authAttribute(auth, "note")); note != "" {
+		return note
+	}
+	if label := coreauth.DisplayLabelFromMetadata(auth.Metadata); label != "" {
+		return label
+	}
+	return strings.TrimSpace(auth.Label)
 }
 
 func authMetadataString(auth *coreauth.Auth, key string) string {
@@ -1255,9 +1273,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if provider == "" {
 		provider = "unknown"
 	}
-	label := provider
-	if email, ok := metadata["email"].(string); ok && email != "" {
-		label = email
+	label := coreauth.DisplayLabelFromMetadata(metadata)
+	if label == "" {
+		label = provider
 	}
 	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
 

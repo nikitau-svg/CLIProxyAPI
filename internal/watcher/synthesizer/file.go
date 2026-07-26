@@ -95,6 +95,15 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 			perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
 			disabled, _ := metadata["disabled"].(bool)
+			// A plugin parser sees only the credential payload, so the operator
+			// annotations sitting beside it in the same file are ours to carry over.
+			// They are the only thing that tells two credentials on one mailbox apart,
+			// and neither overrides a value the plugin picked for itself.
+			fileLabel := coreauth.DisplayLabelFromMetadata(metadata)
+			fileNote := ""
+			if rawNote, ok := metadata["note"].(string); ok {
+				fileNote = strings.TrimSpace(rawNote)
+			}
 			for index, auth := range auths {
 				if auth == nil {
 					continue
@@ -104,12 +113,18 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 				}
 				auth.CreatedAt = now
 				auth.UpdatedAt = now
+				if strings.TrimSpace(auth.Label) == "" {
+					auth.Label = fileLabel
+				}
 				if auth.Attributes == nil {
 					auth.Attributes = make(map[string]string)
 				}
 				auth.Attributes[coreauth.AttributePath] = fullPath
 				auth.Attributes[coreauth.AttributeSource] = fullPath
 				auth.Attributes[coreauth.AttributeSourceBackend] = coreauth.AuthSourceFile
+				if fileNote != "" && strings.TrimSpace(auth.Attributes["note"]) == "" {
+					auth.Attributes["note"] = fileNote
+				}
 				if disabled {
 					auth.Disabled = true
 					auth.Status = coreauth.StatusDisabled
@@ -128,9 +143,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if provider == "" || provider == "gemini-cli" {
 		return nil
 	}
-	label := provider
-	if email, _ := metadata["email"].(string); email != "" {
-		label = email
+	label := coreauth.DisplayLabelFromMetadata(metadata)
+	if label == "" {
+		label = provider
 	}
 	// Use relative path under authDir as ID to stay consistent with the file-based token store.
 	id := fullPath

@@ -569,11 +569,17 @@ func pluginAuthDataToCoreAuth(data pluginapi.AuthData, path, fileName string, au
 		status = coreauth.StatusDisabled
 	}
 	now := time.Now().UTC()
+	label := strings.TrimSpace(data.Label)
+	if label == "" {
+		// Plugin auth data carries no note field, so the label falls back to whatever
+		// the credential metadata records — note first, per DisplayLabelFromMetadata.
+		label = coreauth.DisplayLabelFromMetadata(metadata)
+	}
 	auth := &coreauth.Auth{
 		Provider:         provider,
 		ID:               id,
 		FileName:         fileName,
-		Label:            strings.TrimSpace(data.Label),
+		Label:            label,
 		Prefix:           strings.TrimSpace(data.Prefix),
 		ProxyURL:         strings.TrimSpace(data.ProxyURL),
 		Disabled:         data.Disabled,

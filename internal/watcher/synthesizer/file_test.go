@@ -698,3 +698,74 @@ func TestFileSynthesizer_Synthesize_NoteParsing(t *testing.T) {
 		})
 	}
 }
+
+// Two credentials on one mailbox are the same string in every UI list when the
+// label comes from the email. The note is the only field that separates them, so
+// synthesis must lift it into Label — not just into Attributes.
+func TestSynthesizeFileAuthNoteBecomesLabel(t *testing.T) {
+	tests := []struct {
+		name      string
+		note      any
+		email     string
+		wantLabel string
+	}{
+		{
+			name:      "note names the credential",
+			note:      "Личный аккаунт Claude",
+			email:     "nikita.u@slowdive.app",
+			wantLabel: "Личный аккаунт Claude",
+		},
+		{
+			name:      "same mailbox, different note",
+			note:      "Рабочий аккаунт Claude",
+			email:     "nikita.u@slowdive.app",
+			wantLabel: "Рабочий аккаунт Claude",
+		},
+		{
+			name:      "email when the note is absent",
+			note:      nil,
+			email:     "codex@slowdive.app",
+			wantLabel: "codex@slowdive.app",
+		},
+		{
+			name:      "provider when neither is present",
+			note:      nil,
+			email:     "",
+			wantLabel: "claude",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			authData := map[string]any{"type": "claude"}
+			if tt.note != nil {
+				authData["note"] = tt.note
+			}
+			if tt.email != "" {
+				authData["email"] = tt.email
+			}
+			data, _ := json.Marshal(authData)
+			if errWrite := os.WriteFile(filepath.Join(tempDir, "auth.json"), data, 0644); errWrite != nil {
+				t.Fatalf("failed to write auth file: %v", errWrite)
+			}
+
+			auths, errSynthesize := NewFileSynthesizer().Synthesize(&SynthesisContext{
+				Config:      &config.Config{},
+				AuthDir:     tempDir,
+				Now:         time.Now(),
+				IDGenerator: NewStableIDGenerator(),
+			})
+			if errSynthesize != nil {
+				t.Fatalf("unexpected error: %v", errSynthesize)
+			}
+			if len(auths) != 1 {
+				t.Fatalf("expected 1 auth, got %d", len(auths))
+			}
+			if auths[0].Label != tt.wantLabel {
+				t.Fatalf("Label = %q, want %q", auths[0].Label, tt.wantLabel)
+			}
+		})
+	}
+}
