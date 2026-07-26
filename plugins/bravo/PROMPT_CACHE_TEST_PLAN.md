@@ -201,3 +201,24 @@ reuse a production client key.
    project analytics, and existing client traffic.
 5. Remove only temporary containers, build cache, and superseded intermediate
    images. Keep the rollback image and persistent volumes.
+
+## Verified release evidence (2026-07-26)
+
+- Candidate backend commit: `d1a7634283c65625bef874e3b287442db91ab7a4`.
+- Candidate Management Center commit:
+  `0c7bdc1feeacbed1b38de3701412b3c27bb8ea9d`.
+- Canary/production image:
+  `cliproxyapi-local:v7.2.94-bravo-native0.7.5-d1a76342`,
+  `sha256:b05b66f484502593fdc7da04e5dc161dd867d0ae9f44049dd324bfef40fbb6de`.
+- Full Go tests/builds, Bravo race/vet/build, 89 Management Center tests,
+  ESLint, TypeScript, production build, management CRUD smoke, and
+  Chrome/Playwright UI checks passed.
+- A temporary production project with Claude TTL `5m` reported
+  `cache_creation_input_tokens=72399` on its first multi-turn request and
+  `cache_read_input_tokens=72399` on the identical second request.
+- A temporary production project using the Codex-primary `bravo/luna` route
+  reported `cached_tokens=15104` on the identical second Responses request.
+- Both temporary production projects and their plaintext keys were deleted by
+  the probe cleanup path. Existing projects remained unchanged.
+- Production analytics schema v2 retained cache creation/read/cached-token
+  telemetry and per-project/per-subscription breakdowns after the probes.
