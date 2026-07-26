@@ -98,8 +98,12 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 	}
 	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
 	var lastFailure executionFailure
+	providerCalls := 0
 
 	for _, attempt := range plan {
+		if skipCoolingExecutionAttempt(attempt, &lastFailure) {
+			continue
+		}
 		if errPreflight := verifyCandidateContract(attempt.Candidate, contract); errPreflight != nil {
 			lastFailure = contractFailure(errPreflight)
 			continue
@@ -110,10 +114,14 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 			closePluginStream(pluginStreamID, "bravo_request_invalid: "+errRewrite.Error())
 			return
 		}
+		if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
+			break
+		}
 		releaseLease, acquired := acquireAttemptLease(attempt)
 		if !acquired {
 			continue
 		}
+		providerCalls++
 		started := time.Now()
 		rawResponse, errCall := callHost(pluginabi.MethodHostModelExecuteStream, hostModelExecutionRequest{
 			HostModelExecutionRequest: nestedHostModelRequest(req, attempt, protocol, physicalModel, candidateBody, true),

@@ -14,7 +14,7 @@ func countTokens(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	logicalName, model, _, failure := prepareBravoExecution(req)
+	logicalName, model, cfg, failure := prepareBravoExecution(req)
 	if failure != nil {
 		return failureEnvelope(*failure), nil
 	}
@@ -46,7 +46,11 @@ func countTokens(raw []byte) ([]byte, error) {
 	}
 
 	var lastFailure executionFailure
+	providerCalls := 0
 	for _, attempt := range plan {
+		if skipCoolingExecutionAttempt(attempt, &lastFailure) {
+			continue
+		}
 		if errPreflight := verifyCandidateContract(attempt.Candidate, contract); errPreflight != nil {
 			lastFailure = contractFailure(errPreflight)
 			continue
@@ -60,6 +64,10 @@ func countTokens(raw []byte) ([]byte, error) {
 				Status:  http.StatusBadRequest,
 			}), nil
 		}
+		if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
+			break
+		}
+		providerCalls++
 		started := time.Now()
 		responseRaw, errCall := callHost(pluginabi.MethodHostModelCountTokens, hostModelExecutionRequest{
 			HostModelExecutionRequest: nestedHostModelRequest(req, attempt, protocol, physicalModel, candidateBody, false),

@@ -5,26 +5,52 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-const anthropicExtraUsageMessage = `model_execution_failed: {"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Add more at claude.ai/admin-settings/usage and keep going."}}`
+const anthropicLegacyExtraUsageMessage = `model_execution_failed: {"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Add more at claude.ai/admin-settings/usage and keep going."}}`
+
+const anthropicThirdPartyExtraUsageMessage = `model_execution_failed: {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going."}}`
 
 func TestClassifyExecutionErrorRetriesAnthropicExtraUsage400(t *testing.T) {
+	for name, message := range map[string]string{
+		"legacy exhaustion":       anthropicLegacyExtraUsageMessage,
+		"third-party extra usage": anthropicThirdPartyExtraUsageMessage,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			failure := classifyExecutionError(&hostCallError{
+				Code:       "model_execution_failed",
+				Message:    message,
+				HTTPStatus: http.StatusBadRequest,
+			})
+			if !failure.Retryable {
+				t.Fatalf("failure = %#v, want retryable account quota exhaustion", failure)
+			}
+			if failure.Code != "bravo_subscription_quota_exhausted" {
+				t.Fatalf("code = %q, want bravo_subscription_quota_exhausted", failure.Code)
+			}
+		})
+	}
+}
+
+func TestClassifyExecutionErrorAggregatesAccountWideQuotaAcrossFields(t *testing.T) {
 	t.Parallel()
 
 	failure := classifyExecutionError(&hostCallError{
-		Code:       "model_execution_failed",
-		Message:    anthropicExtraUsageMessage,
+		Code:       "usage limit has been reached",
+		Message:    anthropicThirdPartyExtraUsageMessage,
 		HTTPStatus: http.StatusBadRequest,
 	})
-	if !failure.Retryable {
-		t.Fatalf("failure = %#v, want retryable account quota exhaustion", failure)
+	if !failure.Retryable || failure.Code != "bravo_subscription_quota_exhausted" {
+		t.Fatalf("failure = %#v, want retryable quota exhaustion", failure)
 	}
-	if failure.Code != "bravo_subscription_quota_exhausted" {
-		t.Fatalf("code = %q, want bravo_subscription_quota_exhausted", failure.Code)
+	if !failure.AccountWide {
+		t.Fatalf("failure = %#v, exact later Anthropic signal must widen the cooldown to the account", failure)
 	}
 }
 
@@ -131,6 +157,20 @@ func TestClassifyHTTPFailureRetriesReviewedModelEntitlementBody(t *testing.T) {
 	}
 }
 
+func TestClassifyHTTPFailureRetriesAnthropicThirdPartyExtraUsageBody(t *testing.T) {
+	t.Parallel()
+
+	failure := classifyHTTPFailure(
+		http.StatusBadRequest,
+		nil,
+		"candidate returned an HTTP error",
+		[]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going."}}`),
+	)
+	if !failure.Retryable || failure.Code != "bravo_subscription_quota_exhausted" {
+		t.Fatalf("failure = %#v, want retryable account quota exhaustion", failure)
+	}
+}
+
 func TestContractFailureRemainsTerminal(t *testing.T) {
 	t.Parallel()
 
@@ -152,7 +192,7 @@ func TestStreamChunkFailureRetriesAnthropicExtraUsageBeforeCommit(t *testing.T) 
 	failure := streamChunkFailure(pluginapi.HostModelStreamReadResponse{
 		ErrorDetail: &pluginapi.HostModelExecutionError{
 			Code:       "model_execution_failed",
-			Message:    anthropicExtraUsageMessage,
+			Message:    anthropicThirdPartyExtraUsageMessage,
 			HTTPStatus: http.StatusBadRequest,
 		},
 	})
@@ -205,6 +245,84 @@ func TestStreamChunkFailureRetriesAccountAndModelAvailabilityBeforeCommit(t *tes
 	}
 }
 
+func TestAnthropicExtraUsageCooldownIsAccountWide(t *testing.T) {
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{
+		Candidates: []candidate{
+			{Provider: "claude", Model: "claude-sonnet-5", Priority: 100, Capabilities: []string{capabilityText}},
+		},
+	})
+
+	attempt := executionAttempt{
+		Candidate: candidate{Provider: "claude", Model: "claude-sonnet-5"},
+		Auth:      pluginapi.HostAuthFileEntry{ID: "claude-extra-usage-exhausted", Provider: "claude"},
+	}
+	failure := classifyExecutionError(&hostCallError{
+		Code:       "model_execution_failed",
+		Message:    anthropicThirdPartyExtraUsageMessage,
+		HTTPStatus: http.StatusBadRequest,
+	})
+	applyFailureCooldown(attempt, failure)
+
+	now := time.Now()
+	if !cooldownActive("claude", attempt.Auth.ID, "claude-haiku-4-5-20251001", now) {
+		t.Fatal("extra-usage exhaustion must suppress the same Claude subscription across models")
+	}
+	if cooldownActive("claude", "another-claude-account", "claude-haiku-4-5-20251001", now) {
+		t.Fatal("extra-usage exhaustion must not suppress a different Claude subscription")
+	}
+}
+
+func TestNonAccountQuotaCooldownsRemainModelScoped(t *testing.T) {
+	tests := []struct {
+		name    string
+		failure hostCallError
+	}{
+		{
+			name: "ambiguous provider usage limit",
+			failure: hostCallError{
+				Code:       "model_execution_failed",
+				Message:    "You have reached your usage limit for this model.",
+				HTTPStatus: http.StatusBadRequest,
+			},
+		},
+		{
+			name: "rate limit",
+			failure: hostCallError{
+				Code:       "rate_limit_error",
+				Message:    "The selected model is temporarily rate limited.",
+				HTTPStatus: http.StatusTooManyRequests,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			isolateBravoFallbackTestState(t)
+			installBravoTestConfig(t, logicalModel{
+				Candidates: []candidate{
+					{Provider: "claude", Model: "claude-sonnet-5", Priority: 100, Capabilities: []string{capabilityText}},
+				},
+			})
+
+			attempt := executionAttempt{
+				Candidate: candidate{Provider: "claude", Model: "claude-sonnet-5"},
+				Auth:      pluginapi.HostAuthFileEntry{ID: "claude-model-scoped", Provider: "claude"},
+			}
+			failure := classifyExecutionError(&test.failure)
+			applyFailureCooldown(attempt, failure)
+
+			now := time.Now()
+			if !cooldownActive("claude", attempt.Auth.ID, attempt.Candidate.Model, now) {
+				t.Fatal("the physical model that failed must be cooling down")
+			}
+			if cooldownActive("claude", attempt.Auth.ID, "claude-haiku-4-5-20251001", now) {
+				t.Fatal("a model-scoped quota or rate limit must not suppress a sibling model")
+			}
+		})
+	}
+}
+
 func TestBravoExecuteFallsBackToCodexOnAnthropicExtraUsage400(t *testing.T) {
 	isolateBravoFallbackTestState(t)
 	installBravoTestConfig(t, logicalModel{
@@ -240,7 +358,7 @@ func TestBravoExecuteFallsBackToCodexOnAnthropicExtraUsage400(t *testing.T) {
 			if request.ForcedProvider == "claude" {
 				return nil, &hostCallError{
 					Code:       "model_execution_failed",
-					Message:    anthropicExtraUsageMessage,
+					Message:    anthropicThirdPartyExtraUsageMessage,
 					HTTPStatus: http.StatusBadRequest,
 				}
 			}
@@ -289,6 +407,383 @@ func TestBravoExecuteFallsBackToCodexOnAnthropicExtraUsage400(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "bravo/fallback-probe") {
 		t.Fatalf("logical model was not restored in response: %s", raw)
+	}
+}
+
+func TestBravoExecuteSkipsSameAccountAfterAccountWideQuotaFailure(t *testing.T) {
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{
+		Candidates: []candidate{
+			{Provider: "claude", Model: "claude-sonnet-5", Priority: 100, Capabilities: []string{capabilityText}},
+			{Provider: "claude", Model: "claude-haiku-4-5-20251001", Priority: 90, Capabilities: []string{capabilityText}},
+			{Provider: "codex", Model: "gpt-5.6-terra", Priority: 80, Capabilities: []string{capabilityText}},
+		},
+	})
+	cfg := loadedConfig()
+	cfg.MaxAttempts = 2
+	currentConfig.Store(cfg)
+
+	auths := []pluginapi.HostAuthFileEntry{
+		{ID: "claude-extra-usage-exhausted", Name: "claude-extra-usage-exhausted.json", Provider: "claude"},
+		{ID: "codex-ready", Name: "codex-ready.json", Provider: "codex"},
+	}
+	var calls []pluginapi.HostModelExecutionRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelExecute:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			if request.ForcedProvider == "claude" {
+				return nil, &hostCallError{
+					Code:       "model_execution_failed",
+					Message:    anthropicThirdPartyExtraUsageMessage,
+					HTTPStatus: http.StatusBadRequest,
+				}
+			}
+			return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
+				StatusCode: http.StatusOK,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       []byte(`{"model":"gpt-5.6-terra","content":[{"type":"text","text":"ok"}]}`),
+			}), nil
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	raw, errExecute := execute(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/fallback-probe",
+			Format:          protocolClaude,
+			SourceFormat:    protocolClaude,
+			OriginalRequest: []byte(`{"model":"bravo/fallback-probe","messages":[{"role":"user","content":"hello"}]}`),
+		},
+		HostCallbackID: "account-wide-extra-usage-fallback",
+	}))
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !env.OK {
+		t.Fatalf("Bravo execution failed: %#v", env.Error)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("host model calls = %d, want exhausted Claude once then Codex: %#v", len(calls), calls)
+	}
+	if calls[0].ForcedProvider != "claude" || calls[0].Model != "claude-sonnet-5" {
+		t.Fatalf("first call = %#v, want Claude Sonnet", calls[0])
+	}
+	if calls[1].ForcedProvider != "codex" || calls[1].Model != "gpt-5.6-terra" {
+		t.Fatalf("second call = %#v, want Codex Terra", calls[1])
+	}
+}
+
+func TestBravoCountSkipsSameAccountWithoutSpendingAttemptBudget(t *testing.T) {
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{
+		Candidates: []candidate{
+			{Provider: "claude", Model: "claude-sonnet-5", Priority: 100, Capabilities: []string{capabilityText}},
+			{Provider: "claude", Model: "claude-haiku-4-5-20251001", Priority: 90, Capabilities: []string{capabilityText}},
+			{Provider: "codex", Model: "gpt-5.6-terra", Priority: 80, Capabilities: []string{capabilityText}},
+		},
+	})
+	cfg := loadedConfig()
+	cfg.MaxAttempts = 2
+	currentConfig.Store(cfg)
+
+	auths := []pluginapi.HostAuthFileEntry{
+		{ID: "claude-extra-usage-exhausted", Name: "claude-extra-usage-exhausted.json", Provider: "claude"},
+		{ID: "codex-ready", Name: "codex-ready.json", Provider: "codex"},
+	}
+	var calls []pluginapi.HostModelExecutionRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelCountTokens:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			if request.ForcedProvider == "claude" {
+				return nil, &hostCallError{
+					Code:       "model_execution_failed",
+					Message:    anthropicThirdPartyExtraUsageMessage,
+					HTTPStatus: http.StatusBadRequest,
+				}
+			}
+			return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
+				StatusCode: http.StatusOK,
+				Body:       []byte(`{"input_tokens":42}`),
+			}), nil
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	raw, errCount := countTokens(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/fallback-probe",
+			Format:          protocolClaude,
+			SourceFormat:    protocolClaude,
+			OriginalRequest: []byte(`{"model":"bravo/fallback-probe","messages":[{"role":"user","content":"hello"}]}`),
+		},
+		HostCallbackID: "account-wide-count-fallback",
+	}))
+	if errCount != nil {
+		t.Fatal(errCount)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !env.OK {
+		t.Fatalf("Bravo token count failed: %#v", env.Error)
+	}
+	if len(calls) != 2 || calls[0].Model != "claude-sonnet-5" ||
+		calls[1].ForcedProvider != "codex" || calls[1].Model != "gpt-5.6-terra" {
+		t.Fatalf("count calls = %#v, want Claude Sonnet once then Codex Terra", calls)
+	}
+}
+
+func TestBravoStreamSkipsSameAccountWithoutSpendingAttemptBudget(t *testing.T) {
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{
+		Candidates: []candidate{
+			{Provider: "claude", Model: "claude-sonnet-5", Priority: 100, Capabilities: []string{capabilityText, capabilityStream}},
+			{Provider: "claude", Model: "claude-haiku-4-5-20251001", Priority: 90, Capabilities: []string{capabilityText, capabilityStream}},
+			{Provider: "codex", Model: "gpt-5.6-terra", Priority: 80, Capabilities: []string{capabilityText, capabilityStream}},
+		},
+	})
+	cfg := loadedConfig()
+	cfg.MaxAttempts = 2
+	currentConfig.Store(cfg)
+
+	auths := []pluginapi.HostAuthFileEntry{
+		{ID: "claude-extra-usage-exhausted", Name: "claude-extra-usage-exhausted.json", Provider: "claude"},
+		{ID: "codex-ready", Name: "codex-ready.json", Provider: "codex"},
+	}
+	var calls []pluginapi.HostModelExecutionRequest
+	var pluginClose rpcStreamCloseRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelExecuteStream:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			streamID := "codex-success-stream"
+			if request.ForcedProvider == "claude" {
+				streamID = "claude-extra-usage-stream"
+			}
+			return mustBravoJSON(t, pluginapi.HostModelStreamResponse{
+				StatusCode: http.StatusOK,
+				StreamID:   streamID,
+			}), nil
+		case pluginabi.MethodHostModelStreamRead:
+			var request pluginapi.HostModelStreamReadRequest
+			decodeBravoPayload(t, payload, &request)
+			if request.StreamID == "claude-extra-usage-stream" {
+				return mustBravoJSON(t, pluginapi.HostModelStreamReadResponse{
+					ErrorDetail: &pluginapi.HostModelExecutionError{
+						Code:       "model_execution_failed",
+						Message:    anthropicThirdPartyExtraUsageMessage,
+						HTTPStatus: http.StatusBadRequest,
+					},
+				}), nil
+			}
+			return mustBravoJSON(t, pluginapi.HostModelStreamReadResponse{Done: true}), nil
+		case pluginabi.MethodHostModelStreamClose:
+			return mustBravoJSON(t, map[string]any{}), nil
+		case pluginabi.MethodHostStreamClose:
+			decodeBravoPayload(t, payload, &pluginClose)
+			return mustBravoJSON(t, map[string]any{}), nil
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	runBravoStream(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/fallback-probe",
+			Format:          protocolClaude,
+			SourceFormat:    protocolClaude,
+			OriginalRequest: []byte(`{"model":"bravo/fallback-probe","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+		},
+		HostCallbackID: "account-wide-stream-fallback",
+	}, "client-stream")
+
+	if len(calls) != 2 || calls[0].Model != "claude-sonnet-5" ||
+		calls[1].ForcedProvider != "codex" || calls[1].Model != "gpt-5.6-terra" {
+		t.Fatalf("stream calls = %#v, want Claude Sonnet once then Codex Terra", calls)
+	}
+	if pluginClose.StreamID != "client-stream" || pluginClose.Error != "" {
+		t.Fatalf("plugin stream close = %#v, want successful Codex close", pluginClose)
+	}
+}
+
+func installHardProviderCallBudgetTest(t *testing.T) []pluginapi.HostAuthFileEntry {
+	t.Helper()
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{
+		Candidates: []candidate{
+			{Provider: "claude", Model: "claude-budget-probe", Priority: 100, Capabilities: []string{capabilityText, capabilityStream}},
+			{Provider: "codex", Model: "codex-budget-probe", Priority: 90, Capabilities: []string{capabilityText, capabilityStream}},
+			{Provider: "gemini", Model: "gemini-budget-probe", Priority: 80, Capabilities: []string{capabilityText, capabilityStream}},
+		},
+	})
+	cfg := loadedConfig()
+	cfg.MaxAttempts = 2
+	currentConfig.Store(cfg)
+	return []pluginapi.HostAuthFileEntry{
+		{ID: "claude-budget", Name: "claude-budget.json", Provider: "claude"},
+		{ID: "codex-budget", Name: "codex-budget.json", Provider: "codex"},
+		{ID: "gemini-budget", Name: "gemini-budget.json", Provider: "gemini"},
+	}
+}
+
+func hardProviderCallBudgetFailure() error {
+	return &hostCallError{
+		Code:       "rate_limited",
+		Message:    "provider-call budget probe",
+		Retryable:  true,
+		HTTPStatus: http.StatusTooManyRequests,
+	}
+}
+
+func assertHardProviderCallBudget(t *testing.T, calls []pluginapi.HostModelExecutionRequest) {
+	t.Helper()
+	if len(calls) != 2 {
+		t.Fatalf("host model calls = %#v, want exactly two real provider calls", calls)
+	}
+	if calls[0].ForcedProvider != "claude" || calls[1].ForcedProvider != "codex" {
+		t.Fatalf("providers = %q, %q, want claude then codex with gemini blocked by max_attempts", calls[0].ForcedProvider, calls[1].ForcedProvider)
+	}
+}
+
+func TestBravoExecuteMaxAttemptsCapsRealProviderCalls(t *testing.T) {
+	auths := installHardProviderCallBudgetTest(t)
+	var calls []pluginapi.HostModelExecutionRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelExecute:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			return nil, hardProviderCallBudgetFailure()
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	raw, errExecute := execute(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/fallback-probe",
+			Format:          protocolOpenAI,
+			SourceFormat:    protocolOpenAI,
+			OriginalRequest: []byte(`{"model":"bravo/fallback-probe","messages":[{"role":"user","content":"hello"}]}`),
+		},
+		HostCallbackID: "hard-provider-call-budget-execute",
+	}))
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if env.OK || env.Error == nil {
+		t.Fatalf("response = %s, want exhausted provider-call budget failure", raw)
+	}
+	assertHardProviderCallBudget(t, calls)
+}
+
+func TestBravoCountMaxAttemptsCapsRealProviderCalls(t *testing.T) {
+	auths := installHardProviderCallBudgetTest(t)
+	var calls []pluginapi.HostModelExecutionRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelCountTokens:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			return nil, hardProviderCallBudgetFailure()
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	raw, errCount := countTokens(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/fallback-probe",
+			Format:          protocolOpenAI,
+			SourceFormat:    protocolOpenAI,
+			OriginalRequest: []byte(`{"model":"bravo/fallback-probe","messages":[{"role":"user","content":"hello"}]}`),
+		},
+		HostCallbackID: "hard-provider-call-budget-count",
+	}))
+	if errCount != nil {
+		t.Fatal(errCount)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if env.OK || env.Error == nil {
+		t.Fatalf("response = %s, want exhausted provider-call budget failure", raw)
+	}
+	assertHardProviderCallBudget(t, calls)
+}
+
+func TestBravoStreamMaxAttemptsCapsRealProviderCalls(t *testing.T) {
+	auths := installHardProviderCallBudgetTest(t)
+	var calls []pluginapi.HostModelExecutionRequest
+	var pluginClose rpcStreamCloseRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelExecuteStream:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			return nil, hardProviderCallBudgetFailure()
+		case pluginabi.MethodHostStreamClose:
+			decodeBravoPayload(t, payload, &pluginClose)
+			return mustBravoJSON(t, map[string]any{}), nil
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	runBravoStream(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/fallback-probe",
+			Format:          protocolOpenAI,
+			SourceFormat:    protocolOpenAI,
+			OriginalRequest: []byte(`{"model":"bravo/fallback-probe","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+		},
+		HostCallbackID: "hard-provider-call-budget-stream",
+	}, "hard-provider-call-budget-client-stream")
+
+	assertHardProviderCallBudget(t, calls)
+	if pluginClose.StreamID != "hard-provider-call-budget-client-stream" || pluginClose.Error == "" {
+		t.Fatalf("plugin stream close = %#v, want provider-call budget failure", pluginClose)
 	}
 }
 
