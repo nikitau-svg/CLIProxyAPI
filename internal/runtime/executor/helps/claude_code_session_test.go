@@ -4,9 +4,11 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 func TestExtractClaudeCodeSessionIDFromPayloadJSON(t *testing.T) {
@@ -119,4 +121,57 @@ func TestClaudeCodePromptCacheDeterministicAndAgentScoped(t *testing.T) {
 	if errModel != nil || !ok || otherModel.ID == rootFirst.ID {
 		t.Fatalf("other model cache = %#v, %v, %v; root ID %q", otherModel, ok, errModel, rootFirst.ID)
 	}
+}
+
+func TestClaudeCodePromptCacheIsolatesBravoProjects(t *testing.T) {
+	headers := http.Header{}
+	headers.Set(ClaudeCodeSessionHeader, "shared-session")
+	headers.Set(ClaudeCodeAgentHeader, "shared-agent")
+
+	projectAFirst, ok, errAFirst := ClaudeCodePromptCache(bravoPromptCacheContext("project-a"), "gpt-5.6-sol", nil, headers)
+	if errAFirst != nil || !ok {
+		t.Fatalf("project A first cache = %#v, %v, %v", projectAFirst, ok, errAFirst)
+	}
+	projectASecond, ok, errASecond := ClaudeCodePromptCache(bravoPromptCacheContext("project-a"), "gpt-5.6-sol", nil, headers)
+	if errASecond != nil || !ok || projectASecond.ID != projectAFirst.ID {
+		t.Fatalf("project A second cache = %#v, %v, %v; want ID %q", projectASecond, ok, errASecond, projectAFirst.ID)
+	}
+	projectB, ok, errB := ClaudeCodePromptCache(bravoPromptCacheContext("project-b"), "gpt-5.6-sol", nil, headers)
+	if errB != nil || !ok || projectB.ID == projectAFirst.ID {
+		t.Fatalf("project B cache = %#v, %v, %v; project A ID %q", projectB, ok, errB, projectAFirst.ID)
+	}
+}
+
+func TestClaudeCodePromptCachePreservesLegacyIdentityOutsideBravo(t *testing.T) {
+	headers := http.Header{}
+	headers.Set(ClaudeCodeSessionHeader, "legacy-session")
+	headers.Set(ClaudeCodeAgentHeader, "legacy-agent")
+
+	got, ok, errCache := ClaudeCodePromptCache(nonBravoPromptCacheContext("bravo:not-a-bravo-principal"), "gpt-5.4", nil, headers)
+	if errCache != nil || !ok {
+		t.Fatalf("legacy cache = %#v, %v, %v", got, ok, errCache)
+	}
+	executionScope := "claude:legacy-session:agent:legacy-agent"
+	legacyIdentity := strings.Join([]string{"cli-proxy-api:codex:claude-code", "gpt-5.4", executionScope}, "\x00")
+	want := uuid.NewSHA1(uuid.NameSpaceOID, []byte(legacyIdentity)).String()
+	if got.ID != want {
+		t.Fatalf("legacy cache ID = %q, want %q", got.ID, want)
+	}
+}
+
+func bravoPromptCacheContext(projectID string) context.Context {
+	return promptCacheAccessContext("plugin:bravo:bravo", "bravo:"+projectID)
+}
+
+func nonBravoPromptCacheContext(principal string) context.Context {
+	return promptCacheAccessContext("api-key", principal)
+}
+
+func promptCacheAccessContext(provider, principal string) context.Context {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ginCtx.Set("accessProvider", provider)
+	ginCtx.Set("userApiKey", principal)
+	return context.WithValue(context.Background(), "gin", ginCtx)
 }

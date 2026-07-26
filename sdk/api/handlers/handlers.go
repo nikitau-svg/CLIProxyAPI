@@ -889,7 +889,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelExecutionUsageAlias(originalRequestedModel, execOptions)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
@@ -953,7 +953,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelExecutionUsageAlias(originalRequestedModel, execOptions)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
@@ -1036,7 +1036,7 @@ func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerTyp
 
 func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt string, stream bool, execOptions modelExecutionOptions) (coreexecutor.Request, coreexecutor.Options) {
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelExecutionUsageAlias(originalRequestedModel, execOptions)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
@@ -1317,7 +1317,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelExecutionUsageAlias(originalRequestedModel, execOptions)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)

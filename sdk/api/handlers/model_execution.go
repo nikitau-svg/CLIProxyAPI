@@ -29,6 +29,7 @@ type modelExecutionOptions struct {
 	PinnedAuthID            string
 	SingleAttempt           bool
 	AuthSelectionModel      string
+	UsageAlias              string
 }
 
 // ProtocolExecutionRequest describes a route-level model execution request with explicit protocols.
@@ -56,6 +57,7 @@ type ModelExecutionRequest struct {
 	SingleAttempt           bool
 	AllowImageModel         bool
 	Model                   string
+	UsageAlias              string
 	Stream                  bool
 	Body                    []byte
 	Headers                 http.Header
@@ -121,6 +123,7 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 		ForcedProvider:          req.ForcedProvider,
 		PinnedAuthID:            req.AuthID,
 		SingleAttempt:           req.SingleAttempt,
+		UsageAlias:              req.UsageAlias,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
 		SkipRouterPluginID:      req.SkipRouterPluginID,
 	})
@@ -147,6 +150,7 @@ func (h *BaseAPIHandler) CountModelTokens(ctx context.Context, req ModelExecutio
 		ForcedProvider:          req.ForcedProvider,
 		PinnedAuthID:            req.AuthID,
 		SingleAttempt:           req.SingleAttempt,
+		UsageAlias:              req.UsageAlias,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
 		SkipRouterPluginID:      req.SkipRouterPluginID,
 	})
@@ -175,6 +179,7 @@ func (h *BaseAPIHandler) ExecuteModelStream(ctx context.Context, req ModelExecut
 		ForcedProvider:          req.ForcedProvider,
 		PinnedAuthID:            req.AuthID,
 		SingleAttempt:           req.SingleAttempt,
+		UsageAlias:              req.UsageAlias,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
 		SkipRouterPluginID:      req.SkipRouterPluginID,
 	})
@@ -281,6 +286,13 @@ func addModelExecutionSourceMetadata(meta map[string]any, internalSource bool) {
 		return
 	}
 	meta[modelExecutionMetadataSourceKey] = modelExecutionInternalSource
+}
+
+func modelExecutionUsageAlias(originalRequestedModel string, execOptions modelExecutionOptions) string {
+	if usageAlias := strings.TrimSpace(execOptions.UsageAlias); usageAlias != "" {
+		return usageAlias
+	}
+	return originalRequestedModel
 }
 
 func prepareModelExecutionStream(ctx context.Context, dataChan <-chan []byte, errChan <-chan *interfaces.ErrorMessage) (<-chan ModelExecutionChunk, *interfaces.ErrorMessage) {

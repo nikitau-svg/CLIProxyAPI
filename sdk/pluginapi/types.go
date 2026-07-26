@@ -615,6 +615,9 @@ type HostModelExecutionRequest struct {
 	AllowImageModel bool `json:"allow_image_model,omitempty"`
 	// Model is the requested model identifier.
 	Model string `json:"model"`
+	// UsageAlias is the client-visible logical model or route attached to usage
+	// records. Model remains the physical provider model used for execution.
+	UsageAlias string `json:"usage_alias,omitempty"`
 	// Stream reports whether the request expects streaming output.
 	Stream bool `json:"stream"`
 	// Body contains the raw request body.
@@ -1503,7 +1506,7 @@ type UsageDetail struct {
 	OutputTokens int64
 	// ReasoningTokens is the reasoning token count.
 	ReasoningTokens int64
-	// CachedTokens is the total cached token count.
+	// CachedTokens is the provider-reported cache-read token count.
 	CachedTokens int64
 	// CacheReadTokens is the cache read token count.
 	CacheReadTokens int64

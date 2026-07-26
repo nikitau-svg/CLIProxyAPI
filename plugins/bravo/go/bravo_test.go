@@ -386,15 +386,28 @@ func TestPrefixedModelRoutesToExecutorWithoutSmartKeyForPreciseAuthError(t *test
 func TestNestedHeadersStripClientSecrets(t *testing.T) {
 	t.Parallel()
 	headers := sanitizedNestedHeaders(http.Header{
-		"Authorization":     []string{"Bearer brv_secret"},
-		"X-Api-Key":         []string{"brv_secret"},
-		"Anthropic-Version": []string{"2023-06-01"},
+		"Authorization":            []string{"Bearer brv_secret"},
+		"X-Api-Key":                []string{"brv_secret"},
+		"Anthropic-Version":        []string{"2023-06-01"},
+		"X-Claude-Code-Session-Id": []string{"session-123"},
+		"X-Claude-Code-Agent-Id":   []string{"agent-456"},
+		"X-Stainless-Retry-Count":  []string{"0"},
+		"X-Stainless-Timeout":      []string{"600"},
 	})
 	if headers.Get("Authorization") != "" || headers.Get("X-Api-Key") != "" {
 		t.Fatal("client credentials survived nested header sanitization")
 	}
 	if headers.Get("Anthropic-Version") != "2023-06-01" {
 		t.Fatal("protocol header was removed")
+	}
+	if headers.Get("X-Claude-Code-Session-Id") != "session-123" {
+		t.Fatal("Claude Code session identity was removed, which would break stable prompt cache keys")
+	}
+	if headers.Get("X-Claude-Code-Agent-Id") != "agent-456" {
+		t.Fatal("Claude Code agent identity was removed, which would break prompt cache isolation")
+	}
+	if headers.Get("X-Stainless-Retry-Count") != "0" || headers.Get("X-Stainless-Timeout") != "600" {
+		t.Fatal("Claude client transport metadata was removed")
 	}
 }
 
@@ -468,6 +481,86 @@ func TestRewriteCandidateRequestNormalizesResponsesStringInput(t *testing.T) {
 	textPart, _ := content[0].(map[string]any)
 	if textPart["type"] != "input_text" || textPart["text"] != "hello" {
 		t.Fatalf("normalized text part = %#v", textPart)
+	}
+}
+
+func TestRewriteCandidateRequestPreservesPromptCacheHints(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		protocol string
+		body     string
+		paths    map[string]any
+	}{
+		{
+			name:     "anthropic cache control",
+			protocol: protocolClaude,
+			body: `{
+				"model":"bravo/opus",
+				"system":[{"type":"text","text":"stable","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+				"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}]
+			}`,
+			paths: map[string]any{
+				"system.0.cache_control.type":             "ephemeral",
+				"system.0.cache_control.ttl":              "1h",
+				"messages.0.content.0.cache_control.type": "ephemeral",
+			},
+		},
+		{
+			name:     "OpenAI responses prompt cache key",
+			protocol: protocolOpenAIResponse,
+			body: `{
+				"model":"bravo/frontier",
+				"input":"hello",
+				"prompt_cache_key":"project-session-agent",
+				"prompt_cache_retention":"24h"
+			}`,
+			paths: map[string]any{
+				"prompt_cache_key":       "project-session-agent",
+				"prompt_cache_retention": "24h",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rewritten, errRewrite := rewriteCandidateRequest(
+				[]byte(tt.body),
+				tt.protocol,
+				"physical-model",
+				false,
+			)
+			if errRewrite != nil {
+				t.Fatal(errRewrite)
+			}
+			var root any
+			if errUnmarshal := json.Unmarshal(rewritten, &root); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			for path, want := range tt.paths {
+				if got := nestedJSONValue(root, strings.Split(path, ".")); got != want {
+					t.Errorf("%s = %#v, want %#v; payload: %s", path, got, want, rewritten)
+				}
+			}
+		})
+	}
+}
+
+func nestedJSONValue(value any, path []string) any {
+	if len(path) == 0 {
+		return value
+	}
+	switch current := value.(type) {
+	case map[string]any:
+		return nestedJSONValue(current[path[0]], path[1:])
+	case []any:
+		if path[0] != "0" || len(current) == 0 {
+			return nil
+		}
+		return nestedJSONValue(current[0], path[1:])
+	default:
+		return nil
 	}
 }
 

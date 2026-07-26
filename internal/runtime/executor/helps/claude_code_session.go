@@ -100,6 +100,36 @@ func ClaudeCodePromptCache(ctx context.Context, modelName string, payload []byte
 	if modelName == "" || !ok {
 		return CodexCache{}, false, nil
 	}
-	identity := strings.Join([]string{"cli-proxy-api:codex:claude-code", modelName, executionScope}, "\x00")
+	identityParts := []string{"cli-proxy-api:codex:claude-code", modelName, executionScope}
+	if projectScope := claudeCodeBravoProjectScope(ctx); projectScope != "" {
+		identityParts = append(identityParts, "project:"+projectScope)
+	}
+	identity := strings.Join(identityParts, "\x00")
 	return CodexCache{ID: uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String()}, true, nil
+}
+
+func claudeCodeBravoProjectScope(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	rawProvider, ok := ginCtx.Get("accessProvider")
+	if !ok {
+		return ""
+	}
+	provider, ok := rawProvider.(string)
+	if !ok || !strings.EqualFold(strings.TrimSpace(provider), "plugin:bravo:bravo") {
+		return ""
+	}
+	// Bravo authentication stores a redacted project principal here, not the
+	// plaintext smart key. Other access providers retain the legacy identity.
+	principal := strings.TrimSpace(APIKeyFromContext(ctx))
+	projectID, ok := strings.CutPrefix(principal, "bravo:")
+	if !ok || strings.TrimSpace(projectID) == "" {
+		return ""
+	}
+	return principal
 }

@@ -1,9 +1,13 @@
 services:
   cli-proxy-api-canary:
-    image: ${CLIPROXYAPI_IMAGE:-cliproxyapi-local:v7.2.94-bravo-native0.6.0}
+    # Require an explicit canary image instead of silently running an older
+    # local build. The release procedure supplies a unique commit-SHA tag and
+    # verifies its image ID before launch.
+    image: ${CLIPROXYAPI_IMAGE:?missing CLIPROXYAPI_IMAGE for canary}
     pull_policy: never
-    container_name: CLIProxyAPI-Canary
+    container_name: ${CLIPROXYAPI_CONTAINER_NAME:-CLIProxyAPI-Canary}
     restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "/CLIProxyAPI/cliproxy-healthcheck"]
       interval: 15s
@@ -11,6 +15,8 @@ services:
       retries: 5
       start_period: 10s
     ports:
+      # API and Management UI. The default loopback binding is safe for an
+      # SSH tunnel; opt into a LAN address explicitly when required.
       - "${CLIPROXYAPI_BIND_ADDRESS:-127.0.0.1}:${CLIPROXYAPI_CANARY_PORT:-18319}:8317"
     volumes:
       - "./config.yaml:/CLIProxyAPI/config.yaml"
@@ -18,3 +24,8 @@ services:
       - "./bravo-data:/CLIProxyAPI/bravo-data"
       - "./logs:/CLIProxyAPI/logs"
       - "./plugins:/CLIProxyAPI/plugins"
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"

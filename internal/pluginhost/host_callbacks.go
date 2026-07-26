@@ -337,6 +337,7 @@ func modelExecutionRequestFromPlugin(req pluginapi.HostModelExecutionRequest, sk
 		SingleAttempt:           req.SingleAttempt,
 		AllowImageModel:         req.AllowImageModel,
 		Model:                   req.Model,
+		UsageAlias:              req.UsageAlias,
 		Stream:                  req.Stream,
 		Body:                    append([]byte(nil), req.Body...),
 		Headers:                 cloneHeader(req.Headers),

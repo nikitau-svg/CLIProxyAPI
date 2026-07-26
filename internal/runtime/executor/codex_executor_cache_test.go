@@ -366,3 +366,75 @@ func TestCodexExecutorCacheHelper_ClaudeAgentScopeUsesResolvedModelAcrossHTTPAnd
 		t.Fatalf("HTTP/WebSocket prompt keys differ: http=%q websocket=%q", childKey, websocketKey)
 	}
 }
+
+func TestCodexExecutorCacheHelper_ClaudeBravoProjectScopeMatchesAcrossTransports(t *testing.T) {
+	executor := &CodexExecutor{}
+	url := "https://example.com/responses"
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`),
+	}
+	headers := http.Header{}
+	headers.Set(helps.ClaudeCodeSessionHeader, "shared-transport-session")
+	headers.Set(helps.ClaudeCodeAgentHeader, "shared-transport-agent")
+
+	projectAContext := codexBravoPromptCacheContext("project-a")
+	projectANonStream := codexClaudePromptCacheKey(t, executor, projectAContext, url, req, []byte(`{"model":"gpt-5.6-sol"}`), headers)
+	projectAStream := codexClaudePromptCacheKey(t, executor, projectAContext, url, req, []byte(`{"model":"gpt-5.6-sol","stream":true}`), headers)
+	projectAWebSocketBody, _, errProjectAWebSocket := applyCodexPromptCacheHeadersWithContext(
+		projectAContext,
+		sdktranslator.FromString("claude"),
+		req,
+		[]byte(`{"model":"gpt-5.6-sol","stream":true}`),
+		headers,
+	)
+	if errProjectAWebSocket != nil {
+		t.Fatalf("project A websocket prompt cache: %v", errProjectAWebSocket)
+	}
+	projectAWebSocket := gjson.GetBytes(projectAWebSocketBody, "prompt_cache_key").String()
+	if projectANonStream == "" || projectAStream != projectANonStream || projectAWebSocket != projectANonStream {
+		t.Fatalf("project A cache keys differ: nonstream=%q stream=%q websocket=%q", projectANonStream, projectAStream, projectAWebSocket)
+	}
+
+	projectBContext := codexBravoPromptCacheContext("project-b")
+	projectBNonStream := codexClaudePromptCacheKey(t, executor, projectBContext, url, req, []byte(`{"model":"gpt-5.6-sol"}`), headers)
+	projectBWebSocketBody, _, errProjectBWebSocket := applyCodexPromptCacheHeadersWithContext(
+		projectBContext,
+		sdktranslator.FromString("claude"),
+		req,
+		[]byte(`{"model":"gpt-5.6-sol","stream":true}`),
+		headers,
+	)
+	if errProjectBWebSocket != nil {
+		t.Fatalf("project B websocket prompt cache: %v", errProjectBWebSocket)
+	}
+	projectBWebSocket := gjson.GetBytes(projectBWebSocketBody, "prompt_cache_key").String()
+	if projectBNonStream == "" || projectBWebSocket != projectBNonStream {
+		t.Fatalf("project B cache keys differ: nonstream=%q websocket=%q", projectBNonStream, projectBWebSocket)
+	}
+	if projectBNonStream == projectANonStream {
+		t.Fatalf("distinct Bravo projects share prompt cache key %q", projectANonStream)
+	}
+}
+
+func codexClaudePromptCacheKey(t *testing.T, executor *CodexExecutor, ctx context.Context, url string, req cliproxyexecutor.Request, rawJSON []byte, headers http.Header) string {
+	t.Helper()
+	httpReq, _, _, errCache := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, req, req.Payload, rawJSON, headers)
+	if errCache != nil {
+		t.Fatalf("cacheHelper: %v", errCache)
+	}
+	body, errRead := io.ReadAll(httpReq.Body)
+	if errRead != nil {
+		t.Fatalf("read cache helper body: %v", errRead)
+	}
+	return gjson.GetBytes(body, "prompt_cache_key").String()
+}
+
+func codexBravoPromptCacheContext(projectID string) context.Context {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ginCtx.Set("accessProvider", "plugin:bravo:bravo")
+	ginCtx.Set("userApiKey", "bravo:"+projectID)
+	return context.WithValue(context.Background(), "gin", ginCtx)
+}
