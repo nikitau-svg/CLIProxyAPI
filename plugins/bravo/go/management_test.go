@@ -121,6 +121,10 @@ func TestRedactedBravoConfigOmitsSmartKeyDigest(t *testing.T) {
 	}
 }
 
+// classifyBravoAuthHealth is the summary and quota-refresher verdict, so it still
+// reports every roll-up field verbatim. Routing eligibility deliberately differs:
+// a flag the host only clears on a successful request must not stop that request.
+// wantEligible records that split per case.
 func TestClassifyBravoAuthHealthMatchesRouterEligibility(t *testing.T) {
 	isolateBravoCooldowns(t)
 	now := time.Now()
@@ -129,11 +133,14 @@ func TestClassifyBravoAuthHealthMatchesRouterEligibility(t *testing.T) {
 		name string
 		auth pluginapi.HostAuthFileEntry
 		want bravoAuthHealth
+		// wantEligible is set only where routing diverges from want == ready.
+		wantEligible bool
 	}{
 		{
-			name: "ready",
-			auth: pluginapi.HostAuthFileEntry{ID: "ready", Provider: "claude"},
-			want: bravoAuthReady,
+			name:         "ready",
+			auth:         pluginapi.HostAuthFileEntry{ID: "ready", Provider: "claude"},
+			want:         bravoAuthReady,
+			wantEligible: true,
 		},
 		{
 			name: "disabled flag",
@@ -146,14 +153,27 @@ func TestClassifyBravoAuthHealthMatchesRouterEligibility(t *testing.T) {
 			want: bravoAuthDisabled,
 		},
 		{
-			name: "unavailable",
-			auth: pluginapi.HostAuthFileEntry{ID: "unavailable", Provider: "claude", Unavailable: true},
-			want: bravoAuthUnavailable,
+			// Deadline-free: the host keeps routing here and clears the flag on the
+			// next success, so refusing it would strand the credential.
+			name:         "unavailable",
+			auth:         pluginapi.HostAuthFileEntry{ID: "unavailable", Provider: "claude", Unavailable: true},
+			want:         bravoAuthUnavailable,
+			wantEligible: true,
 		},
 		{
-			name: "error status",
-			auth: pluginapi.HostAuthFileEntry{ID: "error", Provider: "claude", Status: "error"},
-			want: bravoAuthError,
+			name:         "error status",
+			auth:         pluginapi.HostAuthFileEntry{ID: "error", Provider: "claude", Status: "error"},
+			want:         bravoAuthError,
+			wantEligible: true,
+		},
+		{
+			// The same flags with a deadline the host set are honoured.
+			name: "unavailable with deadline",
+			auth: pluginapi.HostAuthFileEntry{
+				ID: "unavailable-deadline", Provider: "claude",
+				Unavailable: true, NextRetryAfter: now.Add(time.Minute),
+			},
+			want: bravoAuthUnavailable,
 		},
 		{
 			name: "provider retry",
@@ -173,8 +193,8 @@ func TestClassifyBravoAuthHealthMatchesRouterEligibility(t *testing.T) {
 				t.Fatalf("classifyBravoAuthHealth() = %q, want %q", got, testCase.want)
 			}
 			eligible := eligibleAuths(item, []pluginapi.HostAuthFileEntry{testCase.auth}, now)
-			if gotEligible, wantEligible := len(eligible) == 1, testCase.want == bravoAuthReady; gotEligible != wantEligible {
-				t.Fatalf("eligibleAuths() eligible = %v, want %v for state %q", gotEligible, wantEligible, testCase.want)
+			if gotEligible := len(eligible) == 1; gotEligible != testCase.wantEligible {
+				t.Fatalf("eligibleAuths() eligible = %v, want %v for state %q", gotEligible, testCase.wantEligible, testCase.want)
 			}
 		})
 	}
@@ -222,6 +242,216 @@ func TestAccountWideCooldownDisablesEveryModel(t *testing.T) {
 		if eligible := eligibleAuths(item, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 0 {
 			t.Fatalf("account-wide cooldown left %s eligible", model)
 		}
+	}
+}
+
+// The production failure this guards: one model fails, the host marks the whole
+// credential StatusError (conductor.go applyResult), and Bravo read that roll-up
+// and dropped the account for *every* model. The native selector meanwhile routes
+// on per-model state, so bravo/<model> answered 503 while the unprefixed model
+// served 200 off the same subscription in the same second.
+func TestHostRollupDoesNotDisableModelsWithHealthyOwnState(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	auth := pluginapi.HostAuthFileEntry{
+		ID:       "rollup-poisoned",
+		Provider: "claude",
+		// Roll-up fields as the host leaves them after a single model failure.
+		Status:         "error",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(30 * time.Second),
+		ModelStates: map[string]pluginapi.HostAuthModelState{
+			"claude-opus-5": {
+				Status:         "error",
+				Unavailable:    true,
+				NextRetryAfter: now.Add(30 * time.Second),
+			},
+			"claude-sonnet-5": {Status: "active"},
+		},
+	}
+
+	failed := candidate{Provider: "claude", Model: "claude-opus-5"}
+	if got := classifyBravoAuthHealthForModel("claude", auth, failed.Model, now); got != bravoAuthCooldown {
+		t.Fatalf("failed model health = %q, want %q", got, bravoAuthCooldown)
+	}
+	if eligible := eligibleAuths(failed, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 0 {
+		t.Fatal("router kept the model that is actually cooling")
+	}
+
+	healthy := candidate{Provider: "claude", Model: "claude-sonnet-5"}
+	if got := classifyBravoAuthHealthForModel("claude", auth, healthy.Model, now); got != bravoAuthReady {
+		t.Fatalf("sibling model health = %q, want %q", got, bravoAuthReady)
+	}
+	if eligible := eligibleAuths(healthy, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 1 {
+		t.Fatal("credential-wide roll-up disabled a model the host still serves")
+	}
+
+	// A thinking suffix must resolve to the same state as its base model.
+	suffixed := candidate{Provider: "claude", Model: "claude-opus-5(8192)"}
+	if got := classifyBravoAuthHealthForModel("claude", auth, suffixed.Model, now); got != bravoAuthCooldown {
+		t.Fatalf("suffixed model health = %q, want %q", got, bravoAuthCooldown)
+	}
+
+	// A model with no state of its own has only the roll-up to go on, and the
+	// roll-up says the credential is in trouble.
+	unknown := candidate{Provider: "claude", Model: "claude-haiku-4-5-20251001"}
+	if got := classifyBravoAuthHealthForModel("claude", auth, unknown.Model, now); got == bravoAuthReady {
+		t.Fatal("a model with no per-model state ignored the credential-wide roll-up")
+	}
+}
+
+// An expired per-model deadline is stale state, not a live cooldown: the host
+// clears it lazily on the next update and routes the model in the meantime.
+func TestExpiredModelDeadlineIsUsableAgain(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	auth := pluginapi.HostAuthFileEntry{
+		ID:       "expired-state",
+		Provider: "claude",
+		Status:   "error",
+		ModelStates: map[string]pluginapi.HostAuthModelState{
+			"claude-opus-5": {
+				Status:         "error",
+				Unavailable:    true,
+				NextRetryAfter: now.Add(-time.Minute),
+			},
+			// Unavailable with no deadline is how the host spells "usable".
+			"claude-sonnet-5": {Status: "error", Unavailable: true},
+		},
+	}
+	for _, model := range []string{"claude-opus-5", "claude-sonnet-5"} {
+		if got := classifyBravoAuthHealthForModel("claude", auth, model, now); got != bravoAuthReady {
+			t.Fatalf("%s health = %q, want %q", model, got, bravoAuthReady)
+		}
+	}
+}
+
+// Disabled is an operator decision about the credential, so it must outrank any
+// per-model state — unlike StatusError, it is never a side effect of one model.
+func TestDisabledCredentialOutranksPerModelState(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	auth := pluginapi.HostAuthFileEntry{
+		ID:          "disabled-credential",
+		Provider:    "claude",
+		Disabled:    true,
+		ModelStates: map[string]pluginapi.HostAuthModelState{"claude-opus-5": {Status: "active"}},
+	}
+	if got := classifyBravoAuthHealthForModel("claude", auth, "claude-opus-5", now); got != bravoAuthDisabled {
+		t.Fatalf("health = %q, want %q", got, bravoAuthDisabled)
+	}
+	item := candidate{Provider: "claude", Model: "claude-opus-5"}
+	if eligible := eligibleAuths(item, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 0 {
+		t.Fatal("router used a disabled credential because one model looked healthy")
+	}
+}
+
+// A per-model quota window is a real block even when Unavailable is not set.
+func TestPerModelQuotaWindowBlocksOnlyItsModel(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	auth := pluginapi.HostAuthFileEntry{
+		ID:       "model-quota",
+		Provider: "claude",
+		ModelStates: map[string]pluginapi.HostAuthModelState{
+			"claude-opus-5":   {Status: "error", QuotaExceeded: true, QuotaRecoverAt: now.Add(time.Hour)},
+			"claude-sonnet-5": {Status: "active"},
+		},
+	}
+	if got := classifyBravoAuthHealthForModel("claude", auth, "claude-opus-5", now); got != bravoAuthCooldown {
+		t.Fatalf("quota-blocked model health = %q, want %q", got, bravoAuthCooldown)
+	}
+	if got := classifyBravoAuthHealthForModel("claude", auth, "claude-sonnet-5", now); got != bravoAuthReady {
+		t.Fatalf("sibling model health = %q, want %q", got, bravoAuthReady)
+	}
+}
+
+// The live production state, read from the management API while the pool was
+// degraded: two Claude credentials at status "error" with a transient network
+// message, no NextRetryAfter, and no per-model state at all. The host keeps
+// routing to them (its selector blocks only on a deadline) and the next success
+// clears the flag in clearAuthStateOnSuccess. Bravo used to refuse them outright,
+// which removed the only thing that could clear the flag — so the credential
+// stayed out of the pool permanently, not for 30 seconds.
+func TestStuckErrorStatusWithoutDeadlineStaysRoutable(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	for _, message := range []string{
+		`Post "https://api.anthropic.com/v1/messages?beta=true": unexpected EOF`,
+		`Post "https://api.anthropic.com/v1/messages?beta=true": socks connect tcp: unknown error general SOCKS`,
+	} {
+		auth := pluginapi.HostAuthFileEntry{
+			ID:            "stuck-error",
+			Provider:      "claude",
+			Status:        "error",
+			StatusMessage: message,
+			// No NextRetryAfter and no ModelStates — exactly as the host left it.
+		}
+		item := candidate{Provider: "claude", Model: "claude-opus-5"}
+		if got := classifyBravoAuthHealthForModel("claude", auth, item.Model, now); got != bravoAuthReady {
+			t.Fatalf("health for %q = %q, want %q", message, got, bravoAuthReady)
+		}
+		if eligible := eligibleAuths(item, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 1 {
+			t.Fatalf("a stuck error flag with no deadline removed the credential (%q)", message)
+		}
+	}
+}
+
+// A roll-up deadline is real: the host set it, it expires on its own, and the
+// native selector honours it. Only the deadline-free flag is ignored.
+func TestRollupDeadlineStillBlocksWhenNoModelStateExists(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	auth := pluginapi.HostAuthFileEntry{
+		ID:             "rollup-deadline",
+		Provider:       "claude",
+		Status:         "error",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(30 * time.Second),
+	}
+	item := candidate{Provider: "claude", Model: "claude-opus-5"}
+	if got := classifyBravoAuthHealthForModel("claude", auth, item.Model, now); got != bravoAuthCooldown {
+		t.Fatalf("health = %q, want %q", got, bravoAuthCooldown)
+	}
+	if eligible := eligibleAuths(item, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 0 {
+		t.Fatal("a live roll-up deadline was ignored")
+	}
+
+	// Once it expires the credential returns without needing any state update.
+	later := auth.NextRetryAfter.Add(time.Second)
+	if got := classifyBravoAuthHealthForModel("claude", auth, item.Model, later); got != bravoAuthReady {
+		t.Fatalf("health after the deadline = %q, want %q", got, bravoAuthReady)
+	}
+}
+
+// disabled is an operator decision and has no deadline to wait for, so it must
+// still block on the stateless path.
+func TestDisabledStillBlocksWithoutModelState(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	for _, auth := range []pluginapi.HostAuthFileEntry{
+		{ID: "flagged", Provider: "claude", Disabled: true},
+		{ID: "by-status", Provider: "claude", Status: "disabled"},
+	} {
+		if got := classifyBravoAuthHealthForModel("claude", auth, "claude-opus-5", now); got != bravoAuthDisabled {
+			t.Fatalf("health for %+v = %q, want %q", auth, got, bravoAuthDisabled)
+		}
+	}
+}
+
+// Bravo's own cooldown map is credential-wide when its model scope is empty, and
+// that must survive the per-model path — 401/403 revoke the whole credential.
+func TestBravoAccountWideCooldownSurvivesPerModelState(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	auth := pluginapi.HostAuthFileEntry{
+		ID:          "bravo-account-cooldown",
+		Provider:    "claude",
+		ModelStates: map[string]pluginapi.HostAuthModelState{"claude-opus-5": {Status: "active"}},
+	}
+	setCooldown("claude", auth.ID, "", "unauthorized", now.Add(time.Minute))
+	if got := classifyBravoAuthHealthForModel("claude", auth, "claude-opus-5", now); got != bravoAuthCooldown {
+		t.Fatalf("health = %q, want %q", got, bravoAuthCooldown)
 	}
 }
 

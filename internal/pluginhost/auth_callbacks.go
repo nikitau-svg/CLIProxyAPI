@@ -321,10 +321,7 @@ func (h *Host) buildAuthFromFileData(path string, data []byte) (*coreauth.Auth, 
 	if strings.TrimSpace(provider) == "" {
 		provider = "unknown"
 	}
-	label := provider
-	if email, ok := metadata["email"].(string); ok && strings.TrimSpace(email) != "" {
-		label = strings.TrimSpace(email)
-	}
+	label := authFileLabel(provider, metadata)
 	authID := h.authIDForPath(path)
 	if authID == "" {
 		authID = path
@@ -355,6 +352,15 @@ func (h *Host) buildAuthFromFileData(path string, data []byte) (*coreauth.Auth, 
 	return auth, nil
 }
 
+// authFileLabel derives the human-readable credential label, falling back to the
+// provider when the file carries no label-worthy field of its own.
+func authFileLabel(provider string, metadata map[string]any) string {
+	if label := coreauth.DisplayLabelFromMetadata(metadata); label != "" {
+		return label
+	}
+	return provider
+}
+
 func (h *Host) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) error {
 	manager := h.currentAuthManager()
 	if manager == nil || auth == nil {
@@ -380,6 +386,58 @@ func isUnsafeAuthFileName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// hostAuthDisplayLabel resolves the label a plugin should show for a credential.
+// The stored Label already prefers the note for file-backed credentials, but ones
+// registered before this precedence existed — or through a path that never saw the
+// auth file — still carry an email there, so the note is re-checked here. Every
+// surface that renders a credential must agree on the name, otherwise the operator
+// reads two different names for one account depending on which page they opened.
+func hostAuthDisplayLabel(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if note := strings.TrimSpace(authAttribute(auth, "note")); note != "" {
+		return note
+	}
+	if label := coreauth.DisplayLabelFromMetadata(auth.Metadata); label != "" {
+		return label
+	}
+	return strings.TrimSpace(auth.Label)
+}
+
+// hostAuthModelStates exposes the per-model health that the native selector
+// routes on, so a plugin router can reach the same verdict as the host.
+//
+// The credential-wide Status/Unavailable/NextRetryAfter fields cannot carry this:
+// a single failing model sets auth.Status to StatusError for the whole
+// credential, and NextRetryAfter is an aggregate that updateAggregatedAvailability
+// only populates once *every* model is cooling. A plugin reading only those
+// withholds a credential the host still serves on its other models.
+func hostAuthModelStates(auth *coreauth.Auth) map[string]pluginapi.HostAuthModelState {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return nil
+	}
+	out := make(map[string]pluginapi.HostAuthModelState, len(auth.ModelStates))
+	for model, state := range auth.ModelStates {
+		model = strings.TrimSpace(model)
+		if model == "" || state == nil {
+			continue
+		}
+		out[model] = pluginapi.HostAuthModelState{
+			Status:         string(state.Status),
+			StatusMessage:  state.StatusMessage,
+			Unavailable:    state.Unavailable,
+			NextRetryAfter: state.NextRetryAfter,
+			QuotaExceeded:  state.Quota.Exceeded,
+			QuotaRecoverAt: state.Quota.NextRecoverAt,
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFileEntry {
@@ -411,7 +469,7 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 		Name:           name,
 		Type:           strings.TrimSpace(auth.Provider),
 		Provider:       strings.TrimSpace(auth.Provider),
-		Label:          auth.Label,
+		Label:          hostAuthDisplayLabel(auth),
 		Status:         string(auth.Status),
 		StatusMessage:  auth.StatusMessage,
 		Disabled:       auth.Disabled,
@@ -450,6 +508,7 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 	if !auth.NextRetryAfter.IsZero() {
 		entry.NextRetryAfter = auth.NextRetryAfter
 	}
+	entry.ModelStates = hostAuthModelStates(auth)
 	if path != "" {
 		entry.Path = path
 		entry.Source = "file"
