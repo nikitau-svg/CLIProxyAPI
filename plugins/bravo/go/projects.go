@@ -29,17 +29,18 @@ const (
 )
 
 type projectView struct {
-	ID             string           `json:"id"`
-	Name           string           `json:"name"`
-	Enabled        bool             `json:"enabled"`
-	Status         string           `json:"status"`
-	Models         []string         `json:"models"`
-	PrimaryAuthIDs []string         `json:"primary_auth_ids"`
-	AllowedAuthIDs []string         `json:"allowed_auth_ids"`
-	Policy         map[string]any   `json:"policy"`
-	CreatedAt      string           `json:"created_at,omitempty"`
-	UpdatedAt      string           `json:"updated_at,omitempty"`
-	Usage          usageSummaryView `json:"usage"`
+	ID             string                 `json:"id"`
+	Name           string                 `json:"name"`
+	Enabled        bool                   `json:"enabled"`
+	Status         string                 `json:"status"`
+	Models         []string               `json:"models"`
+	PrimaryAuthIDs []string               `json:"primary_auth_ids"`
+	AllowedAuthIDs []string               `json:"allowed_auth_ids"`
+	Policy         map[string]any         `json:"policy"`
+	PromptCache    projectPromptCacheView `json:"prompt_cache"`
+	CreatedAt      string                 `json:"created_at,omitempty"`
+	UpdatedAt      string                 `json:"updated_at,omitempty"`
+	Usage          usageSummaryView       `json:"usage"`
 }
 
 type projectModelOption struct {
@@ -50,24 +51,26 @@ type projectModelOption struct {
 }
 
 type createProjectRequest struct {
-	Name           string         `json:"name"`
-	Enabled        *bool          `json:"enabled,omitempty"`
-	Status         string         `json:"status,omitempty"`
-	Models         []string       `json:"models,omitempty"`
-	PrimaryAuthIDs []string       `json:"primary_auth_ids,omitempty"`
-	AllowedAuthIDs []string       `json:"allowed_auth_ids,omitempty"`
-	Policy         map[string]any `json:"policy,omitempty"`
+	Name           string                    `json:"name"`
+	Enabled        *bool                     `json:"enabled,omitempty"`
+	Status         string                    `json:"status,omitempty"`
+	Models         []string                  `json:"models,omitempty"`
+	PrimaryAuthIDs []string                  `json:"primary_auth_ids,omitempty"`
+	AllowedAuthIDs []string                  `json:"allowed_auth_ids,omitempty"`
+	Policy         map[string]any            `json:"policy,omitempty"`
+	PromptCache    *projectPromptCachePolicy `json:"prompt_cache,omitempty"`
 }
 
 type patchProjectRequest struct {
-	ID             string          `json:"id"`
-	Name           *string         `json:"name,omitempty"`
-	Enabled        *bool           `json:"enabled,omitempty"`
-	Status         *string         `json:"status,omitempty"`
-	Models         *[]string       `json:"models,omitempty"`
-	PrimaryAuthIDs *[]string       `json:"primary_auth_ids,omitempty"`
-	AllowedAuthIDs *[]string       `json:"allowed_auth_ids,omitempty"`
-	Policy         json.RawMessage `json:"policy,omitempty"`
+	ID             string                    `json:"id"`
+	Name           *string                   `json:"name,omitempty"`
+	Enabled        *bool                     `json:"enabled,omitempty"`
+	Status         *string                   `json:"status,omitempty"`
+	Models         *[]string                 `json:"models,omitempty"`
+	PrimaryAuthIDs *[]string                 `json:"primary_auth_ids,omitempty"`
+	AllowedAuthIDs *[]string                 `json:"allowed_auth_ids,omitempty"`
+	Policy         json.RawMessage           `json:"policy,omitempty"`
+	PromptCache    *projectPromptCachePolicy `json:"prompt_cache,omitempty"`
 }
 
 type projectIdentityRequest struct {
@@ -195,6 +198,15 @@ func createProject(req rpcManagementRequest) ([]byte, error) {
 		})
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	policy := cloneProjectPolicy(input.Policy)
+	if input.PromptCache != nil {
+		if failure := setProjectPromptCachePolicy(policy, *input.PromptCache); failure != nil {
+			return projectFailureJSON(*failure)
+		}
+	}
+	if failure := validateAndCanonicalizeProjectPromptCachePolicy(policy); failure != nil {
+		return projectFailureJSON(*failure)
+	}
 	item := smartKeyConfig{
 		ID:             projectID,
 		Name:           name,
@@ -204,7 +216,7 @@ func createProject(req rpcManagementRequest) ([]byte, error) {
 		Models:         models,
 		PrimaryAuthIDs: normalizeOpaqueStrings(input.PrimaryAuthIDs),
 		AllowedAuthIDs: normalizeOpaqueStrings(input.AllowedAuthIDs),
-		Policy:         cloneProjectPolicy(input.Policy),
+		Policy:         policy,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
@@ -270,7 +282,7 @@ func patchProject(req rpcManagementRequest) ([]byte, error) {
 	}
 	if input.Policy != nil {
 		if strings.TrimSpace(string(input.Policy)) == "null" {
-			updated.Policy = nil
+			updated.Policy = map[string]any{}
 		} else {
 			var policy map[string]any
 			if errPolicy := json.Unmarshal(input.Policy, &policy); errPolicy != nil || policy == nil {
@@ -282,6 +294,14 @@ func patchProject(req rpcManagementRequest) ([]byte, error) {
 			}
 			updated.Policy = cloneProjectPolicy(policy)
 		}
+	}
+	if input.PromptCache != nil {
+		if failure := setProjectPromptCachePolicy(updated.Policy, *input.PromptCache); failure != nil {
+			return projectFailureJSON(*failure)
+		}
+	}
+	if failure := validateAndCanonicalizeProjectPromptCachePolicy(updated.Policy); failure != nil {
+		return projectFailureJSON(*failure)
 	}
 	if strings.EqualFold(current.Status, projectStatusRevoked) {
 		requestedStatus := projectStatusRevoked
@@ -637,6 +657,7 @@ func smartKeyProjectView(item smartKeyConfig) projectView {
 		PrimaryAuthIDs: append([]string{}, item.PrimaryAuthIDs...),
 		AllowedAuthIDs: append([]string{}, item.AllowedAuthIDs...),
 		Policy:         cloneProjectPolicy(item.Policy),
+		PromptCache:    projectPromptCacheViewFor(item),
 		CreatedAt:      item.CreatedAt,
 		UpdatedAt:      item.UpdatedAt,
 		Usage:          summary,
@@ -668,6 +689,99 @@ func cloneProjectPolicy(policy map[string]any) map[string]any {
 		return map[string]any{}
 	}
 	return out
+}
+
+func projectPromptCacheViewFor(item smartKeyConfig) projectPromptCacheView {
+	policy, _ := normalizeProjectPromptCachePolicy(item.Policy)
+	return projectPromptCacheView{
+		AnthropicTTL: policy.AnthropicTTL,
+		OpenAIMode:   projectPromptCacheOpenAIManaged,
+	}
+}
+
+func setProjectPromptCachePolicy(policy map[string]any, input projectPromptCachePolicy) *projectFailure {
+	normalized, failure := normalizeProjectPromptCacheInput(input)
+	if failure != nil {
+		return failure
+	}
+	if policy == nil {
+		return &projectFailure{
+			Code:    "bravo_project_policy_invalid",
+			Message: "project policy storage is unavailable.",
+			Status:  http.StatusInternalServerError,
+		}
+	}
+	policy["prompt_cache"] = map[string]any{
+		"anthropic_ttl": normalized.AnthropicTTL,
+	}
+	return nil
+}
+
+// validateAndCanonicalizeProjectPromptCachePolicy runs before the host mutation
+// callback so a malformed generic policy can never be persisted and poison the
+// next Bravo startup. The dedicated prompt_cache request field and the generic
+// policy path intentionally share the same validator.
+func validateAndCanonicalizeProjectPromptCachePolicy(policy map[string]any) *projectFailure {
+	if policy == nil {
+		return nil
+	}
+	normalized, failure := normalizeProjectPromptCachePolicy(policy)
+	if failure != nil {
+		return failure
+	}
+	if _, exists := policy["prompt_cache"]; exists {
+		policy["prompt_cache"] = map[string]any{
+			"anthropic_ttl": normalized.AnthropicTTL,
+		}
+	}
+	return nil
+}
+
+func normalizeProjectPromptCachePolicy(policy map[string]any) (projectPromptCachePolicy, *projectFailure) {
+	defaultPolicy := projectPromptCachePolicy{AnthropicTTL: projectPromptCacheTTLAutomatic}
+	if len(policy) == 0 {
+		return defaultPolicy, nil
+	}
+	rawValue, exists := policy["prompt_cache"]
+	if !exists || rawValue == nil {
+		return defaultPolicy, nil
+	}
+	raw, errMarshal := json.Marshal(rawValue)
+	if errMarshal != nil {
+		return projectPromptCachePolicy{}, invalidProjectPromptCachePolicy()
+	}
+	var input projectPromptCachePolicy
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if errDecode := decoder.Decode(&input); errDecode != nil {
+		return projectPromptCachePolicy{}, invalidProjectPromptCachePolicy()
+	}
+	var trailing any
+	if errTrailing := decoder.Decode(&trailing); errTrailing != io.EOF {
+		return projectPromptCachePolicy{}, invalidProjectPromptCachePolicy()
+	}
+	return normalizeProjectPromptCacheInput(input)
+}
+
+func normalizeProjectPromptCacheInput(input projectPromptCachePolicy) (projectPromptCachePolicy, *projectFailure) {
+	input.AnthropicTTL = strings.ToLower(strings.TrimSpace(input.AnthropicTTL))
+	if input.AnthropicTTL == "" {
+		input.AnthropicTTL = projectPromptCacheTTLAutomatic
+	}
+	switch input.AnthropicTTL {
+	case projectPromptCacheTTLAutomatic, projectPromptCacheTTL5Minutes, projectPromptCacheTTL1Hour:
+		return input, nil
+	default:
+		return projectPromptCachePolicy{}, invalidProjectPromptCachePolicy()
+	}
+}
+
+func invalidProjectPromptCachePolicy() *projectFailure {
+	return &projectFailure{
+		Code:    "bravo_project_prompt_cache_invalid",
+		Message: "prompt_cache.anthropic_ttl must be auto, 5m, or 1h.",
+		Status:  http.StatusBadRequest,
+	}
 }
 
 func boolPointer(value bool) *bool {

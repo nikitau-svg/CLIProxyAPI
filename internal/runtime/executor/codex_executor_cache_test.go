@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -67,6 +68,240 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	gotKey2 := gjson.GetBytes(body2, "prompt_cache_key").String()
 	if gotKey2 != expectedKey {
 		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, expectedKey)
+	}
+}
+
+func TestCodexExecutorCacheHelper_OpenAIResponsesScopesBravoProjects(t *testing.T) {
+	executor := &CodexExecutor{}
+	url := "https://example.com/responses"
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.6-sol",
+		Payload: []byte(`{
+			"model":"gpt-5.6-sol",
+			"prompt_cache_key":"shared-client-session",
+			"input":[{"role":"user","content":"hello"}]
+		}`),
+	}
+	rawJSON := []byte(`{
+		"model":"gpt-5.6-sol",
+		"prompt_cache_key":"shared-client-session",
+		"client_metadata":{
+			"x-codex-turn-metadata":"{\"prompt_cache_key\":\"shared-client-session\",\"window_id\":\"shared-client-session:0\"}",
+			"x-codex-window-id":"shared-client-session:0"
+		}
+	}`)
+
+	projectA := codexBravoPromptCacheContext("project-a")
+	projectARequest, projectABody, projectAState, errA := executor.cacheHelper(
+		projectA,
+		sdktranslator.FromString("openai-response"),
+		url,
+		nil,
+		req,
+		req.Payload,
+		rawJSON,
+	)
+	if errA != nil {
+		t.Fatalf("project A cacheHelper: %v", errA)
+	}
+	projectACache, projectAScope := codexOpenAIResponsesPromptCache(projectA, req)
+	if !projectAScope.active() || projectACache.ID == "" {
+		t.Fatalf("project A scope = %#v cache = %#v, want active project cache", projectAScope, projectACache)
+	}
+	if got := gjson.GetBytes(projectABody, "prompt_cache_key").String(); got != projectACache.ID {
+		t.Fatalf("project A prompt_cache_key = %q, want %q", got, projectACache.ID)
+	}
+	if got := projectARequest.Header["Session_id"]; len(got) != 1 || got[0] != projectACache.ID {
+		t.Fatalf("project A Session_id = %#v, want [%q]", got, projectACache.ID)
+	}
+	turnMetadata := gjson.GetBytes(projectABody, "client_metadata.x-codex-turn-metadata").String()
+	if got := gjson.Get(turnMetadata, "prompt_cache_key").String(); got != projectACache.ID {
+		t.Fatalf("project A turn metadata prompt_cache_key = %q, want %q", got, projectACache.ID)
+	}
+	if got := gjson.GetBytes(projectABody, "client_metadata.x-codex-window-id").String(); got != projectACache.ID+":0" {
+		t.Fatalf("project A window id = %q, want %q", got, projectACache.ID+":0")
+	}
+	if !projectAState.bravoPromptCache.active() {
+		t.Fatalf("project A identity state lost Bravo scope: %#v", projectAState)
+	}
+
+	repeatedRequest, repeatedBody, _, errRepeat := executor.cacheHelper(
+		projectA,
+		sdktranslator.FromString("openai-response"),
+		url,
+		nil,
+		req,
+		req.Payload,
+		rawJSON,
+	)
+	if errRepeat != nil {
+		t.Fatalf("project A repeated cacheHelper: %v", errRepeat)
+	}
+	if got := gjson.GetBytes(repeatedBody, "prompt_cache_key").String(); got != projectACache.ID {
+		t.Fatalf("project A repeated prompt_cache_key = %q, want %q", got, projectACache.ID)
+	}
+	if got := repeatedRequest.Header["Session_id"]; len(got) != 1 || got[0] != projectACache.ID {
+		t.Fatalf("project A repeated Session_id = %#v, want [%q]", got, projectACache.ID)
+	}
+
+	projectB := codexBravoPromptCacheContext("project-b")
+	_, projectBBody, _, errB := executor.cacheHelper(
+		projectB,
+		sdktranslator.FromString("openai-response"),
+		url,
+		nil,
+		req,
+		req.Payload,
+		rawJSON,
+	)
+	if errB != nil {
+		t.Fatalf("project B cacheHelper: %v", errB)
+	}
+	projectBKey := gjson.GetBytes(projectBBody, "prompt_cache_key").String()
+	if projectBKey == "" || projectBKey == projectACache.ID {
+		t.Fatalf("distinct Bravo projects share prompt cache key: A=%q B=%q", projectACache.ID, projectBKey)
+	}
+
+	nonBravoRequest, nonBravoBody, nonBravoState, errNonBravo := executor.cacheHelper(
+		context.Background(),
+		sdktranslator.FromString("openai-response"),
+		url,
+		nil,
+		req,
+		req.Payload,
+		rawJSON,
+	)
+	if errNonBravo != nil {
+		t.Fatalf("non-Bravo cacheHelper: %v", errNonBravo)
+	}
+	if got := gjson.GetBytes(nonBravoBody, "prompt_cache_key").String(); got != "shared-client-session" {
+		t.Fatalf("non-Bravo prompt_cache_key = %q, want legacy client key", got)
+	}
+	if got := nonBravoRequest.Header["Session_id"]; len(got) != 1 || got[0] != "shared-client-session" {
+		t.Fatalf("non-Bravo Session_id = %#v, want legacy client key", got)
+	}
+	if nonBravoState.bravoPromptCache.active() {
+		t.Fatalf("non-Bravo request gained project scope: %#v", nonBravoState.bravoPromptCache)
+	}
+}
+
+func TestCodexExecutorCacheHelper_OpenAIResponsesComposesBravoScopeBeforeIdentityConfuse(t *testing.T) {
+	executor := &CodexExecutor{cfg: &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}}
+	auth := &cliproxyauth.Auth{ID: "auth-project-cache", Provider: "codex"}
+	ctx := codexBravoPromptCacheContext("project-identity")
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"client-cache","input":[]}`),
+	}
+
+	httpReq, upstreamBody, state, errCache := executor.cacheHelper(
+		ctx,
+		sdktranslator.FromString("openai-response"),
+		"https://example.com/responses",
+		auth,
+		req,
+		req.Payload,
+		req.Payload,
+	)
+	if errCache != nil {
+		t.Fatalf("cacheHelper: %v", errCache)
+	}
+	projectCache, projectScope := codexOpenAIResponsesPromptCache(ctx, req)
+	if !projectScope.active() {
+		t.Fatalf("project scope = %#v, want active", projectScope)
+	}
+	wantUpstream := codexIdentityConfuseUUID(auth.ID, "prompt-cache", projectCache.ID)
+	legacyUpstream := codexIdentityConfuseUUID(auth.ID, "prompt-cache", "client-cache")
+	if wantUpstream == legacyUpstream {
+		t.Fatal("test setup did not distinguish project-scoped and legacy identity keys")
+	}
+	if got := gjson.GetBytes(upstreamBody, "prompt_cache_key").String(); got != wantUpstream {
+		t.Fatalf("upstream prompt_cache_key = %q, want identity(project(client)) %q", got, wantUpstream)
+	}
+	if state.originalPromptCacheKey != projectCache.ID || state.promptCacheKey != wantUpstream {
+		t.Fatalf("identity state = %#v, want project key -> upstream key", state)
+	}
+	if got := httpReq.Header["Session_id"]; len(got) != 1 || got[0] != wantUpstream {
+		t.Fatalf("Session_id = %#v, want [%q]", got, wantUpstream)
+	}
+
+	response := []byte(`{"prompt_cache_key":"` + wantUpstream + `","output_text":"` + projectCache.ID + `"}`)
+	exposed := applyCodexIdentityExposeResponsePayload(response, state)
+	if got := gjson.GetBytes(exposed, "prompt_cache_key").String(); got != "client-cache" {
+		t.Fatalf("client prompt_cache_key = %q, want original client-cache; response=%s", got, exposed)
+	}
+	if got := gjson.GetBytes(exposed, "output_text").String(); got != projectCache.ID {
+		t.Fatalf("unrelated output text was rewritten: %q, want %q", got, projectCache.ID)
+	}
+
+	nestedResponse := []byte(`{"response":{"output":[{"metadata":{"prompt_cache_key":"` + wantUpstream + `"}},{"metadata":{"prompt_cache_key":"different-key"}}]},"message":"keep ` + projectCache.ID + `","metadata":{"session":"` + projectCache.ID + `"}}`)
+	exposedNested := applyCodexIdentityExposeResponsePayload(nestedResponse, state)
+	if got := gjson.GetBytes(exposedNested, "response.output.0.metadata.prompt_cache_key").String(); got != "client-cache" {
+		t.Fatalf("nested prompt_cache_key = %q, want client-cache; response=%s", got, exposedNested)
+	}
+	if got := gjson.GetBytes(exposedNested, "response.output.1.metadata.prompt_cache_key").String(); got != "different-key" {
+		t.Fatalf("unrelated prompt_cache_key = %q, want different-key; response=%s", got, exposedNested)
+	}
+	if got := gjson.GetBytes(exposedNested, "message").String(); got != "keep "+projectCache.ID {
+		t.Fatalf("message text was rewritten: %q, want project key preserved", got)
+	}
+	if got := gjson.GetBytes(exposedNested, "metadata.session").String(); got != projectCache.ID {
+		t.Fatalf("unrelated JSON field was rewritten: %q, want project key preserved", got)
+	}
+
+	sse := []byte("data: " + string(response) + "\n\n")
+	exposedSSE := applyCodexIdentityExposeResponsePayload(sse, state)
+	sseJSON := helps.JSONPayload(exposedSSE)
+	if got := gjson.GetBytes(sseJSON, "prompt_cache_key").String(); got != "client-cache" {
+		t.Fatalf("SSE client prompt_cache_key = %q, want client-cache; payload=%s", got, exposedSSE)
+	}
+
+	internalErrorBody := []byte(`{"error":{"message":"upstream rejected the request","prompt_cache_key":"` + wantUpstream + `"}}`)
+	clientErr := newCodexStatusErrForClient(http.StatusConflict, internalErrorBody, state)
+	if got := gjson.Get(clientErr.Error(), "error.prompt_cache_key").String(); got != "client-cache" {
+		t.Fatalf("HTTP error prompt_cache_key = %q, want client-cache; error=%s", got, clientErr.Error())
+	}
+}
+
+func TestCodexExecutorCacheHelper_OpenAIResponsesDoesNotInventBravoCacheKey(t *testing.T) {
+	executor := &CodexExecutor{}
+	ctx := codexBravoPromptCacheContext("project-empty-cache")
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "absent", payload: `{"model":"gpt-5.6-sol","input":[]}`},
+		{name: "empty", payload: `{"model":"gpt-5.6-sol","prompt_cache_key":"","input":[]}`},
+		{name: "null", payload: `{"model":"gpt-5.6-sol","prompt_cache_key":null,"input":[]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: []byte(tt.payload)}
+			httpReq, body, state, errCache := executor.cacheHelper(
+				ctx,
+				sdktranslator.FromString("openai-response"),
+				"https://example.com/responses",
+				nil,
+				req,
+				req.Payload,
+				req.Payload,
+			)
+			if errCache != nil {
+				t.Fatalf("cacheHelper: %v", errCache)
+			}
+			if got := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()); got != "" {
+				t.Fatalf("prompt_cache_key = %q, want absent/empty", got)
+			}
+			if got := httpReq.Header["Session_id"]; len(got) != 0 {
+				t.Fatalf("Session_id = %#v, want absent", got)
+			}
+			if state.bravoPromptCache.active() {
+				t.Fatalf("empty key gained Bravo scope: %#v", state.bravoPromptCache)
+			}
+		})
 	}
 }
 

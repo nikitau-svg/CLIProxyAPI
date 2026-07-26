@@ -326,6 +326,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
+	body = applyProjectPromptCacheTTL(body, helps.BravoPromptCacheClaudeTTL(opts.Metadata))
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
@@ -525,6 +526,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
+	body = applyProjectPromptCacheTTL(body, helps.BravoPromptCacheClaudeTTL(opts.Metadata))
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	body = enforceCacheControlLimit(body, 4)
@@ -798,6 +800,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
+	body = applyProjectPromptCacheTTL(body, helps.BravoPromptCacheClaudeTTL(opts.Metadata))
 	body = enforceCacheControlLimit(body, 4)
 	body = normalizeCacheControlTTL(body)
 
@@ -2421,8 +2424,105 @@ func ensureCacheControl(payload []byte) []byte {
 	return payload
 }
 
+// applyProjectPromptCacheTTL applies Bravo's validated per-project policy only
+// after the request has been translated to Anthropic's native schema. The
+// top-level cache_control enables Anthropic automatic caching, while existing
+// explicit breakpoints keep their locations and receive the same TTL so the
+// combined request cannot violate the provider's ordering rule.
+func applyProjectPromptCacheTTL(payload []byte, ttl string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	ttl = strings.ToLower(strings.TrimSpace(ttl))
+	if ttl == "" || ttl == "auto" {
+		return payload
+	}
+	if ttl != "5m" && ttl != "1h" {
+		return payload
+	}
+
+	rootControl := gjson.GetBytes(payload, "cache_control")
+	if !rootControl.Exists() || !rootControl.IsObject() {
+		updated, errSetRoot := sjson.SetRawBytes(payload, "cache_control", []byte(`{"type":"ephemeral"}`))
+		if errSetRoot != nil {
+			return payload
+		}
+		payload = updated
+	}
+	updated, errSetRootType := sjson.SetBytes(payload, "cache_control.type", "ephemeral")
+	if errSetRootType != nil {
+		return payload
+	}
+	payload = updated
+	if ttl == "1h" {
+		if updated, errSetRootTTL := sjson.SetBytes(payload, "cache_control.ttl", "1h"); errSetRootTTL == nil {
+			payload = updated
+		}
+	} else if updated, errDeleteRootTTL := sjson.DeleteBytes(payload, "cache_control.ttl"); errDeleteRootTTL == nil {
+		payload = updated
+	}
+
+	applyAtPath := func(path string) {
+		controlPath := path + ".cache_control"
+		if !gjson.GetBytes(payload, controlPath).Exists() {
+			return
+		}
+		next, errType := sjson.SetBytes(payload, controlPath+".type", "ephemeral")
+		if errType != nil {
+			return
+		}
+		payload = next
+		if ttl == "1h" {
+			if next, errTTL := sjson.SetBytes(payload, controlPath+".ttl", "1h"); errTTL == nil {
+				payload = next
+			}
+			return
+		}
+		if next, errTTL := sjson.DeleteBytes(payload, controlPath+".ttl"); errTTL == nil {
+			payload = next
+		}
+	}
+
+	tools := gjson.GetBytes(payload, "tools")
+	if tools.IsArray() {
+		tools.ForEach(func(index, _ gjson.Result) bool {
+			applyAtPath(fmt.Sprintf("tools.%d", int(index.Int())))
+			return true
+		})
+	}
+	system := gjson.GetBytes(payload, "system")
+	if system.IsArray() {
+		system.ForEach(func(index, _ gjson.Result) bool {
+			applyAtPath(fmt.Sprintf("system.%d", int(index.Int())))
+			return true
+		})
+	}
+	messages := gjson.GetBytes(payload, "messages")
+	if messages.IsArray() {
+		messages.ForEach(func(messageIndex, message gjson.Result) bool {
+			content := message.Get("content")
+			if !content.IsArray() {
+				return true
+			}
+			content.ForEach(func(contentIndex, _ gjson.Result) bool {
+				applyAtPath(fmt.Sprintf(
+					"messages.%d.content.%d",
+					int(messageIndex.Int()),
+					int(contentIndex.Int()),
+				))
+				return true
+			})
+			return true
+		})
+	}
+	return payload
+}
+
 func countCacheControls(payload []byte) int {
 	count := 0
+	if gjson.GetBytes(payload, "cache_control").Exists() {
+		count++
+	}
 
 	// Check system
 	system := gjson.GetBytes(payload, "system")
@@ -2486,8 +2586,7 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 	seen5m := false
 	modified := false
 
-	processBlock := func(path string, obj gjson.Result) {
-		cc := obj.Get("cache_control")
+	processControl := func(ttlPath string, cc gjson.Result) {
 		if !cc.Exists() {
 			return
 		}
@@ -2503,13 +2602,15 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 		if !seen5m {
 			return
 		}
-		ttlPath := path + ".cache_control.ttl"
 		updated, errDel := sjson.DeleteBytes(payload, ttlPath)
 		if errDel != nil {
 			return
 		}
 		payload = updated
 		modified = true
+	}
+	processBlock := func(path string, obj gjson.Result) {
+		processControl(path+".cache_control.ttl", obj.Get("cache_control"))
 	}
 
 	tools := gjson.GetBytes(payload, "tools")
@@ -2542,6 +2643,9 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 			return true
 		})
 	}
+	// Anthropic automatic caching is a logical breakpoint at the end of the
+	// prompt, so evaluate its top-level control after all explicit blocks.
+	processControl("cache_control.ttl", gjson.GetBytes(payload, "cache_control"))
 
 	if !modified {
 		return original

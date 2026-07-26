@@ -15,6 +15,11 @@ const (
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
 	defaultStatePath = "bravo-data/bravo-state.json"
+
+	projectPromptCacheTTLAutomatic  = "auto"
+	projectPromptCacheTTL5Minutes   = "5m"
+	projectPromptCacheTTL1Hour      = "1h"
+	projectPromptCacheOpenAIManaged = "provider_managed"
 )
 
 type envelope struct {
@@ -131,6 +136,18 @@ type smartKeyConfig struct {
 	CreatedAt       string         `yaml:"created_at,omitempty" json:"created_at,omitempty"`
 	UpdatedAt       string         `yaml:"updated_at,omitempty" json:"updated_at,omitempty"`
 	LegacyDerivedID bool           `yaml:"-" json:"-"`
+}
+
+// projectPromptCachePolicy is persisted inside smart_keys[].policy.prompt_cache
+// so older Bravo configs remain compatible while the management API can expose
+// a small, validated provider-native contract.
+type projectPromptCachePolicy struct {
+	AnthropicTTL string `json:"anthropic_ttl" yaml:"anthropic_ttl"`
+}
+
+type projectPromptCacheView struct {
+	AnthropicTTL string `json:"anthropic_ttl"`
+	OpenAIMode   string `json:"openai_mode"`
 }
 
 type logicalModel struct {

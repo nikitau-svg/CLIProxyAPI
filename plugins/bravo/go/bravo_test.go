@@ -245,26 +245,28 @@ func TestSmartKeyRoutesUnprefixedExactModel(t *testing.T) {
 		currentConfig.Store(fallback)
 	})
 
-	raw, errRoute := routeModel(mustJSONValue(t, rpcModelRouteRequest{
-		ModelRouteRequest: pluginapi.ModelRouteRequest{
-			RequestedModel:     "claude-opus-4-8",
-			Headers:            http.Header{"Authorization": []string{"Bearer " + plaintext}},
-			AvailableProviders: []string{"claude", "codex"},
-		},
-	}))
-	if errRoute != nil {
-		t.Fatal(errRoute)
-	}
-	var env envelope
-	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
-		t.Fatal(errUnmarshal)
-	}
-	var response pluginapi.ModelRouteResponse
-	if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
-		t.Fatal(errUnmarshal)
-	}
-	if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
-		t.Fatalf("route response = %#v", response)
+	for _, availableProviders := range [][]string{{"claude", "codex"}, nil} {
+		raw, errRoute := routeModel(mustJSONValue(t, rpcModelRouteRequest{
+			ModelRouteRequest: pluginapi.ModelRouteRequest{
+				RequestedModel:     "claude-opus-4-8",
+				Headers:            http.Header{"Authorization": []string{"Bearer " + plaintext}},
+				AvailableProviders: availableProviders,
+			},
+		}))
+		if errRoute != nil {
+			t.Fatal(errRoute)
+		}
+		var env envelope
+		if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+			t.Fatal(errUnmarshal)
+		}
+		var response pluginapi.ModelRouteResponse
+		if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
+			t.Fatal(errUnmarshal)
+		}
+		if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
+			t.Fatalf("route response with available providers %v = %#v", availableProviders, response)
+		}
 	}
 }
 
@@ -380,6 +382,179 @@ func TestPrefixedModelRoutesToExecutorWithoutSmartKeyForPreciseAuthError(t *test
 	}
 	if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
 		t.Fatalf("route response = %#v", response)
+	}
+}
+
+func TestRecognizedModelStaysInsideExecutorWithoutAvailableProviders(t *testing.T) {
+	const plaintext = "test_no_provider_scope"
+	sum := sha256.Sum256([]byte(plaintext))
+	cfg := defaultPluginConfig()
+	cfg.RequireSmartKey = true
+	cfg.SmartKeys = []smartKeyConfig{{
+		Name:   "haiku-only",
+		SHA256: hex.EncodeToString(sum[:]),
+		Models: []string{"haiku"},
+	}}
+	if errNormalize := normalizeConfig(&cfg); errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	currentConfig.Store(cfg)
+	t.Cleanup(func() {
+		fallback := defaultPluginConfig()
+		_ = normalizeConfig(&fallback)
+		currentConfig.Store(fallback)
+	})
+
+	headers := http.Header{"Authorization": []string{"Bearer " + plaintext}}
+	raw, errRoute := routeModel(mustJSONValue(t, rpcModelRouteRequest{
+		ModelRouteRequest: pluginapi.ModelRouteRequest{
+			RequestedModel: "bravo/opus",
+			Headers:        headers,
+			// This reproduces a fresh canary with no provider credentials.
+			// Bravo must still handle the model so project scope is checked
+			// before the executor reports an empty provider pool.
+			AvailableProviders: nil,
+		},
+	}))
+	if errRoute != nil {
+		t.Fatal(errRoute)
+	}
+	var routeEnvelope envelope
+	if errUnmarshal := json.Unmarshal(raw, &routeEnvelope); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !routeEnvelope.OK {
+		t.Fatalf("router returned an RPC error: %#v", routeEnvelope.Error)
+	}
+	var response pluginapi.ModelRouteResponse
+	if errUnmarshal := json.Unmarshal(routeEnvelope.Result, &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
+		t.Fatalf("route response = %#v, want Bravo executor", response)
+	}
+
+	raw, errExecute := execute(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/opus",
+			Format:          protocolOpenAI,
+			SourceFormat:    protocolOpenAI,
+			Headers:         headers,
+			OriginalRequest: []byte(`{"model":"bravo/opus","messages":[{"role":"user","content":"scope check"}],"max_tokens":8}`),
+		},
+	}))
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var executeEnvelope envelope
+	if errUnmarshal := json.Unmarshal(raw, &executeEnvelope); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if executeEnvelope.OK || executeEnvelope.Error == nil {
+		t.Fatalf("disallowed model unexpectedly executed: %#v", executeEnvelope)
+	}
+	if executeEnvelope.Error.Code != "bravo_model_forbidden" ||
+		executeEnvelope.Error.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("scope failure = %#v, want bravo_model_forbidden/403", executeEnvelope.Error)
+	}
+}
+
+func TestBravoProjectKeyKeepsUnknownModelsFailClosed(t *testing.T) {
+	const plaintext = "test_unknown_model_gate"
+	sum := sha256.Sum256([]byte(plaintext))
+	cfg := defaultPluginConfig()
+	cfg.RequireSmartKey = true
+	cfg.SmartKeys = []smartKeyConfig{{
+		Name:   "all-current-models",
+		SHA256: hex.EncodeToString(sum[:]),
+		Models: []string{"*"},
+	}}
+	if errNormalize := normalizeConfig(&cfg); errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	currentConfig.Store(cfg)
+	t.Cleanup(func() {
+		fallback := defaultPluginConfig()
+		_ = normalizeConfig(&fallback)
+		currentConfig.Store(fallback)
+	})
+
+	projectHeaders := http.Header{"Authorization": []string{"Bearer " + plaintext}}
+	tests := []struct {
+		name        string
+		model       string
+		headers     http.Header
+		wantHandled bool
+	}{
+		{
+			name:        "unknown Bravo namespace is owned",
+			model:       "bravo/new-provider-model",
+			wantHandled: true,
+		},
+		{
+			name:        "unknown physical model with project key is gated",
+			model:       "new-provider-model",
+			headers:     projectHeaders,
+			wantHandled: true,
+		},
+		{
+			name:        "ordinary key keeps native unknown model routing",
+			model:       "new-provider-model",
+			headers:     http.Header{"Authorization": []string{"Bearer ordinary-key"}},
+			wantHandled: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, errRoute := routeModel(mustJSONValue(t, rpcModelRouteRequest{
+				ModelRouteRequest: pluginapi.ModelRouteRequest{
+					RequestedModel:     tt.model,
+					Headers:            tt.headers,
+					AvailableProviders: []string{"claude", "codex"},
+				},
+			}))
+			if errRoute != nil {
+				t.Fatal(errRoute)
+			}
+			var routeEnvelope envelope
+			if errUnmarshal := json.Unmarshal(raw, &routeEnvelope); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			var response pluginapi.ModelRouteResponse
+			if errUnmarshal := json.Unmarshal(routeEnvelope.Result, &response); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			if response.Handled != tt.wantHandled {
+				t.Fatalf("route response = %#v, want handled=%v", response, tt.wantHandled)
+			}
+			if response.Handled && response.TargetKind != pluginapi.ModelRouteTargetSelf {
+				t.Fatalf("route target = %#v, want Bravo executor", response)
+			}
+		})
+	}
+
+	raw, errExecute := execute(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "new-provider-model",
+			Format:          protocolOpenAI,
+			SourceFormat:    protocolOpenAI,
+			Headers:         projectHeaders,
+			OriginalRequest: []byte(`{"model":"new-provider-model","messages":[{"role":"user","content":"scope check"}],"max_tokens":8}`),
+		},
+	}))
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var executeEnvelope envelope
+	if errUnmarshal := json.Unmarshal(raw, &executeEnvelope); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if executeEnvelope.OK || executeEnvelope.Error == nil {
+		t.Fatalf("unknown model unexpectedly executed: %#v", executeEnvelope)
+	}
+	if executeEnvelope.Error.Code != "bravo_model_unknown" ||
+		executeEnvelope.Error.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("unknown-model failure = %#v, want bravo_model_unknown/404", executeEnvelope.Error)
 	}
 }
 

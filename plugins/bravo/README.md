@@ -109,6 +109,31 @@ Use the new key as either an OpenAI API key or an Anthropic API key. Rotating
 immediately replaces the old key. Deleting a project invalidates its key.
 Revoked projects cannot be re-enabled or rotated.
 
+## Per-project prompt caching
+
+Each project has a collapsed **Prompt caching** section in the standard
+Management Center. Claude exposes only the provider-supported choices
+`auto`, `5m`, and `1h`. OpenAI/Codex is intentionally read-only and labelled
+`provider_managed`: when the client supplies a supported cache identity, Bravo
+isolates it by project, while the subscription endpoint owns retention.
+
+The setting is authenticated project metadata, not a client-controlled header.
+CLIProxyAPI's core executor applies it after request translation to the native
+target schema for ordinary, streaming, token-counting, retry, and pre-response
+fallback attempts. Bravo never stores prompt bodies or model responses.
+
+A retry on the same provider/account can reuse an eligible exact prefix.
+Switching provider or account can legitimately start with a cache miss because
+provider caches are isolated. A miss continues as a normal request and does
+not alter the generated answer. Prompt caching improves repeated eligible
+prefixes; it does not make a cold request faster and provider write pricing
+still applies.
+
+The implementation follows the current provider contracts:
+
+- [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching)
+
 ## Smart-key configuration
 
 Only a SHA-256 digest is stored in YAML:
@@ -133,7 +158,9 @@ plugins:
           models: ["*"]
           allowed_auth_ids: []
           primary_auth_ids: []
-          policy: {}
+          policy:
+            prompt_cache:
+              anthropic_ttl: 5m
 ```
 
 `max_attempts: 0` means all eligible accounts may be tried. Ordinary API keys

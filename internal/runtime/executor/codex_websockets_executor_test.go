@@ -1153,6 +1153,146 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 	}
 }
 
+func TestApplyCodexPromptCacheHeadersScopesBravoResponsesAcrossHTTPAndWebsocket(t *testing.T) {
+	ctx := codexBravoPromptCacheContext("project-ws-parity")
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.6-sol",
+		Payload: []byte(`{
+			"model":"gpt-5.6-sol",
+			"prompt_cache_key":"shared-transport-key",
+			"input":[]
+		}`),
+	}
+	rawJSON := []byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"shared-transport-key","input":[]}`)
+
+	executor := &CodexExecutor{}
+	httpReq, httpBody, _, errHTTP := executor.cacheHelper(
+		ctx,
+		sdktranslator.FromString("openai-response"),
+		"https://example.com/responses",
+		nil,
+		req,
+		req.Payload,
+		rawJSON,
+	)
+	if errHTTP != nil {
+		t.Fatalf("HTTP cacheHelper: %v", errHTTP)
+	}
+	httpKey := gjson.GetBytes(httpBody, "prompt_cache_key").String()
+	if httpKey == "" || httpKey == "shared-transport-key" {
+		t.Fatalf("HTTP key = %q, want scoped key", httpKey)
+	}
+
+	wsBody, wsHeaders, wsScope, errWS := applyCodexPromptCacheHeadersWithContextAndScope(
+		ctx,
+		sdktranslator.FromString("openai-response"),
+		req,
+		rawJSON,
+	)
+	if errWS != nil {
+		t.Fatalf("WebSocket prompt cache: %v", errWS)
+	}
+	if !wsScope.active() {
+		t.Fatalf("WebSocket scope = %#v, want active", wsScope)
+	}
+	if got := gjson.GetBytes(wsBody, "prompt_cache_key").String(); got != httpKey {
+		t.Fatalf("HTTP/WebSocket project keys differ: HTTP=%q WebSocket=%q", httpKey, got)
+	}
+	if got := wsHeaders["session_id"]; len(got) != 1 || got[0] != httpKey {
+		t.Fatalf("WebSocket session_id = %#v, want [%q]", got, httpKey)
+	}
+	if got := wsHeaders.Get("Conversation_id"); got != httpKey {
+		t.Fatalf("WebSocket Conversation_id = %q, want %q", got, httpKey)
+	}
+	if got := httpReq.Header["Session_id"]; len(got) != 1 || got[0] != httpKey {
+		t.Fatalf("HTTP Session_id = %#v, want [%q]", got, httpKey)
+	}
+}
+
+func TestApplyCodexPromptCacheHeadersComposesBravoScopeBeforeWebsocketIdentity(t *testing.T) {
+	ctx := codexBravoPromptCacheContext("project-ws-identity")
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{ID: "auth-ws-project", Provider: "codex"}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"client-ws-cache","input":[]}`),
+	}
+	body, headers, scope, errCache := applyCodexPromptCacheHeadersWithContextAndScope(
+		ctx,
+		sdktranslator.FromString("openai-response"),
+		req,
+		req.Payload,
+	)
+	if errCache != nil {
+		t.Fatalf("WebSocket prompt cache: %v", errCache)
+	}
+	if !scope.active() {
+		t.Fatalf("scope = %#v, want active", scope)
+	}
+	identityPayload := applyCodexBravoPromptCacheBody(req.Payload, scope)
+	upstreamBody, state := applyCodexIdentityConfuseBody(cfg, auth, identityPayload, body)
+	state.bravoPromptCache = scope
+	headers = applyCodexWebsocketHeaders(ctx, headers, auth, "oauth-token", cfg)
+	applyCodexIdentityConfuseHeaders(headers, &state)
+
+	wantUpstream := codexIdentityConfuseUUID(auth.ID, "prompt-cache", scope.projectKey)
+	if got := gjson.GetBytes(upstreamBody, "prompt_cache_key").String(); got != wantUpstream {
+		t.Fatalf("WebSocket upstream key = %q, want identity(project(client)) %q", got, wantUpstream)
+	}
+	if got := headers["session_id"]; len(got) != 1 || got[0] != wantUpstream {
+		t.Fatalf("WebSocket session_id = %#v, want [%q]", got, wantUpstream)
+	}
+
+	clientPayload := applyCodexIdentityExposeResponsePayload(
+		[]byte(`{"type":"response.completed","response":{"prompt_cache_key":"`+wantUpstream+`"}}`),
+		state,
+	)
+	if got := gjson.GetBytes(clientPayload, "response.prompt_cache_key").String(); got != "client-ws-cache" {
+		t.Fatalf("WebSocket client key = %q, want client-ws-cache; payload=%s", got, clientPayload)
+	}
+
+	internalErrorPayload := []byte(`{"type":"error","status":409,"error":{"message":"upstream rejected the request","prompt_cache_key":"` + wantUpstream + `"}}`)
+	internalErr, ok := parseCodexWebsocketError(internalErrorPayload)
+	if !ok {
+		t.Fatalf("test WebSocket error was not parsed: %s", internalErrorPayload)
+	}
+	clientErr := codexWebsocketErrorForClient(internalErrorPayload, internalErr, state)
+	if got := gjson.Get(clientErr.Error(), "error.prompt_cache_key").String(); got != "client-ws-cache" {
+		t.Fatalf("WebSocket error prompt_cache_key = %q, want client-ws-cache; error=%s", got, clientErr)
+	}
+
+	wrappedErrorPayload := []byte(`{"type":"error","status":409,"body":{"error":{"details":[{"prompt_cache_key":"` + wantUpstream + `"}],"message":"keep ` + scope.projectKey + `","session":"` + scope.projectKey + `"}}}`)
+	wrappedInternalErr, ok := parseCodexWebsocketError(wrappedErrorPayload)
+	if !ok {
+		t.Fatalf("wrapped test WebSocket error was not parsed: %s", wrappedErrorPayload)
+	}
+	wrappedClientErr := codexWebsocketErrorForClient(wrappedErrorPayload, wrappedInternalErr, state)
+	if got := gjson.Get(wrappedClientErr.Error(), "body.error.details.0.prompt_cache_key").String(); got != "client-ws-cache" {
+		t.Fatalf("wrapped WebSocket prompt_cache_key = %q, want client-ws-cache; error=%s", got, wrappedClientErr)
+	}
+	if got := gjson.Get(wrappedClientErr.Error(), "body.error.message").String(); got != "keep "+scope.projectKey {
+		t.Fatalf("wrapped WebSocket message was rewritten: %q, want project key preserved", got)
+	}
+	if got := gjson.Get(wrappedClientErr.Error(), "body.error.session").String(); got != scope.projectKey {
+		t.Fatalf("wrapped WebSocket unrelated field was rewritten: %q, want project key preserved", got)
+	}
+
+	handshakeBody := []byte(`{"error":{"details":{"prompt_cache_key":"` + wantUpstream + `"},"message":"keep ` + scope.projectKey + `","session":"` + scope.projectKey + `"}}`)
+	handshakeErr := codexWebsocketHandshakeErrorForClient(http.StatusTooManyRequests, handshakeBody, state)
+	if got := gjson.Get(handshakeErr.Error(), "error.details.prompt_cache_key").String(); got != "client-ws-cache" {
+		t.Fatalf("handshake prompt_cache_key = %q, want client-ws-cache; error=%s", got, handshakeErr.Error())
+	}
+	if got := gjson.Get(handshakeErr.Error(), "error.message").String(); got != "keep "+scope.projectKey {
+		t.Fatalf("handshake message was rewritten: %q, want project key preserved", got)
+	}
+	if got := gjson.Get(handshakeErr.Error(), "error.session").String(); got != scope.projectKey {
+		t.Fatalf("handshake unrelated field was rewritten: %q, want project key preserved", got)
+	}
+}
+
 func TestCodexIdentityConfuseResponsePayloadHidesUpstreamAndRestoresClient(t *testing.T) {
 	state := codexIdentityConfuseState{
 		enabled:                true,

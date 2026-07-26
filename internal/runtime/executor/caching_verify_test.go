@@ -343,3 +343,80 @@ func TestCacheControlOrder(t *testing.T) {
 
 	t.Log("cache order correct: tools -> system")
 }
+
+func TestApplyProjectPromptCacheTTLUsesAnthropicNativeAutomaticCaching(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-4-8",
+		"cache_control":{"type":"ephemeral","ttl":"5m","scope":"workspace","future":{"enabled":true}},
+		"tools":[{"name":"Read","cache_control":{"type":"ephemeral"}}],
+		"system":[{"type":"text","text":"stable","cache_control":{"type":"ephemeral"}}],
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"first","cache_control":{"type":"ephemeral"}}]},
+			{"role":"user","content":[{"type":"text","text":"next"}]}
+		]
+	}`)
+
+	oneHour := applyProjectPromptCacheTTL(input, "1h")
+	if got := gjson.GetBytes(oneHour, "cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("top-level cache_control.type = %q; body=%s", got, oneHour)
+	}
+	if got := gjson.GetBytes(oneHour, "cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("top-level cache_control.ttl = %q; body=%s", got, oneHour)
+	}
+	if got := gjson.GetBytes(oneHour, "cache_control.scope").String(); got != "workspace" ||
+		!gjson.GetBytes(oneHour, "cache_control.future.enabled").Bool() {
+		t.Fatalf("top-level client cache_control fields were lost; body=%s", oneHour)
+	}
+	for _, path := range []string{
+		"tools.0.cache_control.ttl",
+		"system.0.cache_control.ttl",
+		"messages.0.content.0.cache_control.ttl",
+	} {
+		if got := gjson.GetBytes(oneHour, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want 1h; body=%s", path, got, oneHour)
+		}
+	}
+	if got := countCacheControls(oneHour); got != 4 {
+		t.Fatalf("cache_control count = %d, want 4", got)
+	}
+
+	fiveMinutes := applyProjectPromptCacheTTL(oneHour, "5m")
+	if gjson.GetBytes(fiveMinutes, "cache_control.ttl").Exists() {
+		t.Fatalf("top-level 5m cache must use the documented default TTL; body=%s", fiveMinutes)
+	}
+	if got := gjson.GetBytes(fiveMinutes, "cache_control.scope").String(); got != "workspace" ||
+		!gjson.GetBytes(fiveMinutes, "cache_control.future.enabled").Bool() {
+		t.Fatalf("top-level client cache_control fields were lost after 5m policy; body=%s", fiveMinutes)
+	}
+	for _, path := range []string{
+		"tools.0.cache_control.ttl",
+		"system.0.cache_control.ttl",
+		"messages.0.content.0.cache_control.ttl",
+	} {
+		if gjson.GetBytes(fiveMinutes, path).Exists() {
+			t.Fatalf("%s survived 5m policy; body=%s", path, fiveMinutes)
+		}
+	}
+}
+
+func TestCacheControlGuardsCountTopLevelAutomaticBreakpoint(t *testing.T) {
+	input := []byte(`{
+		"cache_control":{"type":"ephemeral"},
+		"tools":[
+			{"name":"t1","cache_control":{"type":"ephemeral"}},
+			{"name":"t2","cache_control":{"type":"ephemeral"}}
+		],
+		"system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"u","cache_control":{"type":"ephemeral"}}]}]
+	}`)
+	if got := countCacheControls(input); got != 5 {
+		t.Fatalf("cache_control count = %d, want 5", got)
+	}
+	output := enforceCacheControlLimit(input, 4)
+	if got := countCacheControls(output); got != 4 {
+		t.Fatalf("limited cache_control count = %d, want 4; body=%s", got, output)
+	}
+	if !gjson.GetBytes(output, "cache_control").Exists() {
+		t.Fatalf("top-level automatic breakpoint was removed; body=%s", output)
+	}
+}

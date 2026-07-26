@@ -105,6 +105,57 @@ func TestWriteWebsocketCloseForUpstreamErrorMirrorsMessageTooBig(t *testing.T) {
 	}
 }
 
+func TestWriteResponsesWebsocketErrorPreservesBravoCode(t *testing.T) {
+	serverErrCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			serverErrCh <- errUpgrade
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_, errWrite := writeResponsesWebsocketError(
+			newResponsesWebsocketWriter(conn),
+			newInMemoryWebsocketTimelineLog(),
+			&interfaces.ErrorMessage{
+				StatusCode: http.StatusForbidden,
+				Error: codedOpenAIStreamError{
+					code:    "bravo_model_forbidden",
+					message: "This Bravo smart key cannot use the requested logical model.",
+				},
+			},
+		)
+		serverErrCh <- errWrite
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_, payload, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read websocket error: %v", errRead)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeError {
+		t.Fatalf("payload type = %q, want %q; payload=%s", got, wsEventTypeError, payload)
+	}
+	if got := int(gjson.GetBytes(payload, "status").Int()); got != http.StatusForbidden {
+		t.Fatalf("payload status = %d, want %d; payload=%s", got, http.StatusForbidden, payload)
+	}
+	if got := gjson.GetBytes(payload, "error.code").String(); got != "bravo_model_forbidden" {
+		t.Fatalf("error.code = %q, want bravo_model_forbidden; payload=%s", got, payload)
+	}
+
+	if errServer := <-serverErrCh; errServer != nil {
+		t.Fatalf("server error: %v", errServer)
+	}
+}
+
 func TestResponsesWebsocketWriterCloseDoesNotWaitForActiveDataWriter(t *testing.T) {
 	serverErrCh := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

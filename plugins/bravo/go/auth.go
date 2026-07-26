@@ -16,6 +16,7 @@ const (
 	bravoProjectIDMetadataKey      = "bravo_project_id"
 	bravoKeyNameMetadataKey        = "bravo_key_name"
 	bravoAllowedModelsMetadataKey  = "bravo_allowed_models"
+	bravoPromptCacheTTLMetadataKey = "bravo_prompt_cache_claude_ttl"
 )
 
 func authenticateSmartKey(raw []byte) ([]byte, error) {
@@ -31,6 +32,7 @@ func authenticateSmartKey(raw []byte) ([]byte, error) {
 	if !ok {
 		return okEnvelope(pluginapi.FrontendAuthResponse{Authenticated: false})
 	}
+	promptCache := projectPromptCacheViewFor(matched)
 	return okEnvelope(pluginapi.FrontendAuthResponse{
 		Authenticated: true,
 		Principal:     "bravo:" + matched.ID,
@@ -39,6 +41,7 @@ func authenticateSmartKey(raw []byte) ([]byte, error) {
 			bravoProjectIDMetadataKey:      matched.ID,
 			bravoKeyNameMetadataKey:        matched.Name,
 			bravoAllowedModelsMetadataKey:  strings.Join(matched.Models, ","),
+			bravoPromptCacheTTLMetadataKey: promptCache.AnthropicTTL,
 		},
 	})
 }

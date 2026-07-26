@@ -407,6 +407,17 @@ func normalizeConfig(cfg *pluginConfig) error {
 		key.PrimaryAuthIDs = normalizeOpaqueStrings(key.PrimaryAuthIDs)
 		key.AllowedAuthIDs = normalizeOpaqueStrings(key.AllowedAuthIDs)
 		key.Status = strings.ToLower(strings.TrimSpace(key.Status))
+		promptCache, promptCacheFailure := normalizeProjectPromptCachePolicy(key.Policy)
+		if promptCacheFailure != nil {
+			return fmt.Errorf("smart_keys[%d] has invalid prompt cache policy: %s", index, promptCacheFailure.Message)
+		}
+		if key.Policy != nil {
+			if _, exists := key.Policy["prompt_cache"]; exists {
+				key.Policy["prompt_cache"] = map[string]any{
+					"anthropic_ttl": promptCache.AnthropicTTL,
+				}
+			}
+		}
 		if key.Name == "" || len(key.SHA256) != 64 {
 			return fmt.Errorf("smart_keys[%d] requires name and a 64-character sha256", index)
 		}

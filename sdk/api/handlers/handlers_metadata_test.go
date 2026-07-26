@@ -64,16 +64,17 @@ func TestRequestExecutionMetadataIncludesSanitizedFrontendAuthContext(t *testing
 	ginCtx.Set("accessProvider", "plugin:bravo:bravo")
 	ginCtx.Set("userApiKey", "sk-plaintext-must-not-leak")
 	ginCtx.Set("accessMetadata", map[string]string{
-		"bravo_access_provider": "bravo",
-		"bravo_project_id":      "prj_primary",
-		"bravo_key_name":        "primary",
-		"bravo_allowed_models":  "opus,sonnet",
-		"principal":             "bravo:primary",
-		"api_key":               "sk-plaintext-must-not-leak",
-		"access_token":          "token-plaintext-must-not-leak",
-		"accessToken":           "camel-token-must-not-leak",
-		"clientSecret":          "camel-secret-must-not-leak",
-		"tenant":                "unneeded-routing-data",
+		"bravo_access_provider":         "bravo",
+		"bravo_project_id":              "prj_primary",
+		"bravo_key_name":                "primary",
+		"bravo_allowed_models":          "opus,sonnet",
+		"bravo_prompt_cache_claude_ttl": "1h",
+		"principal":                     "bravo:primary",
+		"api_key":                       "sk-plaintext-must-not-leak",
+		"access_token":                  "token-plaintext-must-not-leak",
+		"accessToken":                   "camel-token-must-not-leak",
+		"clientSecret":                  "camel-secret-must-not-leak",
+		"tenant":                        "unneeded-routing-data",
 	})
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 
@@ -89,6 +90,7 @@ func TestRequestExecutionMetadataIncludesSanitizedFrontendAuthContext(t *testing
 	if accessMetadata["bravo_key_name"] != "primary" ||
 		accessMetadata["bravo_project_id"] != "prj_primary" ||
 		accessMetadata["bravo_allowed_models"] != "opus,sonnet" ||
+		accessMetadata["bravo_prompt_cache_claude_ttl"] != "1h" ||
 		accessMetadata["bravo_access_provider"] != "bravo" {
 		t.Fatalf("sanitized access metadata = %#v", accessMetadata)
 	}
@@ -133,10 +135,11 @@ func TestSanitizedAccessMetadataRejectsInvalidBravoConstraints(t *testing.T) {
 	tooLongName := strings.Repeat("a", 121)
 	tooLongModels := strings.Repeat("m", (32<<10)+1)
 	got := sanitizedAccessMetadata(map[string]string{
-		"bravo_access_provider": "not-bravo",
-		"bravo_project_id":      "contains/slash",
-		"bravo_key_name":        tooLongName,
-		"bravo_allowed_models":  tooLongModels,
+		"bravo_access_provider":         "not-bravo",
+		"bravo_project_id":              "contains/slash",
+		"bravo_key_name":                tooLongName,
+		"bravo_allowed_models":          tooLongModels,
+		"bravo_prompt_cache_claude_ttl": "24h",
 	})
 	if len(got) != 0 {
 		t.Fatalf("invalid Bravo metadata survived constraints: %#v", got)

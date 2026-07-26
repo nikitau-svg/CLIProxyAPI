@@ -101,14 +101,17 @@ func ClaudeCodePromptCache(ctx context.Context, modelName string, payload []byte
 		return CodexCache{}, false, nil
 	}
 	identityParts := []string{"cli-proxy-api:codex:claude-code", modelName, executionScope}
-	if projectScope := claudeCodeBravoProjectScope(ctx); projectScope != "" {
+	if projectScope := BravoProjectScope(ctx); projectScope != "" {
 		identityParts = append(identityParts, "project:"+projectScope)
 	}
 	identity := strings.Join(identityParts, "\x00")
 	return CodexCache{ID: uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String()}, true, nil
 }
 
-func claudeCodeBravoProjectScope(ctx context.Context) string {
+// BravoProjectScope returns the stable redacted project principal for a request
+// authenticated by Bravo. It deliberately ignores lookalike principals from
+// other access providers and never exposes the plaintext smart key.
+func BravoProjectScope(ctx context.Context) string {
 	if ctx == nil {
 		return ""
 	}
