@@ -153,6 +153,38 @@ the decisions survive across sessions.
   return a precise 422 before any upstream call.
 - Linux/arm64 shared-plugin build in the canary Dockerfile.
 
+## Bravo 0.7.6 source and canary evidence
+
+- Subscription identity is now operator-first everywhere: the auth-file note
+  is the bold primary label; without a note, the safe fallback is
+  `workspace · email`, then provider plus a redacted analytics ID.
+- Technical auth names, filenames, indices, and credential identifiers are
+  never promoted into Management API display names.
+- Project analytics now includes a redacted subscription-usage timeline. The
+  newest eight time buckets are visible and older buckets remain collapsed by
+  default, while the existing totals and per-subscription/model attribution
+  remain backward-compatible.
+- The latency calculation was verified against production data:
+  `598067 / 55 = 10873.945 ms`. It is the complete provider-attempt duration,
+  including a streamed response through completion, not ping or time to first
+  token. The UI therefore labels it `Среднее время ответа`, formats it as
+  `10,9 с`, and exposes a keyboard-accessible explanation.
+- Full repository Go tests/build, focused Bravo race/vet tests, and the exact
+  Bun 1.3.14 Management Center verification passed. The only full-repository
+  vet messages are unchanged pre-existing core warnings outside this patch.
+- Exact canary image
+  `cliproxyapi-local:v7.2.94-bravo-native0.7.6-eb7a418b` built for
+  `linux/arm64`; build manifest digest:
+  `sha256:a136430cd39aadb958555014f19703e644ca1d9bd17dd475269b7e086b21e210`.
+- Canary stayed healthy with zero restarts. Read-only schema/identity/timeline
+  smoke passed, followed by the existing 21/21 Management API and protocol
+  smoke including temporary project lifecycle and fail-closed contracts.
+- Chrome/Playwright QA used the exact embedded Management Center artifact.
+  Desktop and 390 px layouts have no horizontal overflow; account/project
+  disclosures are closed initially; note and workspace/email identities are
+  bold; the latency help is focusable; the timeline and collapsed older
+  periods render correctly; browser console errors are empty.
+
 ## Bravo 0.7.5 source, canary, and production evidence
 
 - Per-project Claude prompt-cache TTL is managed in the standard Management
