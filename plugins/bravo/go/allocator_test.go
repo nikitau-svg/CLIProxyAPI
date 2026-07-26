@@ -243,6 +243,78 @@ func TestUnknownQuotaViewUsesNullPercentagesAndKeepsModelIdentity(t *testing.T) 
 	}
 }
 
+func TestSubscriptionViewExposesNoteAndStableDisplayName(t *testing.T) {
+	cfg := defaultPluginConfig()
+	withNote := buildSubscriptionView(
+		cfg,
+		pluginapi.HostAuthFileEntry{
+			AuthIndex: "note-auth-index",
+			Provider:  "claude",
+			Email:     "member@example.com",
+			Note:      "Рабочая подписка",
+			Label:     "legacy email label",
+		},
+		subscriptionConfig{AuthIndex: "note-auth-index", Tariff: "x5"},
+		tariffByID(cfg, "x5"),
+		credentialQuotaState{
+			Confidence:     "confirmed",
+			WorkspaceLabel: "Workspace A",
+			AccountLabel:   "member@example.com",
+		},
+		nil,
+	)
+	if withNote.Note != "Рабочая подписка" ||
+		withNote.DisplayName != "Рабочая подписка" ||
+		withNote.Label != withNote.DisplayName {
+		t.Fatalf("note presentation = %#v", withNote)
+	}
+
+	withoutNote := buildSubscriptionView(
+		cfg,
+		pluginapi.HostAuthFileEntry{
+			AuthIndex: "fallback-auth-index",
+			Provider:  "claude",
+			Email:     "member@example.com",
+			Label:     "legacy email label",
+		},
+		subscriptionConfig{AuthIndex: "fallback-auth-index", Tariff: "x1"},
+		tariffByID(cfg, "x1"),
+		credentialQuotaState{
+			Confidence:     "confirmed",
+			WorkspaceLabel: "Workspace A",
+			AccountLabel:   "member@example.com",
+		},
+		nil,
+	)
+	if withoutNote.Note != "" ||
+		withoutNote.DisplayName != "Workspace A · member@example.com" ||
+		withoutNote.Label != withoutNote.DisplayName {
+		t.Fatalf("fallback presentation = %#v", withoutNote)
+	}
+
+	const technicalAuthIndex = "claude-private-account.json"
+	technicalOnly := buildSubscriptionView(
+		cfg,
+		pluginapi.HostAuthFileEntry{
+			AuthIndex: technicalAuthIndex,
+			Provider:  "claude",
+			Name:      "claude-private-account.json",
+			Label:     "claude-private-account.json",
+		},
+		subscriptionConfig{AuthIndex: technicalAuthIndex, Tariff: "x1"},
+		tariffByID(cfg, "x1"),
+		credentialQuotaState{Confidence: "unknown"},
+		nil,
+	)
+	wantRedacted := analyticsSubscriptionLabel(analyticsSubscriptionID(technicalAuthIndex), "claude")
+	if technicalOnly.DisplayName != wantRedacted ||
+		technicalOnly.Label != wantRedacted ||
+		technicalOnly.DisplayName == technicalAuthIndex ||
+		technicalOnly.DisplayName == technicalOnly.AuthID {
+		t.Fatalf("technical-only presentation = %#v, want redacted %q", technicalOnly, wantRedacted)
+	}
+}
+
 func TestInactiveQuotaViewUsesNullResetAndKeepsResetMode(t *testing.T) {
 	cfg := defaultPluginConfig()
 	view := buildSubscriptionView(

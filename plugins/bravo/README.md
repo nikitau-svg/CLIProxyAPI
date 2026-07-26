@@ -226,11 +226,20 @@ persisted outside the credential discovery directory in
 Schema v2 also retains hourly analytics for 31 days and daily analytics for
 400 days. The authenticated analytics endpoint supports project,
 subscription, provider, model, time-range, and interval filters while exposing
-only stable redacted subscription IDs:
+only stable redacted subscription IDs. Its compact `subscription_timeline`
+shows which subscription served each populated hour or day without storing new
+identity data. `latency_ms` is the complete provider-attempt duration, including
+stream consumption; `average_latency_ms` is that total divided by provider
+attempts, not time to first token:
 
 ```text
 GET /v0/management/bravo/analytics
 ```
+
+Subscription responses expose the operator-authored `note` separately and a
+deterministic `display_name`. The display name prefers the note and otherwise
+combines workspace and email; the legacy `label` remains the same display name
+for older Management Center builds.
 
 The native Management UI provides 24h/7d/30d/90d/custom periods,
 previous-period comparison, charts, tables, CSV export, and
