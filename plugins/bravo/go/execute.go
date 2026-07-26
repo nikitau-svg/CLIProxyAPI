@@ -241,13 +241,21 @@ func failureEnvelope(failure executionFailure) []byte {
 	if message == "" {
 		message = http.StatusText(status)
 	}
+	// Non-streaming failures need the same backoff hint the streaming path
+	// already synthesizes in closePluginStreamFailure. Pool exhaustion carries
+	// no upstream Retry-After of its own, so without this a 503 reaches the SDK
+	// bare and it retries immediately into the same exhausted pool.
+	retryAfter := strings.TrimSpace(failure.RetryAfter)
+	if retryAfter == "" && status == http.StatusServiceUnavailable {
+		retryAfter = strconv.Itoa(defaultRetryAfterSeconds(failure))
+	}
 	return detailedErrorEnvelope(envelopeError{
 		Code:       code,
 		Message:    message,
 		Retryable:  failure.Retryable,
 		HTTPStatus: status,
 		Headers:    cloneHeader(failure.Headers),
-		RetryAfter: strings.TrimSpace(failure.RetryAfter),
+		RetryAfter: retryAfter,
 	})
 }
 
@@ -457,7 +465,7 @@ func recordExecutionAttempt(attempt executionAttempt, started time.Time, status 
 		RequestedEffort: attempt.RequestedEffort,
 		EffectiveEffort: attempt.EffectiveEffort,
 		AuthID:          pinnedAuthID(attempt.Auth),
-		AuthLabel:       firstNonEmpty(attempt.Auth.Label, attempt.Auth.Email, attempt.Auth.Name),
+		AuthLabel:       firstNonEmpty(attempt.Auth.Note, attempt.Auth.Label, attempt.Auth.Email, attempt.Auth.Name),
 		Status:          status,
 		Success:         success,
 		Retryable:       failure.Retryable,

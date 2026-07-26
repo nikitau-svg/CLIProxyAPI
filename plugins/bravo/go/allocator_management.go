@@ -166,11 +166,14 @@ func buildSubscriptionView(
 		tariffID = "auto"
 	}
 	return subscriptionView{
-		AuthIndex:         strings.TrimSpace(auth.AuthIndex),
-		AnalyticsID:       analyticsSubscriptionID(auth.AuthIndex),
-		AuthID:            strings.TrimSpace(auth.ID),
-		Provider:          normalizeProvider(firstNonEmpty(auth.Provider, auth.Type, quota.Provider)),
-		Label:             strings.TrimSpace(firstNonEmpty(quota.AccountLabel, auth.Label, auth.Name)),
+		AuthIndex:   strings.TrimSpace(auth.AuthIndex),
+		AnalyticsID: analyticsSubscriptionID(auth.AuthIndex),
+		AuthID:      strings.TrimSpace(auth.ID),
+		Provider:    normalizeProvider(firstNonEmpty(auth.Provider, auth.Type, quota.Provider)),
+		// auth.Note comes before the quota AccountLabel on purpose: the latter is the
+		// provider's own email for the credential, and two subscriptions on one mailbox
+		// then render as the same name in this list. The note is the operator's label.
+		Label:             strings.TrimSpace(firstNonEmpty(auth.Note, auth.Label, quota.AccountLabel, auth.Email, auth.Name)),
 		Email:             strings.TrimSpace(auth.Email),
 		Workspace:         strings.TrimSpace(firstNonEmpty(quota.WorkspaceLabel, auth.ProjectID, auth.Account, auth.AccountType)),
 		Plan:              strings.TrimSpace(quota.Plan),
