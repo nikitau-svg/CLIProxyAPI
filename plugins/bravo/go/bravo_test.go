@@ -30,9 +30,26 @@ func TestDefaultConfigCoversConnectedGeneralModels(t *testing.T) {
 			t.Errorf("default model %q is missing", name)
 		}
 	}
-	for _, unsupported := range []string{"gpt-5.3-codex-spark", "codex-auto-review"} {
-		if _, ok := cfg.Models[unsupported]; ok {
-			t.Errorf("direct-only model %q must not be advertised as Bravo-capable", unsupported)
+	// These two used to be deliberately absent, on the theory that a model with no
+	// cross-provider equivalent should not be advertised as Bravo-capable. Absence
+	// did not make them unreachable: routeModel simply declined them and the host
+	// answered from its own pool, outside the project's model list, outside
+	// allowed_auth_ids and outside quota accounting. Verified in production — a
+	// smart key asking for codex-auto-review got HTTP 200 while Bravo recorded no
+	// event at all. They are registered now with a single self-candidate, so the
+	// request stays inside Bravo and inside the project's limits.
+	for _, name := range selfOnlyDefaultModels {
+		model, ok := cfg.Models[name]
+		if !ok {
+			t.Errorf("self-only model %q is missing, so the host would serve it outside Bravo", name)
+			continue
+		}
+		if len(model.Candidates) != 1 {
+			t.Errorf("self-only model %q candidates = %#v, want exactly one self candidate", name, model.Candidates)
+			continue
+		}
+		if normalizeProvider(model.Candidates[0].Provider) != "codex" || model.Candidates[0].Model != name {
+			t.Errorf("self-only model %q candidate = %#v, want codex/%s and no mapped fallback", name, model.Candidates[0], name)
 		}
 	}
 }
@@ -116,8 +133,18 @@ func TestOlderClaudeExactAliasesKeepOneCodexFallback(t *testing.T) {
 func TestEveryDefaultGeneralTextRouteIsOneCrossProviderPair(t *testing.T) {
 	t.Parallel()
 	cfg := defaultPluginConfig()
+	selfOnly := map[string]bool{}
+	for _, name := range selfOnlyDefaultModels {
+		selfOnly[name] = true
+	}
 	for name, model := range cfg.Models {
 		if routeClassCapability(model) == capabilityImageGeneration {
+			continue
+		}
+		// The self-only routes are exempt by construction: they exist precisely
+		// because there is no equivalent to pair them with, and a mapped fallback
+		// would answer from a different model than the client asked for.
+		if selfOnly[name] {
 			continue
 		}
 		if len(model.Candidates) != 2 {
@@ -238,6 +265,83 @@ func TestSmartKeyRoutesUnprefixedExactModel(t *testing.T) {
 	}
 	if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
 		t.Fatalf("route response = %#v", response)
+	}
+}
+
+// A model Bravo does not register is not blocked — it is handed back to the host,
+// which answers it from its own credential pool with no project scope, no
+// allowed_auth_ids filter and no quota accounting. That was the live behaviour of
+// codex-auto-review and gpt-5.3-codex-spark in production: HTTP 200 from a smart
+// key, and no Bravo event recorded for the request at all. Registering them keeps
+// the request inside Bravo, and a project that does not list them now gets a
+// refusal from smartKeyAllowsModel instead of a silent unmetered answer.
+func TestSelfOnlyModelsStayInsideBravoAndRespectProjectScope(t *testing.T) {
+	for _, name := range selfOnlyDefaultModels {
+		t.Run(name, func(t *testing.T) {
+			plaintext := "brv_scope_" + name
+			sum := sha256.Sum256([]byte(plaintext))
+			cfg := defaultPluginConfig()
+			cfg.SmartKeys = []smartKeyConfig{{
+				Name:   "project-allows",
+				SHA256: hex.EncodeToString(sum[:]),
+				Models: []string{name},
+			}}
+			if errNormalize := normalizeConfig(&cfg); errNormalize != nil {
+				t.Fatal(errNormalize)
+			}
+			currentConfig.Store(cfg)
+			t.Cleanup(func() {
+				fallback := defaultPluginConfig()
+				_ = normalizeConfig(&fallback)
+				currentConfig.Store(fallback)
+			})
+
+			// The bare real model name resolves, so the host never sees it.
+			logicalName, model, ok := resolveUnprefixedLogicalModel(cfg, name)
+			if !ok {
+				t.Fatalf("%s does not resolve, so routeModel declines it and the host serves it unmetered", name)
+			}
+			if logicalName != name {
+				t.Fatalf("logical name = %q, want %q", logicalName, name)
+			}
+			if len(model.Candidates) != 1 || model.Candidates[0].Model != name {
+				t.Fatalf("candidates = %#v, want only the model the client asked for", model.Candidates)
+			}
+
+			for _, requested := range []string{name, "bravo/" + name} {
+				raw, errRoute := routeModel(mustJSONValue(t, rpcModelRouteRequest{
+					ModelRouteRequest: pluginapi.ModelRouteRequest{
+						RequestedModel:     requested,
+						Headers:            http.Header{"Authorization": []string{"Bearer " + plaintext}},
+						AvailableProviders: []string{"claude", "codex"},
+					},
+				}))
+				if errRoute != nil {
+					t.Fatal(errRoute)
+				}
+				var env envelope
+				if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+					t.Fatal(errUnmarshal)
+				}
+				var response pluginapi.ModelRouteResponse
+				if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
+					t.Fatal(errUnmarshal)
+				}
+				if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
+					t.Fatalf("%s route response = %#v, want Bravo to handle it itself", requested, response)
+				}
+			}
+
+			// Project scope is enforced now instead of being bypassed.
+			allowed := cfg.SmartKeys[0]
+			if !smartKeyAllowsModel(allowed, name) {
+				t.Fatalf("project listing %q was refused", name)
+			}
+			scoped := smartKeyConfig{Name: "project-denies", Models: []string{"sonnet"}}
+			if smartKeyAllowsModel(scoped, name) {
+				t.Fatalf("project not listing %q was allowed to use it", name)
+			}
+		})
 	}
 }
 

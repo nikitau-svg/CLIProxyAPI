@@ -13,15 +13,28 @@ import (
 
 var currentConfig atomic.Value
 
+// selfOnlyDefaultModels are connected Codex models with no counterpart on the
+// Claude side. They get a logical alias with a single self-candidate: routing
+// them to a mapped equivalent would silently answer from a different model,
+// while leaving them unregistered let the host serve them outside Bravo
+// entirely. See the comment at their registration in defaultPluginConfig.
+var selfOnlyDefaultModels = []string{"codex-auto-review", "gpt-5.3-codex-spark"}
+
 func defaultPluginConfig() pluginConfig {
 	caps := []string{"text", "tools", "tool_result", "vision", "web_search", "stream"}
-	claudeCaps := append(append([]string(nil), caps...), capabilityReasoning)
+	// Both providers declare reasoning. Claude replays a signed thinking block
+	// verbatim; Codex carries the reasoning text across as prior context and
+	// cannot resume the signed state — see the liveCapabilityMatrix comment in
+	// contract.go. Withholding it from Codex made a request with replayed thinking
+	// unroutable the moment every Claude credential ran out of weekly quota, which
+	// is a worse outcome than answering with the reasoning as context.
+	textCaps := append(append([]string(nil), caps...), capabilityReasoning)
 	imageCaps := []string{capabilityImageGeneration}
 	claude := func(model, effort string, priority int) candidate {
-		return candidate{Provider: "claude", Model: model, Effort: effort, Priority: priority, Capabilities: append([]string(nil), claudeCaps...)}
+		return candidate{Provider: "claude", Model: model, Effort: effort, Priority: priority, Capabilities: append([]string(nil), textCaps...)}
 	}
 	codex := func(model, effort string, priority int) candidate {
-		return candidate{Provider: "codex", Model: model, Effort: effort, Priority: priority, Capabilities: append([]string(nil), caps...)}
+		return candidate{Provider: "codex", Model: model, Effort: effort, Priority: priority, Capabilities: append([]string(nil), textCaps...)}
 	}
 	codexImage := func(model string, priority int) candidate {
 		return candidate{Provider: "codex", Model: model, Priority: priority, Capabilities: append([]string(nil), imageCaps...)}
@@ -150,8 +163,16 @@ func defaultPluginConfig() pluginConfig {
 	}
 
 	// Every general text model exposed by the connected Claude and Codex
-	// subscriptions gets an exact logical alias. Special non-API models
-	// (codex-auto-review and gpt-5.3-codex-spark) remain direct-only.
+	// subscriptions gets an exact logical alias, so a client may address a real
+	// model name and still be routed, metered and limited by Bravo.
+	//
+	// codex-auto-review and gpt-5.3-codex-spark are included with a single
+	// self-candidate and no cross-provider equivalent. They have no Claude
+	// counterpart, so a mapped fallback would silently answer from a different
+	// model. Leaving them out entirely was worse: routeModel declined them, the
+	// host served them natively, and the request escaped project scope and quota
+	// accounting altogether — verified against production, where a smart key
+	// asking for codex-auto-review was answered without Bravo recording an event.
 	exact := map[string][]candidate{
 		"claude-fable-5":             {claude("claude-fable-5", "max", 100), codex("gpt-5.6-sol", "max", 90)},
 		"claude-opus-5":              {claude("claude-opus-5", "high", 100), codex("gpt-5.6-sol", "high", 90)},
@@ -180,6 +201,13 @@ func defaultPluginConfig() pluginConfig {
 			DisplayName: "Bravo " + name,
 			Description: "Exact " + name + " subscriptions first, then mapped equivalents.",
 			Candidates:  candidates,
+		}
+	}
+	for _, name := range selfOnlyDefaultModels {
+		models[name] = logicalModel{
+			DisplayName: "Bravo " + name,
+			Description: "Exact " + name + " subscriptions only; this model has no equivalent to fall back to.",
+			Candidates:  []candidate{codex(name, "", 100)},
 		}
 	}
 	// "auto" intentionally points at the explicit frontier policy so clients
