@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -57,12 +58,34 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		refreshQuotaSnapshots(req.HostCallbackID, authResp.Files, false)
 	}
 	plan := make([]executionAttempt, 0)
+	// Every candidate that drops out records why. An empty plan is reported as
+	// "no healthy account", which is only one of the reasons a candidate can
+	// fail — a rejected capability contract or a provider with no credentials
+	// look identical to the client otherwise, and the true cause is lost.
+	rejections := make([]candidateRejection, 0, len(model.Candidates))
 	for _, item := range model.Candidates {
 		resolved, errContract := resolveCandidateContract(item, contract)
 		if errContract != nil {
+			rejections = append(rejections, candidateRejection{
+				Provider: normalizeProvider(item.Provider),
+				Model:    item.Model,
+				Stage:    "contract",
+				Code:     capabilityContractCode(errContract),
+				Reason:   errContract.Error(),
+			})
 			continue
 		}
 		eligible := eligibleAuths(resolved, authResp.Files, now)
+		if len(eligible) == 0 {
+			rejections = append(rejections, candidateRejection{
+				Provider: normalizeProvider(resolved.Provider),
+				Model:    resolved.Model,
+				Stage:    "eligibility",
+				Code:     "bravo_no_eligible_account",
+				Reason:   authRejectionSummary(resolved, authResp.Files, now),
+			})
+			continue
+		}
 		orderAuths(eligible, sticky, resolved)
 		attempts := make([]executionAttempt, 0, len(eligible))
 		if authenticatedProject && cfg.AllocatorMode != "off" {
@@ -81,6 +104,19 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 				attempts = append(attempts, executionAttempt{Candidate: resolved, Auth: auth})
 			}
 		}
+		if len(attempts) == 0 {
+			// Eligible credentials existed, so the allocator withheld all of
+			// them: quota below the tariff floor, a disabled subscription, or an
+			// unknown snapshot under a deny policy.
+			rejections = append(rejections, candidateRejection{
+				Provider: normalizeProvider(resolved.Provider),
+				Model:    resolved.Model,
+				Stage:    "allocator",
+				Code:     "bravo_allocator_withheld",
+				Reason:   fmt.Sprintf("allocator released none of %d eligible credentials", len(eligible)),
+			})
+			continue
+		}
 		for _, allocated := range attempts {
 			allocated.LogicalModel = logicalName
 			allocated.RequestedEffort = requestedEffortValue(contract.Effort)
@@ -92,9 +128,214 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		}
 	}
 	if len(plan) == 0 {
-		return nil, fmt.Errorf("Bravo has no healthy account for logical model %s", logicalName)
+		// The allocator is a budget policy, not an authorization boundary. When it
+		// withholds every credential the request is still authorized and the
+		// account is still alive, so refusing outright drops a client that the
+		// unprefixed model would have served from the very same subscription.
+		// Degrade to the authorized, healthy pool instead of answering 503.
+		if fallback := allocatorBypassPlan(logicalName, model, contract, authResp.Files, rejections, sticky, now); len(fallback) > 0 {
+			logAllocatorBypass(logicalName, rejections)
+			return fallback, nil
+		}
+		return nil, noEligibleCandidateError(logicalName, contract, rejections)
 	}
 	return plan, nil
+}
+
+// allocatorBypassPlan rebuilds a plan from credentials that passed provider
+// eligibility and health but that the allocator declined to release.
+//
+// It deliberately re-runs eligibleAuths over the already project-filtered list:
+// allowed_auth_ids has been applied to authResp.Files by the caller, so this
+// cannot widen the authorization boundary. Only allocator verdicts — quota
+// floors, tariff reservations, unknown-snapshot policy — are bypassed, and only
+// for candidates whose sole rejection was the allocator. A candidate rejected on
+// contract or eligibility grounds stays rejected: the request genuinely cannot
+// run there.
+//
+// Attempts are marked AllocatorManaged=false so the lease path does not re-apply
+// the floors that just withheld them, while usage accounting still records the
+// spend against the credential.
+func allocatorBypassPlan(
+	logicalName string,
+	model logicalModel,
+	contract requestCapabilityContract,
+	auths []pluginapi.HostAuthFileEntry,
+	rejections []candidateRejection,
+	sticky string,
+	now time.Time,
+) []executionAttempt {
+	withheld := make(map[string]struct{}, len(rejections))
+	for _, rejection := range rejections {
+		if rejection.Stage == "allocator" {
+			withheld[normalizeProvider(rejection.Provider)+"\x00"+rejection.Model] = struct{}{}
+		}
+	}
+	if len(withheld) == 0 {
+		return nil
+	}
+	plan := make([]executionAttempt, 0, len(withheld))
+	cfg := loadedConfig()
+	for _, item := range model.Candidates {
+		resolved, errContract := resolveCandidateContract(item, contract)
+		if errContract != nil {
+			continue
+		}
+		if _, ok := withheld[normalizeProvider(resolved.Provider)+"\x00"+resolved.Model]; !ok {
+			continue
+		}
+		eligible := eligibleAuths(resolved, auths, now)
+		if len(eligible) == 0 {
+			continue
+		}
+		orderAuths(eligible, sticky, resolved)
+		for _, auth := range eligible {
+			plan = append(plan, executionAttempt{
+				LogicalModel:    logicalName,
+				Candidate:       resolved,
+				Auth:            auth,
+				RequestedEffort: requestedEffortValue(contract.Effort),
+				EffectiveEffort: normalizeEffort(resolved.Effort),
+				// AllocatorManaged stays false: the allocator already declined
+				// these, and re-checking its floors here would withhold them again.
+				AllocatorManaged: false,
+			})
+			if cfg.MaxAttempts > 0 && len(plan) >= cfg.MaxAttempts {
+				return plan
+			}
+		}
+	}
+	return plan
+}
+
+// logAllocatorBypass records that budget policy was overridden to keep a request
+// alive. This is a silent quota overspend otherwise — the one thing an operator
+// must be able to see after the fact.
+func logAllocatorBypass(logicalName string, rejections []candidateRejection) {
+	details := make([]string, 0, len(rejections))
+	for _, rejection := range rejections {
+		if rejection.Stage == "allocator" {
+			details = append(details, rejection.String())
+		}
+	}
+	_, _ = callHost(pluginabi.MethodHostLog, map[string]any{
+		"level":   "warn",
+		"message": "bravo: allocator withheld every credential, serving request anyway",
+		"fields": map[string]any{
+			"logical_model": logicalName,
+			"withheld":      strings.Join(details, "; "),
+		},
+	})
+}
+
+// candidateRejection records why one candidate of a logical model dropped out.
+type candidateRejection struct {
+	Provider string
+	Model    string
+	Stage    string
+	Code     string
+	Reason   string
+}
+
+func (r candidateRejection) String() string {
+	return fmt.Sprintf("%s/%s %s(%s): %s", r.Provider, r.Model, r.Stage, r.Code, r.Reason)
+}
+
+func capabilityContractCode(err error) string {
+	var contractErr *capabilityContractError
+	if errors.As(err, &contractErr) && contractErr != nil && strings.TrimSpace(contractErr.Code) != "" {
+		return contractErr.Code
+	}
+	return "bravo_contract_rejected"
+}
+
+// authRejectionSummary counts why each credential of a provider was skipped, so
+// "no eligible account" carries the actual health tally instead of a bare count.
+func authRejectionSummary(item candidate, auths []pluginapi.HostAuthFileEntry, now time.Time) string {
+	provider := normalizeProvider(item.Provider)
+	allowed := make(map[string]struct{}, len(item.AuthIDs))
+	for _, id := range item.AuthIDs {
+		allowed[strings.TrimSpace(id)] = struct{}{}
+	}
+	tally := make(map[string]int)
+	providerTotal := 0
+	for _, auth := range auths {
+		authProvider := normalizeProvider(auth.Provider)
+		if authProvider == "" {
+			authProvider = normalizeProvider(auth.Type)
+		}
+		if authProvider != provider {
+			continue
+		}
+		providerTotal++
+		if len(allowed) > 0 {
+			if _, ok := allowed[strings.TrimSpace(auth.ID)]; !ok {
+				if _, ok = allowed[auth.AuthIndex]; !ok {
+					if _, ok = allowed[auth.Name]; !ok {
+						tally["not_in_candidate_auth_ids"]++
+						continue
+					}
+				}
+			}
+		}
+		tally[string(classifyBravoAuthHealthForModel(provider, auth, item.Model, now))]++
+	}
+	if providerTotal == 0 {
+		return fmt.Sprintf("no %s credential is visible to this project", provider)
+	}
+	reasons := make([]string, 0, len(tally))
+	for reason, count := range tally {
+		reasons = append(reasons, fmt.Sprintf("%s=%d", reason, count))
+	}
+	sort.Strings(reasons)
+	return fmt.Sprintf("%d %s credential(s): %s", providerTotal, provider, strings.Join(reasons, " "))
+}
+
+// noEligibleCandidateError reports the first cause rather than the generic one.
+// A contract rejection is distinguished from an exhausted pool because they call
+// for opposite responses: change the request, or wait for quota.
+func noEligibleCandidateError(logicalName string, contract requestCapabilityContract, rejections []candidateRejection) error {
+	details := make([]string, 0, len(rejections))
+	stages := make(map[string]int, len(rejections))
+	for _, rejection := range rejections {
+		details = append(details, rejection.String())
+		stages[rejection.Stage]++
+	}
+	logPlanRejections(logicalName, contract, details)
+
+	if len(rejections) > 0 && stages["contract"] == len(rejections) {
+		// Nothing was wrong with the accounts — no candidate accepted the
+		// request's capabilities. Surface the upstream code verbatim.
+		first := rejections[0]
+		return &capabilityContractError{
+			Code:     first.Code,
+			Provider: first.Provider,
+			Protocol: contract.Protocol,
+			Message: fmt.Sprintf("no candidate of logical model %s accepts this request: %s",
+				logicalName, strings.Join(details, "; ")),
+		}
+	}
+	if len(details) == 0 {
+		return fmt.Errorf("Bravo has no healthy account for logical model %s", logicalName)
+	}
+	return fmt.Errorf("Bravo has no healthy account for logical model %s (%s)",
+		logicalName, strings.Join(details, "; "))
+}
+
+func logPlanRejections(logicalName string, contract requestCapabilityContract, details []string) {
+	if len(details) == 0 {
+		return
+	}
+	_, _ = callHost(pluginabi.MethodHostLog, map[string]any{
+		"level":   "warn",
+		"message": "bravo: no execution plan for logical model",
+		"fields": map[string]any{
+			"logical_model": logicalName,
+			"protocol":      contract.Protocol,
+			"capabilities":  strings.Join(contract.RequiredCapabilities(), ","),
+			"rejections":    strings.Join(details, "; "),
+		},
+	})
 }
 
 func filterProjectAllowedAuths(project smartKeyConfig, auths []pluginapi.HostAuthFileEntry) []pluginapi.HostAuthFileEntry {
