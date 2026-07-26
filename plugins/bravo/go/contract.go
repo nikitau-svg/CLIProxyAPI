@@ -84,6 +84,7 @@ var liveCapabilityMatrix = map[providerProtocol]capabilitySet{
 		capabilityText:       {},
 		capabilityTools:      {},
 		capabilityToolResult: {},
+		capabilityReasoning:  {},
 		capabilityVision:     {},
 		capabilityWebSearch:  {},
 		capabilityStream:     {},
@@ -97,6 +98,32 @@ var liveCapabilityMatrix = map[providerProtocol]capabilitySet{
 // including nested tool-result images, adaptive effort, and streaming. OpenAI
 // image generation and edit are also live-verified. Image-generation streaming
 // remains absent until its upstream response framing is verified as valid SSE.
+//
+// capabilityReasoning for {codex, claude} is a *degraded* contract, and it is
+// declared because the alternative was worse. It is the contract for replaying a
+// signed Claude thinking block, and the signature itself can never cross: GPT
+// refuses to synthesize encrypted_content from another provider's signature
+// (DecideSignatureCompatibility → SignatureActionDropBlock).
+//
+// The translator used to drop the whole block, text and all, so Bravo withheld
+// Codex entirely rather than truncate the assistant's own history. In production
+// that turned a healthy Codex pool into a 503 the moment every Claude credential
+// was out of weekly quota — the outage this comment used to justify.
+//
+// appendReasoningContent now carries the reasoning *text* across as assistant
+// output_text. Live-verified against chatgpt.com/backend-api/codex on
+// gpt-5.6-sol: a reasoning input item holding the text in its summary is
+// accepted with HTTP 200 but the model never reads it (asked to recall a token
+// planted in it, the model answered it did not know), while the same token sent
+// as output_text was recalled verbatim. So the text does reach the model.
+//
+// What is lost is verbatim signed replay: the reasoning arrives as prior context
+// rather than as the model's own resumable state. That is a real degradation, not
+// a silent one — the content survives, only its provenance does not.
+//
+// Requesting reasoning *depth* is a different thing and was never gated here:
+// the translator maps thinking.budget_tokens and adaptive output_config.effort
+// onto reasoning.effort, and such a request carries no block to replay.
 
 var capabilityOrder = []string{
 	capabilityText,

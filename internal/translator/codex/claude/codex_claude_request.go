@@ -137,13 +137,35 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				rawSignature := part.Get("signature").String()
 				signature, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderGPT, rawSignature)
 				if !ok {
-					if !codexClaudeTargetAcceptsGrokSignature(modelName) {
+					if codexClaudeTargetAcceptsGrokSignature(modelName) {
+						if _, err := sigcompat.InspectGrokEncryptedContent(rawSignature); err == nil {
+							flushMessage()
+							reasoningItem := []byte(`{"type":"reasoning","summary":[],"content":null}`)
+							reasoningItem, _ = sjson.SetBytes(reasoningItem, "encrypted_content", rawSignature)
+							inputItems = append(inputItems, reasoningItem)
+							return
+						}
+					}
+					// The signature cannot be replayed: GPT refuses to synthesize
+					// encrypted_content from another provider's signature. Dropping the
+					// whole block would also discard the reasoning *text*, which carries
+					// no signature and translates fine — the assistant would lose the
+					// conclusion it had already reached and silently continue without it.
+					//
+					// The text is carried as an ordinary assistant output_text part, NOT as
+					// a reasoning item. Live-verified against chatgpt.com/backend-api/codex
+					// on gpt-5.6-sol: a reasoning input item whose summary holds the text
+					// is accepted with HTTP 200 but the text never reaches the model (asked
+					// to recall a token planted in it, the model answered "не знаю"),
+					// whereas the same token sent as output_text was recalled verbatim.
+					// Verbatim signed replay is still impossible, but the reasoning
+					// survives where the model can actually read it.
+					summaryText := strings.TrimSpace(part.Get("thinking").String())
+					if summaryText == "" {
 						return
 					}
-					if _, err := sigcompat.InspectGrokEncryptedContent(rawSignature); err != nil {
-						return
-					}
-					signature = rawSignature
+					appendTextContent(summaryText)
+					return
 				}
 
 				flushMessage()

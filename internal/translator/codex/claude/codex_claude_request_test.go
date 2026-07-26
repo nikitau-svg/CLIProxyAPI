@@ -587,13 +587,113 @@ func TestConvertClaudeRequestToCodex_IgnoresGrokSignatureForNonGrokTargets(t *te
 	for _, modelName := range []string{"gpt-5.4", "claude-sonnet-4-6"} {
 		t.Run(modelName, func(t *testing.T) {
 			out := ConvertClaudeRequestToCodex(modelName, payload, false)
+			// The Grok signature is invalid for these targets and must never be
+			// replayed, so no reasoning item is emitted at all. The reasoning text
+			// carries no signature and does survive, as assistant output_text — see
+			// TestConvertClaudeRequestToCodex_CarriesThinkingTextWhenSignatureIncompatible.
+			if strings.Contains(string(out), signature) {
+				t.Fatalf("Grok signature leaked into a non-Grok request; output=%s", out)
+			}
 			if got := countRequestInputItemsByType(out, "reasoning"); got != 0 {
 				t.Fatalf("got %d reasoning items for non-Grok target, want 0; output=%s", got, out)
+			}
+			if got := gjson.GetBytes(out, "input.0.content.0.text").String(); got != "summary" {
+				t.Fatalf("reasoning text = %q, want %q; output=%s", got, "summary", out)
 			}
 		})
 	}
 }
 
+// An incompatible signature cannot be replayed, but the reasoning *text* has no
+// signature and translates fine. Dropping the whole block discarded it, so the
+// assistant silently lost the conclusion it had already reached — in production
+// this surfaced as Bravo refusing to fall back to Codex at all.
+//
+// The text is carried as an ordinary assistant output_text part. Live-verified on
+// gpt-5.6-sol: a reasoning input item carrying the text in its summary is
+// accepted (HTTP 200) but the model never sees the text, while the same text as
+// output_text is recalled verbatim. So a reasoning item here would look correct
+// and lose the data anyway.
+func TestConvertClaudeRequestToCodex_CarriesThinkingTextWhenSignatureIncompatible(t *testing.T) {
+	tests := []struct {
+		name      string
+		signature string
+	}{
+		{name: "Anthropic native signature", signature: "Eo8Canthropic-state"},
+		{name: "Grok signature against a non-Grok target", signature: "grok#not-a-valid-grok-payload"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputJSON := `{
+				"model": "claude-3-opus",
+				"messages": [
+					{
+						"role": "assistant",
+						"content": [
+							{
+								"type": "thinking",
+								"thinking": "anthropic thinking",
+								"signature": "` + tt.signature + `"
+							},
+							{
+								"type": "text",
+								"text": "visible answer"
+							}
+						]
+					}
+				]
+			}`
+			result := ConvertClaudeRequestToCodex("gpt-5.6-sol", []byte(inputJSON), false)
+			// No reasoning item: it would be accepted and silently ignored upstream.
+			if got := countRequestInputItemsByType(result, "reasoning"); got != 0 {
+				t.Fatalf("got %d reasoning items, want 0. Output: %s", got, string(result))
+			}
+			// The reasoning text reaches the model as assistant output_text, ahead of
+			// the visible answer so the original order is preserved.
+			parts := gjson.GetBytes(result, "input.0.content").Array()
+			if len(parts) != 2 {
+				t.Fatalf("assistant content parts = %d, want 2. Output: %s", len(parts), string(result))
+			}
+			if got := parts[0].Get("type").String(); got != "output_text" {
+				t.Fatalf("first part type = %q, want output_text. Output: %s", got, string(result))
+			}
+			if got := parts[0].Get("text").String(); got != "anthropic thinking" {
+				t.Fatalf("first part text = %q, want the reasoning text", got)
+			}
+			if got := parts[1].Get("text").String(); got != "visible answer" {
+				t.Fatalf("second part text = %q, want the visible answer", got)
+			}
+			// The signature must never be replayed: it is the thing that is invalid.
+			if strings.Contains(string(result), tt.signature) {
+				t.Fatalf("incompatible signature leaked into the Codex request. Output: %s", string(result))
+			}
+		})
+	}
+}
+
+// A thinking block with no text carries nothing translatable, so it is still
+// dropped outright rather than becoming an empty reasoning item.
+func TestConvertClaudeRequestToCodex_DropsIncompatibleThinkingWithoutText(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "   ", "signature": "Eo8Canthropic-state"},
+					{"type": "text", "text": "visible answer"}
+				]
+			}
+		]
+	}`
+	result := ConvertClaudeRequestToCodex("gpt-5.6-sol", []byte(inputJSON), false)
+	if got := countRequestInputItemsByType(result, "reasoning"); got != 0 {
+		t.Fatalf("got %d reasoning items, want 0. Output: %s", got, string(result))
+	}
+}
+
+// A user-supplied thinking block is not the assistant's own reasoning and is
+// still ignored entirely, signature or not.
 func TestConvertClaudeRequestToCodex_IgnoresNonCodexThinkingSignatures(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -615,28 +715,6 @@ func TestConvertClaudeRequestToCodex_IgnoresNonCodexThinkingSignatures(t *testin
 							{
 								"type": "text",
 								"text": "hello"
-							}
-						]
-					}
-				]
-			}`,
-		},
-		{
-			name: "Ignore Anthropic native signature",
-			inputJSON: `{
-				"model": "claude-3-opus",
-				"messages": [
-					{
-						"role": "assistant",
-						"content": [
-							{
-								"type": "thinking",
-								"thinking": "anthropic thinking",
-								"signature": "Eo8Canthropic-state"
-							},
-							{
-								"type": "text",
-								"text": "visible answer"
 							}
 						]
 					}
