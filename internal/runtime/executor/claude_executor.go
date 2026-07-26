@@ -326,6 +326,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
+	body = applyProjectPromptCacheTTL(body, helps.BravoPromptCacheClaudeTTL(opts.Metadata))
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
@@ -438,12 +439,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			helps.RecordAPIResponseError(ctx, e.cfg, errValidate)
 			return resp, errValidate
 		}
+		var streamUsage helps.StreamUsageBuffer
 		lines := bytes.Split(data, []byte("\n"))
 		for _, line := range lines {
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			streamUsage.ObserveClaudeStream(line)
 		}
+		streamUsage.Publish(ctx, reporter)
 	} else {
 		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
 	}
@@ -525,6 +526,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
+	body = applyProjectPromptCacheTTL(body, helps.BravoPromptCacheClaudeTTL(opts.Metadata))
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	body = enforceCacheControlLimit(body, 4)
@@ -625,6 +627,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				log.Errorf("response body close error: %v", errClose)
 			}
 		}()
+		var streamUsage helps.StreamUsageBuffer
 
 		// If the response target is Claude, directly forward complete SSE events without translation.
 		if responseFormat == to {
@@ -647,9 +650,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
-				}
+				streamUsage.ObserveClaudeStream(line)
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				line = e.restoreResponseModel(line, req.Model)
 				event.Write(line)
@@ -668,7 +669,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 				case <-ctx.Done():
 				}
+				return
 			}
+			streamUsage.Publish(ctx, reporter)
 			return
 		}
 
@@ -679,9 +682,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			streamUsage.ObserveClaudeStream(line)
 			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			line = e.restoreResponseModel(line, req.Model)
 			chunks := sdktranslator.TranslateStream(
@@ -709,7 +710,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
 			}
+			return
 		}
+		streamUsage.Publish(ctx, reporter)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
@@ -797,6 +800,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
+	body = applyProjectPromptCacheTTL(body, helps.BravoPromptCacheClaudeTTL(opts.Metadata))
 	body = enforceCacheControlLimit(body, 4)
 	body = normalizeCacheControlTTL(body)
 
@@ -2397,7 +2401,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 // ensureCacheControl injects cache_control breakpoints into the payload for optimal prompt caching.
 // According to Anthropic's documentation, cache prefixes are created in order: tools -> system -> messages.
 // This function adds cache_control to:
-// 1. The LAST tool in the tools array (caches all tool definitions)
+// 1. The LAST non-deferred tool in the tools array (caches all preceding tool definitions)
 // 2. The LAST system prompt element
 // 3. The SECOND-TO-LAST user turn (caches conversation history for multi-turn)
 //
@@ -2405,7 +2409,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 // This enables up to 90% cost reduction on cached tokens (cache read = 0.1x base price).
 // See: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
 func ensureCacheControl(payload []byte) []byte {
-	// 1. Inject cache_control into the LAST tool (caches all tool definitions)
+	// 1. Inject cache_control into the LAST non-deferred tool
 	// Tools are cached first in the hierarchy, so this is the most important breakpoint.
 	payload = injectToolsCacheControl(payload)
 
@@ -2420,8 +2424,105 @@ func ensureCacheControl(payload []byte) []byte {
 	return payload
 }
 
+// applyProjectPromptCacheTTL applies Bravo's validated per-project policy only
+// after the request has been translated to Anthropic's native schema. The
+// top-level cache_control enables Anthropic automatic caching, while existing
+// explicit breakpoints keep their locations and receive the same TTL so the
+// combined request cannot violate the provider's ordering rule.
+func applyProjectPromptCacheTTL(payload []byte, ttl string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	ttl = strings.ToLower(strings.TrimSpace(ttl))
+	if ttl == "" || ttl == "auto" {
+		return payload
+	}
+	if ttl != "5m" && ttl != "1h" {
+		return payload
+	}
+
+	rootControl := gjson.GetBytes(payload, "cache_control")
+	if !rootControl.Exists() || !rootControl.IsObject() {
+		updated, errSetRoot := sjson.SetRawBytes(payload, "cache_control", []byte(`{"type":"ephemeral"}`))
+		if errSetRoot != nil {
+			return payload
+		}
+		payload = updated
+	}
+	updated, errSetRootType := sjson.SetBytes(payload, "cache_control.type", "ephemeral")
+	if errSetRootType != nil {
+		return payload
+	}
+	payload = updated
+	if ttl == "1h" {
+		if updated, errSetRootTTL := sjson.SetBytes(payload, "cache_control.ttl", "1h"); errSetRootTTL == nil {
+			payload = updated
+		}
+	} else if updated, errDeleteRootTTL := sjson.DeleteBytes(payload, "cache_control.ttl"); errDeleteRootTTL == nil {
+		payload = updated
+	}
+
+	applyAtPath := func(path string) {
+		controlPath := path + ".cache_control"
+		if !gjson.GetBytes(payload, controlPath).Exists() {
+			return
+		}
+		next, errType := sjson.SetBytes(payload, controlPath+".type", "ephemeral")
+		if errType != nil {
+			return
+		}
+		payload = next
+		if ttl == "1h" {
+			if next, errTTL := sjson.SetBytes(payload, controlPath+".ttl", "1h"); errTTL == nil {
+				payload = next
+			}
+			return
+		}
+		if next, errTTL := sjson.DeleteBytes(payload, controlPath+".ttl"); errTTL == nil {
+			payload = next
+		}
+	}
+
+	tools := gjson.GetBytes(payload, "tools")
+	if tools.IsArray() {
+		tools.ForEach(func(index, _ gjson.Result) bool {
+			applyAtPath(fmt.Sprintf("tools.%d", int(index.Int())))
+			return true
+		})
+	}
+	system := gjson.GetBytes(payload, "system")
+	if system.IsArray() {
+		system.ForEach(func(index, _ gjson.Result) bool {
+			applyAtPath(fmt.Sprintf("system.%d", int(index.Int())))
+			return true
+		})
+	}
+	messages := gjson.GetBytes(payload, "messages")
+	if messages.IsArray() {
+		messages.ForEach(func(messageIndex, message gjson.Result) bool {
+			content := message.Get("content")
+			if !content.IsArray() {
+				return true
+			}
+			content.ForEach(func(contentIndex, _ gjson.Result) bool {
+				applyAtPath(fmt.Sprintf(
+					"messages.%d.content.%d",
+					int(messageIndex.Int()),
+					int(contentIndex.Int()),
+				))
+				return true
+			})
+			return true
+		})
+	}
+	return payload
+}
+
 func countCacheControls(payload []byte) int {
 	count := 0
+	if gjson.GetBytes(payload, "cache_control").Exists() {
+		count++
+	}
 
 	// Check system
 	system := gjson.GetBytes(payload, "system")
@@ -2485,8 +2586,7 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 	seen5m := false
 	modified := false
 
-	processBlock := func(path string, obj gjson.Result) {
-		cc := obj.Get("cache_control")
+	processControl := func(ttlPath string, cc gjson.Result) {
 		if !cc.Exists() {
 			return
 		}
@@ -2502,13 +2602,15 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 		if !seen5m {
 			return
 		}
-		ttlPath := path + ".cache_control.ttl"
 		updated, errDel := sjson.DeleteBytes(payload, ttlPath)
 		if errDel != nil {
 			return
 		}
 		payload = updated
 		modified = true
+	}
+	processBlock := func(path string, obj gjson.Result) {
+		processControl(path+".cache_control.ttl", obj.Get("cache_control"))
 	}
 
 	tools := gjson.GetBytes(payload, "tools")
@@ -2541,6 +2643,9 @@ func normalizeCacheControlTTL(payload []byte) []byte {
 			return true
 		})
 	}
+	// Anthropic automatic caching is a logical breakpoint at the end of the
+	// prompt, so evaluate its top-level control after all explicit blocks.
+	processControl("cache_control.ttl", gjson.GetBytes(payload, "cache_control"))
 
 	if !modified {
 		return original
@@ -2814,8 +2919,8 @@ func injectMessagesCacheControl(payload []byte) []byte {
 	return payload
 }
 
-// injectToolsCacheControl adds cache_control to the last tool in the tools array.
-// Per Anthropic docs: "The cache_control parameter on the last tool definition caches all tool definitions."
+// injectToolsCacheControl adds cache_control to the last non-deferred tool in the tools array.
+// Deferred tools cannot use prompt caching, so trailing deferred tools are skipped.
 // This only adds cache_control if NO tool in the array already has it.
 func injectToolsCacheControl(payload []byte) []byte {
 	tools := gjson.GetBytes(payload, "tools")
@@ -2823,26 +2928,24 @@ func injectToolsCacheControl(payload []byte) []byte {
 		return payload
 	}
 
-	toolCount := int(tools.Get("#").Int())
-	if toolCount == 0 {
-		return payload
-	}
-
-	// Check if ANY tool already has cache_control - if so, don't modify tools
+	// Check if ANY tool already has cache_control and find the last eligible tool.
 	hasCacheControlInTools := false
-	tools.ForEach(func(_, tool gjson.Result) bool {
+	lastEligibleToolIndex := -1
+	tools.ForEach(func(index, tool gjson.Result) bool {
 		if tool.Get("cache_control").Exists() {
 			hasCacheControlInTools = true
 			return false
 		}
+		if !tool.Get("defer_loading").Bool() {
+			lastEligibleToolIndex = int(index.Int())
+		}
 		return true
 	})
-	if hasCacheControlInTools {
+	if hasCacheControlInTools || lastEligibleToolIndex < 0 {
 		return payload
 	}
 
-	// Add cache_control to the last tool
-	lastToolPath := fmt.Sprintf("tools.%d.cache_control", toolCount-1)
+	lastToolPath := fmt.Sprintf("tools.%d.cache_control", lastEligibleToolIndex)
 	result, err := sjson.SetBytes(payload, lastToolPath, map[string]string{"type": "ephemeral"})
 	if err != nil {
 		log.Warnf("failed to inject cache_control into tools array: %v", err)

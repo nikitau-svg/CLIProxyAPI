@@ -1753,6 +1753,66 @@ func TestClaudeExecutor_CountTokens_AppliesCacheControlGuards(t *testing.T) {
 	}
 }
 
+func TestClaudeExecutor_ExecuteAppliesBravoProjectPromptCachePolicyAfterTranslation(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_cache","type":"message","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":2048,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{
+		"model":"bravo/opus",
+		"tools":[{"name":"read","description":"read","input_schema":{"type":"object"}}],
+		"system":[{"type":"text","text":"stable instructions"}],
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"first"}]},
+			{"role":"assistant","content":[{"type":"text","text":"ok"}]},
+			{"role":"user","content":[{"type":"text","text":"next"}]}
+		]
+	}`)
+	metadata := map[string]any{
+		cliproxyexecutor.AccessProviderMetadataKey: "plugin:bravo:bravo",
+		cliproxyexecutor.AccessMetadataMetadataKey: map[string]string{
+			"bravo_access_provider":         "bravo",
+			"bravo_prompt_cache_claude_ttl": "1h",
+		},
+	}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Metadata:     metadata,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected upstream request body to be captured")
+	}
+	if got := gjson.GetBytes(seenBody, "cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("upstream cache_control.type = %q; body=%s", got, seenBody)
+	}
+	if got := gjson.GetBytes(seenBody, "cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("upstream cache_control.ttl = %q; body=%s", got, seenBody)
+	}
+	if got := countCacheControls(seenBody); got > 4 {
+		t.Fatalf("upstream cache controls = %d, want <=4; body=%s", got, seenBody)
+	}
+	if hasTTLOrderingViolation(seenBody) {
+		t.Fatalf("upstream body has TTL ordering violation: %s", seenBody)
+	}
+}
+
 func TestClaudeExecutor_ExecuteSanitizesSignaturesBeforeUpstream(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1857,6 +1917,7 @@ func hasTTLOrderingViolation(payload []byte) bool {
 			return !violates
 		})
 	}
+	checkCC(gjson.GetBytes(payload, "cache_control"))
 
 	return violates
 }

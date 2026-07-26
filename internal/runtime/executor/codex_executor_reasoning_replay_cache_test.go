@@ -159,6 +159,54 @@ func TestCodexExecutorReasoningReplaySessionKeyUsesClaudeCodeJSONSessionID(t *te
 	}
 }
 
+func TestCodexExecutorReasoningReplaySessionKeyIsolatesBravoProjects(t *testing.T) {
+	from := sdktranslator.FromString("claude")
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"shared-bravo-session\"}"},
+			"messages":[{"role":"user","content":[{"type":"text","text":"next"}]}]
+		}`),
+	}
+	body := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}`)
+	opts := cliproxyexecutor.Options{SourceFormat: from}
+
+	projectAFirst := codexReasoningReplaySessionKey(codexBravoPromptCacheContext("project-a"), from, req, opts, body)
+	projectASecond := codexReasoningReplaySessionKey(codexBravoPromptCacheContext("project-a"), from, req, opts, body)
+	projectB := codexReasoningReplaySessionKey(codexBravoPromptCacheContext("project-b"), from, req, opts, body)
+	if projectAFirst == "" || projectAFirst != projectASecond {
+		t.Fatalf("same Bravo project produced unstable replay key: first=%q second=%q", projectAFirst, projectASecond)
+	}
+	if projectAFirst == projectB {
+		t.Fatalf("distinct Bravo projects share replay key %q", projectAFirst)
+	}
+
+	legacy := codexReasoningReplaySessionKey(context.Background(), from, req, opts, body)
+	if legacy != "claude:shared-bravo-session:agent:main" {
+		t.Fatalf("non-Bravo replay key = %q, want unchanged legacy key", legacy)
+	}
+
+	fallbackReq := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"next"}]}`),
+	}
+	fallbackOpts := cliproxyexecutor.Options{
+		SourceFormat: from,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "shared-execution-session",
+		},
+	}
+	fallbackA := codexReasoningReplaySessionKey(codexBravoPromptCacheContext("project-a"), from, fallbackReq, fallbackOpts, body)
+	fallbackB := codexReasoningReplaySessionKey(codexBravoPromptCacheContext("project-b"), from, fallbackReq, fallbackOpts, body)
+	if fallbackA == "" || fallbackA == fallbackB {
+		t.Fatalf("Bravo fallback replay identity is not project-scoped: A=%q B=%q", fallbackA, fallbackB)
+	}
+	if got := codexReasoningReplaySessionKey(context.Background(), from, fallbackReq, fallbackOpts, body); got != "execution:shared-execution-session" {
+		t.Fatalf("non-Bravo fallback replay key = %q, want unchanged execution scope", got)
+	}
+}
+
 func TestCodexExecutorReasoningReplaySessionKeyIsolatesClaudeCodeAgents(t *testing.T) {
 	from := sdktranslator.FromString("claude")
 	req := cliproxyexecutor.Request{

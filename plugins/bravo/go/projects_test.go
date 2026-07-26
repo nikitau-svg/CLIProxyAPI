@@ -81,7 +81,8 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 		"models":["bravo/frontier"],
 		"primary_auth_ids":["claude-primary"],
 		"allowed_auth_ids":["claude-primary"],
-		"policy":{"future_reserve_percent":50}
+		"policy":{"future_reserve_percent":50},
+		"prompt_cache":{"anthropic_ttl":"1h"}
 	}`)
 	if status != http.StatusCreated {
 		t.Fatalf("create status = %d body=%#v", status, created)
@@ -100,6 +101,10 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	}
 	if got, _ := project["allowed_auth_ids"].([]any); len(got) != 1 || got[0] != "1111111111111111" {
 		t.Fatalf("created allowed_auth_ids = %#v", project["allowed_auth_ids"])
+	}
+	promptCache := projectMap(t, project["prompt_cache"])
+	if promptCache["anthropic_ttl"] != "1h" || promptCache["openai_mode"] != projectPromptCacheOpenAIManaged {
+		t.Fatalf("created prompt_cache = %#v", promptCache)
 	}
 	if len(stored) != 1 {
 		t.Fatalf("stored items = %d", len(stored))
@@ -152,12 +157,15 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	if auth.Metadata[bravoProjectIDMetadataKey] != projectID {
 		t.Fatalf("auth metadata = %#v", auth.Metadata)
 	}
+	if auth.Metadata[bravoPromptCacheTTLMetadataKey] != "1h" {
+		t.Fatalf("auth prompt cache metadata = %#v", auth.Metadata)
+	}
 
 	status, patched := callProjectManagement(
 		t,
 		http.MethodPatch,
 		"/v0/management/bravo/projects",
-		`{"id":"`+projectID+`","name":"Alpha disabled","enabled":false}`,
+		`{"id":"`+projectID+`","name":"Alpha disabled","enabled":false,"policy":null,"prompt_cache":{"anthropic_ttl":"5m"}}`,
 	)
 	if status != http.StatusOK {
 		t.Fatalf("patch status = %d body=%#v", status, patched)
@@ -165,6 +173,10 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	patchedProject := projectMap(t, patched["project"])
 	if patchedProject["enabled"] != false || patchedProject["status"] != projectStatusDisabled {
 		t.Fatalf("patched project = %#v", patchedProject)
+	}
+	patchedPromptCache := projectMap(t, patchedProject["prompt_cache"])
+	if patchedPromptCache["anthropic_ttl"] != "5m" {
+		t.Fatalf("patched prompt_cache = %#v", patchedPromptCache)
 	}
 	if authenticateProjectKey(t, plaintext).Authenticated {
 		t.Fatal("disabled project key still authenticates")
@@ -215,6 +227,84 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	}
 	if authenticateProjectKey(t, rotatedPlaintext).Authenticated {
 		t.Fatal("deleted project key still authenticates")
+	}
+}
+
+func TestBravoProjectPromptCachePolicyIsValidatedAndLegacySafe(t *testing.T) {
+	legacy := smartKeyConfig{Policy: map[string]any{}}
+	view := projectPromptCacheViewFor(legacy)
+	if view.AnthropicTTL != projectPromptCacheTTLAutomatic ||
+		view.OpenAIMode != projectPromptCacheOpenAIManaged {
+		t.Fatalf("legacy prompt cache view = %#v", view)
+	}
+
+	for _, value := range []string{"10m", "24h", "forever"} {
+		_, failure := normalizeProjectPromptCacheInput(projectPromptCachePolicy{AnthropicTTL: value})
+		if failure == nil || failure.Code != "bravo_project_prompt_cache_invalid" {
+			t.Fatalf("TTL %q failure = %#v", value, failure)
+		}
+	}
+
+	policy := map[string]any{"future": true}
+	if failure := setProjectPromptCachePolicy(policy, projectPromptCachePolicy{AnthropicTTL: " 1H "}); failure != nil {
+		t.Fatalf("set valid policy failed: %#v", failure)
+	}
+	normalized, failure := normalizeProjectPromptCachePolicy(policy)
+	if failure != nil || normalized.AnthropicTTL != "1h" || policy["future"] != true {
+		t.Fatalf("normalized policy = %#v, failure=%#v, raw=%#v", normalized, failure, policy)
+	}
+
+	invalid := defaultPluginConfig()
+	invalid.SmartKeys = []smartKeyConfig{{
+		ID:      "prj_invalid_cache",
+		Name:    "Invalid cache",
+		SHA256:  strings.Repeat("c", 64),
+		Enabled: boolPointer(true),
+		Status:  projectStatusActive,
+		Models:  []string{"*"},
+		Policy: map[string]any{
+			"prompt_cache": map[string]any{"anthropic_ttl": "10m"},
+		},
+	}}
+	if errNormalize := normalizeConfig(&invalid); errNormalize == nil ||
+		!strings.Contains(errNormalize.Error(), "invalid prompt cache policy") {
+		t.Fatalf("invalid config error = %v", errNormalize)
+	}
+}
+
+func TestBravoProjectPromptCachePolicyFailsBeforePersistence(t *testing.T) {
+	previousConfig := loadedConfig()
+	cfg := defaultPluginConfig()
+	if errNormalize := normalizeConfig(&cfg); errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	currentConfig.Store(cfg)
+	t.Cleanup(func() {
+		currentConfig.Store(previousConfig)
+	})
+
+	hostCalls := 0
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		hostCalls++
+		t.Fatalf("invalid prompt cache policy called host method %q with %#v", method, payload)
+		return nil, nil
+	})
+
+	status, response := callProjectManagement(
+		t,
+		http.MethodPost,
+		"/v0/management/bravo/projects",
+		`{"name":"Invalid cache","models":["*"],"policy":{"prompt_cache":{"anthropic_ttl":"24h"}}}`,
+	)
+	if status != http.StatusBadRequest {
+		t.Fatalf("invalid cache status/body = %d %#v", status, response)
+	}
+	errorBody := projectMap(t, response["error"])
+	if errorBody["code"] != "bravo_project_prompt_cache_invalid" {
+		t.Fatalf("invalid cache error = %#v", errorBody)
+	}
+	if hostCalls != 0 {
+		t.Fatalf("host calls = %d, want zero", hostCalls)
 	}
 }
 

@@ -1,0 +1,9 @@
+services:
+  cli-proxy-api-canary:
+    # Opt in only while authenticating dedicated canary accounts and only
+    # after verifying that no production container owns these fixed redirect
+    # ports. Provider OAuth redirects require the original host port numbers.
+    ports:
+      - "127.0.0.1:1455:1455"
+      - "127.0.0.1:54545:54545"
+      - "127.0.0.1:51121:51121"

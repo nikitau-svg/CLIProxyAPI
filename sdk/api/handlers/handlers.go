@@ -196,20 +196,30 @@ func buildErrorResponseBody(status int, errText, errorCode string) []byte {
 	switch status {
 	case http.StatusUnauthorized:
 		errType = "authentication_error"
-		code = "invalid_api_key"
+		if code == "" {
+			code = "invalid_api_key"
+		}
 	case http.StatusForbidden:
 		errType = "permission_error"
-		code = "insufficient_quota"
+		if code == "" {
+			code = "insufficient_quota"
+		}
 	case http.StatusTooManyRequests:
 		errType = "rate_limit_error"
-		code = "rate_limit_exceeded"
+		if code == "" {
+			code = "rate_limit_exceeded"
+		}
 	case http.StatusNotFound:
 		errType = "invalid_request_error"
-		code = "model_not_found"
+		if code == "" {
+			code = "model_not_found"
+		}
 	default:
 		if status >= http.StatusInternalServerError {
 			errType = "server_error"
-			code = "internal_server_error"
+			if code == "" {
+				code = "internal_server_error"
+			}
 		}
 	}
 
@@ -417,6 +427,13 @@ func validBravoAccessMetadata(key, value string) bool {
 		return len([]rune(value)) <= 120
 	case "bravo_allowed_models":
 		return len(value) <= 32<<10
+	case "bravo_prompt_cache_claude_ttl":
+		switch value {
+		case "auto", "5m", "1h":
+			return true
+		default:
+			return false
+		}
 	default:
 		return false
 	}
@@ -889,7 +906,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelExecutionUsageAlias(originalRequestedModel, execOptions)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
@@ -953,7 +970,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelExecutionUsageAlias(originalRequestedModel, execOptions)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
@@ -1036,7 +1053,7 @@ func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerTyp
 
 func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt string, stream bool, execOptions modelExecutionOptions) (coreexecutor.Request, coreexecutor.Options) {
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelExecutionUsageAlias(originalRequestedModel, execOptions)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
@@ -1317,7 +1334,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelExecutionUsageAlias(originalRequestedModel, execOptions)
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addExecutionControlMetadata(reqMeta, execOptions.PinnedAuthID, execOptions.SingleAttempt)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)

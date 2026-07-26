@@ -109,6 +109,9 @@ class BravoManagementSmoke
     return unless created
 
     check("list redacts project key material") { list_created_project }
+    check("unsupported project cache TTL fails closed") do
+      assert_invalid_prompt_cache_ttl
+    end
 
     disabled = check("patch project to disabled") { disable_project }
     if disabled
@@ -280,6 +283,7 @@ class BravoManagementSmoke
       "name" => project_name,
       "models" => [@logical_name],
       "primary_auth_ids" => [],
+      "prompt_cache" => { "anthropic_ttl" => "1h" },
       "policy" => {
         "smoke_test" => true,
         "created_by" => "scripts/bravo-management-smoke.rb"
@@ -306,6 +310,7 @@ class BravoManagementSmoke
     assert(project["enabled"] == true, "created project is not enabled")
     assert(project["status"] == "active", "created project is not active")
     assert(Array(project["models"]).include?(@logical_name), "model allowlist differs")
+    assert_prompt_cache(project, "1h")
     assert_redacted_project(project)
   end
 
@@ -317,7 +322,25 @@ class BravoManagementSmoke
       item.is_a?(Hash) && item["id"] == @project_id
     end
     assert(project, "created project is missing from list")
+    assert_prompt_cache(project, "1h")
     assert_redacted_project(project)
+  end
+
+  def assert_invalid_prompt_cache_ttl
+    response = management_request(
+      :patch,
+      "/v0/management/bravo/projects",
+      {
+        "id" => @project_id,
+        "prompt_cache" => { "anthropic_ttl" => "24h" }
+      }
+    )
+    assert(response.status == 400, http_failure(response, "expected HTTP 400"))
+    error = require_object(parse_json(response)["error"], "invalid cache error")
+    assert(
+      error["code"] == "bravo_project_prompt_cache_invalid",
+      "unsupported cache TTL returned #{error["code"].inspect}"
+    )
   end
 
   def disable_project
@@ -328,6 +351,7 @@ class BravoManagementSmoke
         "id" => @project_id,
         "name" => temporary_project_name("disabled"),
         "enabled" => false,
+        "prompt_cache" => { "anthropic_ttl" => "5m" },
         "policy" => {
           "smoke_test" => true,
           "state" => "disabled"
@@ -338,6 +362,7 @@ class BravoManagementSmoke
     assert(project["id"] == @project_id, "patch changed the project ID")
     assert(project["enabled"] == false, "patch did not disable the project")
     assert(project["status"] == "disabled", "disabled status was not persisted")
+    assert_prompt_cache(project, "5m")
     assert_redacted_project(project)
   end
 
@@ -349,6 +374,7 @@ class BravoManagementSmoke
         "id" => @project_id,
         "name" => temporary_project_name("active"),
         "enabled" => true,
+        "prompt_cache" => { "anthropic_ttl" => "1h" },
         "policy" => {
           "smoke_test" => true,
           "state" => "active"
@@ -359,6 +385,7 @@ class BravoManagementSmoke
     assert(project["id"] == @project_id, "patch changed the project ID")
     assert(project["enabled"] == true, "patch did not enable the project")
     assert(project["status"] == "active", "active status was not persisted")
+    assert_prompt_cache(project, "1h")
     assert_redacted_project(project)
   end
 
@@ -376,6 +403,7 @@ class BravoManagementSmoke
     assert(project["id"] == @project_id, "rotation changed the project ID")
     assert(@rotated_key.start_with?("brv_"), "rotation did not return a Bravo key")
     assert(@rotated_key != @project_key, "rotation returned the old key")
+    assert_prompt_cache(project, "1h")
     assert_redacted_project(project)
 
     listed = management_request(:get, "/v0/management/bravo/projects")
@@ -521,6 +549,18 @@ class BravoManagementSmoke
         "project object exposed a key digest"
       )
     end
+  end
+
+  def assert_prompt_cache(project, expected_ttl)
+    cache = require_object(project["prompt_cache"], "project prompt_cache")
+    assert(
+      cache["anthropic_ttl"] == expected_ttl,
+      "Claude cache TTL #{cache["anthropic_ttl"].inspect} differs from #{expected_ttl.inspect}"
+    )
+    assert(
+      cache["openai_mode"] == "provider_managed",
+      "OpenAI cache mode is not provider_managed"
+    )
   end
 
   def management_request(method, path, payload = nil)

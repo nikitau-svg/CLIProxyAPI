@@ -53,6 +53,54 @@ func TestWriteErrorResponsePreservesExecutorErrorCode(t *testing.T) {
 	}
 }
 
+func TestWriteErrorResponsePreservesBravoCodeAcrossStatusDefaults(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusForbidden,
+		Error: codedHandlerResponseError{
+			code:    "bravo_model_forbidden",
+			message: "This Bravo smart key cannot use the requested logical model.",
+		},
+	})
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusForbidden)
+	}
+	var response ErrorResponse
+	if errUnmarshal := json.Unmarshal(recorder.Body.Bytes(), &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if response.Error.Code != "bravo_model_forbidden" {
+		t.Fatalf("error.code = %q, want bravo_model_forbidden; body=%s", response.Error.Code, recorder.Body.Bytes())
+	}
+	if response.Error.Type != "permission_error" {
+		t.Fatalf("error.type = %q, want permission_error", response.Error.Type)
+	}
+}
+
+func TestBuildErrorResponseBodyWithCodePreservesForbiddenBravoCode(t *testing.T) {
+	body := BuildErrorResponseBodyWithCode(
+		http.StatusForbidden,
+		"This Bravo smart key cannot use the requested logical model.",
+		"bravo_model_forbidden",
+	)
+	var response ErrorResponse
+	if errUnmarshal := json.Unmarshal(body, &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if response.Error.Code != "bravo_model_forbidden" {
+		t.Fatalf("error.code = %q, want bravo_model_forbidden; body=%s", response.Error.Code, body)
+	}
+	if response.Error.Type != "permission_error" {
+		t.Fatalf("error.type = %q, want permission_error", response.Error.Type)
+	}
+}
+
 func TestWriteErrorResponseKeepsLegacyStatusCodesForGenericAuthErrors(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -65,6 +113,12 @@ func TestWriteErrorResponseKeepsLegacyStatusCodesForGenericAuthErrors(t *testing
 			status:     http.StatusUnauthorized,
 			sourceCode: "unauthorized",
 			wantCode:   "invalid_api_key",
+		},
+		{
+			name:       "forbidden",
+			status:     http.StatusForbidden,
+			sourceCode: "permission_denied",
+			wantCode:   "insufficient_quota",
 		},
 		{
 			name:       "rate limited",

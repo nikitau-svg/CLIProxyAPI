@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -361,38 +362,52 @@ func codexClaudeCodeReplaySessionKey(ctx context.Context, payload []byte, header
 	return sessionKey
 }
 
+func scopeCodexReasoningReplaySessionKey(ctx context.Context, sessionKey string) string {
+	sessionKey = strings.TrimSpace(sessionKey)
+	projectScope := helps.BravoProjectScope(ctx)
+	if sessionKey == "" || projectScope == "" {
+		return sessionKey
+	}
+	identity := strings.Join([]string{
+		"cli-proxy-api:codex:reasoning-replay:bravo-project-v1",
+		projectScope,
+		sessionKey,
+	}, "\x00")
+	return "bravo-project:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String()
+}
+
 func codexReasoningReplaySessionKey(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte) string {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
 		if sessionKey := codexClaudeCodeReplaySessionKey(ctx, req.Payload, opts.Headers); sessionKey != "" {
-			return sessionKey
+			return scopeCodexReasoningReplaySessionKey(ctx, sessionKey)
 		}
 	}
 	if value := metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
-		return "execution:" + value
+		return scopeCodexReasoningReplaySessionKey(ctx, "execution:"+value)
 	}
 	if value := metadataString(req.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
-		return "execution:" + value
+		return scopeCodexReasoningReplaySessionKey(ctx, "execution:"+value)
 	}
 	if value := codexReasoningReplaySessionKeyFromPayload(body); value != "" {
-		return value
+		return scopeCodexReasoningReplaySessionKey(ctx, value)
 	}
 	if value := codexReasoningReplaySessionKeyFromPayload(req.Payload); value != "" {
-		return value
+		return scopeCodexReasoningReplaySessionKey(ctx, value)
 	}
 	if value := codexReasoningReplaySessionKeyFromHeaders(opts.Headers); value != "" {
-		return value
+		return scopeCodexReasoningReplaySessionKey(ctx, value)
 	}
 	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		if value := codexReasoningReplaySessionKeyFromHeaders(ginCtx.Request.Header); value != "" {
-			return value
+			return scopeCodexReasoningReplaySessionKey(ctx, value)
 		}
 	}
 	if sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
 		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
-			return "prompt-cache:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
+			return scopeCodexReasoningReplaySessionKey(ctx, "prompt-cache:"+uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String())
 		}
 	}
 	return ""
@@ -1201,7 +1216,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newCodexStatusErr(httpResp.StatusCode, b)
+		err = newCodexStatusErrForClient(httpResp.StatusCode, b, identityState)
 		return resp, err
 	}
 	data, errRead := io.ReadAll(httpResp.Body)
@@ -1223,7 +1238,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 				return resp, errClearReplay
 			}
-			err = streamErr
+			err = codexTerminalStatusErrForClient(streamErr, terminalBody, identityState)
 			return resp, err
 		}
 
@@ -1353,7 +1368,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newCodexStatusErr(httpResp.StatusCode, b)
+		err = newCodexStatusErrForClient(httpResp.StatusCode, b, identityState)
 		return resp, err
 	}
 	data, err := io.ReadAll(httpResp.Body)
@@ -1474,7 +1489,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data)
+		err = newCodexStatusErrForClient(httpResp.StatusCode, data, identityState)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -1510,9 +1525,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						return
 					}
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx, streamErr)
+					clientStreamErr := codexTerminalStatusErrForClient(streamErr, terminalBody, identityState)
+					reporter.PublishFailure(ctx, clientStreamErr)
 					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+					case out <- cliproxyexecutor.StreamChunk{Err: clientStreamErr}:
 					case <-ctx.Done():
 					}
 					return
@@ -1769,6 +1785,7 @@ type codexIdentityConfuseState struct {
 	authID                 string
 	originalPromptCacheKey string
 	promptCacheKey         string
+	bravoPromptCache       codexBravoPromptCacheScope
 	turnIDs                []codexIdentityReplacement
 }
 
@@ -1777,12 +1794,103 @@ type codexIdentityReplacement struct {
 	confused string
 }
 
+type codexBravoPromptCacheScope struct {
+	clientKey  string
+	projectKey string
+}
+
+func (scope codexBravoPromptCacheScope) active() bool {
+	return strings.TrimSpace(scope.clientKey) != "" &&
+		strings.TrimSpace(scope.projectKey) != "" &&
+		scope.clientKey != scope.projectKey
+}
+
+func codexOpenAIResponsesPromptCache(ctx context.Context, req cliproxyexecutor.Request) (helps.CodexCache, codexBravoPromptCacheScope) {
+	promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
+	if !promptCacheKey.Exists() {
+		return helps.CodexCache{}, codexBravoPromptCacheScope{}
+	}
+
+	clientKey := promptCacheKey.String()
+	cache := helps.CodexCache{ID: clientKey}
+	projectScope := helps.BravoProjectScope(ctx)
+	if strings.TrimSpace(clientKey) == "" || projectScope == "" {
+		return cache, codexBravoPromptCacheScope{}
+	}
+
+	identity := strings.Join([]string{
+		"cli-proxy-api:codex:openai-responses:bravo-project-v1",
+		projectScope,
+		clientKey,
+	}, "\x00")
+	scope := codexBravoPromptCacheScope{
+		clientKey:  clientKey,
+		projectKey: uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String(),
+	}
+	cache.ID = scope.projectKey
+	return cache, scope
+}
+
+func applyCodexBravoPromptCacheBody(rawJSON []byte, scope codexBravoPromptCacheScope) []byte {
+	if len(rawJSON) == 0 || !scope.active() {
+		return rawJSON
+	}
+
+	rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", scope.projectKey)
+	if turnMetadata := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
+		updatedMetadata := turnMetadata
+		if gjson.Get(turnMetadata, "prompt_cache_key").Exists() {
+			updatedMetadata, _ = sjson.Set(updatedMetadata, "prompt_cache_key", scope.projectKey)
+		}
+		if gjson.Get(turnMetadata, "window_id").Exists() {
+			updatedMetadata, _ = sjson.Set(updatedMetadata, "window_id", scope.projectKey+":0")
+		}
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", updatedMetadata)
+	}
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-window-id").String()) != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-window-id", scope.projectKey+":0")
+	}
+	return rawJSON
+}
+
+func applyCodexBravoPromptCacheHeaders(headers http.Header, scope codexBravoPromptCacheScope) {
+	if headers == nil || !scope.active() {
+		return
+	}
+
+	if codexSessionHeaderValue(headers) != "" {
+		setCodexSessionHeaderCasePreserved(headers, "Session_id", scope.projectKey)
+	}
+	if headerValueCaseInsensitive(headers, "Conversation_id") != "" {
+		setHeaderCasePreserved(headers, "Conversation_id", scope.projectKey)
+	}
+	if rawTurnMetadata := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); rawTurnMetadata != "" {
+		updatedMetadata := rawTurnMetadata
+		if gjson.Get(rawTurnMetadata, "prompt_cache_key").Exists() {
+			updatedMetadata, _ = sjson.Set(updatedMetadata, "prompt_cache_key", scope.projectKey)
+		}
+		if gjson.Get(rawTurnMetadata, "window_id").Exists() {
+			updatedMetadata, _ = sjson.Set(updatedMetadata, "window_id", scope.projectKey+":0")
+		}
+		headers.Set("X-Codex-Turn-Metadata", updatedMetadata)
+	}
+	if headerValueCaseInsensitive(headers, "X-Codex-Window-Id") != "" {
+		headers.Set("X-Codex-Window-Id", scope.projectKey+":0")
+	}
+	for _, name := range []string{"X-Client-Request-Id", "Thread-Id"} {
+		if strings.TrimSpace(headerValueCaseInsensitive(headers, name)) == scope.clientKey {
+			headers.Set(name, scope.projectKey)
+		}
+	}
+}
+
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte, headerSets ...http.Header) (*http.Request, []byte, codexIdentityConfuseState, error) {
 	var headers http.Header
 	if len(headerSets) > 0 {
 		headers = headerSets[0]
 	}
 	var cache helps.CodexCache
+	var bravoPromptCache codexBravoPromptCacheScope
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
 		modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
 		if modelName == "" {
@@ -1796,10 +1904,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 			cache = cached
 		}
 	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
-		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
-		if promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
-		}
+		cache, bravoPromptCache = codexOpenAIResponsesPromptCache(ctx, req)
 	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
 		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
 			cache.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
@@ -1809,9 +1914,12 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if cache.ID != "" {
 		rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", cache.ID)
 	}
+	rawJSON = applyCodexBravoPromptCacheBody(rawJSON, bravoPromptCache)
 	rawJSON = helps.SanitizeCodexInputItemIDs(rawJSON)
+	identityUserPayload := applyCodexBravoPromptCacheBody(userPayload, bravoPromptCache)
 	var identityState codexIdentityConfuseState
-	rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
+	rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, identityUserPayload, rawJSON)
+	identityState.bravoPromptCache = bravoPromptCache
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
@@ -1854,6 +1962,9 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityConfuseState) {
 	if headers == nil {
 		return
+	}
+	if state != nil {
+		applyCodexBravoPromptCacheHeaders(headers, state.bravoPromptCache)
 	}
 	if state == nil || !state.enabled {
 		return
@@ -1907,7 +2018,219 @@ func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentity
 	for _, turnID := range state.turnIDs {
 		payload = replaceCodexIdentityResponsePayload(payload, turnID.confused, turnID.original)
 	}
-	return payload
+	return restoreCodexBravoPromptCacheResponsePayload(payload, state.bravoPromptCache)
+}
+
+func restoreCodexBravoPromptCacheResponsePayload(payload []byte, scope codexBravoPromptCacheScope) []byte {
+	if len(payload) == 0 || !scope.active() {
+		return payload
+	}
+
+	jsonStart := 0
+	for jsonStart < len(payload) && (payload[jsonStart] == ' ' || payload[jsonStart] == '\t' || payload[jsonStart] == '\r' || payload[jsonStart] == '\n') {
+		jsonStart++
+	}
+	if bytes.HasPrefix(payload[jsonStart:], []byte("data:")) {
+		jsonStart += len("data:")
+		for jsonStart < len(payload) && (payload[jsonStart] == ' ' || payload[jsonStart] == '\t') {
+			jsonStart++
+		}
+	}
+	jsonEnd := len(payload)
+	for jsonEnd > jsonStart && (payload[jsonEnd-1] == ' ' || payload[jsonEnd-1] == '\t' || payload[jsonEnd-1] == '\r' || payload[jsonEnd-1] == '\n') {
+		jsonEnd--
+	}
+	jsonPayload := payload[jsonStart:jsonEnd]
+	if len(jsonPayload) == 0 || !gjson.ValidBytes(jsonPayload) {
+		return payload
+	}
+
+	updated, changed := restoreCodexBravoPromptCacheJSONFields(jsonPayload, scope.projectKey, scope.clientKey)
+	if !changed {
+		return payload
+	}
+
+	rebuilt := make([]byte, 0, jsonStart+len(updated)+len(payload)-jsonEnd)
+	rebuilt = append(rebuilt, payload[:jsonStart]...)
+	rebuilt = append(rebuilt, updated...)
+	rebuilt = append(rebuilt, payload[jsonEnd:]...)
+	return rebuilt
+}
+
+type codexJSONReplacement struct {
+	start int
+	end   int
+	value []byte
+}
+
+// restoreCodexBravoPromptCacheJSONFields rewrites only JSON string values whose
+// field name is prompt_cache_key and whose complete value equals projectKey.
+// It deliberately walks arbitrary objects and arrays so wrapped provider errors
+// are handled without replacing IDs embedded in messages or unrelated fields.
+func restoreCodexBravoPromptCacheJSONFields(payload []byte, projectKey, clientKey string) ([]byte, bool) {
+	if len(payload) == 0 || projectKey == "" || clientKey == "" {
+		return payload, false
+	}
+
+	replacements := make([]codexJSONReplacement, 0, 2)
+	if _, ok := collectCodexBravoPromptCacheJSONReplacements(payload, 0, false, projectKey, clientKey, &replacements); !ok || len(replacements) == 0 {
+		return payload, false
+	}
+
+	size := len(payload)
+	for _, replacement := range replacements {
+		size += len(replacement.value) - (replacement.end - replacement.start)
+	}
+	updated := make([]byte, 0, size)
+	cursor := 0
+	for _, replacement := range replacements {
+		updated = append(updated, payload[cursor:replacement.start]...)
+		updated = append(updated, replacement.value...)
+		cursor = replacement.end
+	}
+	updated = append(updated, payload[cursor:]...)
+	return updated, true
+}
+
+func collectCodexBravoPromptCacheJSONReplacements(payload []byte, start int, promptCacheField bool, projectKey, clientKey string, replacements *[]codexJSONReplacement) (int, bool) {
+	pos := skipCodexJSONWhitespace(payload, start)
+	if pos >= len(payload) {
+		return pos, false
+	}
+
+	switch payload[pos] {
+	case '{':
+		pos++
+		for {
+			pos = skipCodexJSONWhitespace(payload, pos)
+			if pos >= len(payload) {
+				return pos, false
+			}
+			if payload[pos] == '}' {
+				return pos + 1, true
+			}
+
+			keyStart := pos
+			keyEnd, ok := scanCodexJSONString(payload, keyStart)
+			if !ok {
+				return pos, false
+			}
+			var key string
+			if err := json.Unmarshal(payload[keyStart:keyEnd], &key); err != nil {
+				return pos, false
+			}
+			pos = skipCodexJSONWhitespace(payload, keyEnd)
+			if pos >= len(payload) || payload[pos] != ':' {
+				return pos, false
+			}
+			pos, ok = collectCodexBravoPromptCacheJSONReplacements(payload, pos+1, key == "prompt_cache_key", projectKey, clientKey, replacements)
+			if !ok {
+				return pos, false
+			}
+			pos = skipCodexJSONWhitespace(payload, pos)
+			if pos >= len(payload) {
+				return pos, false
+			}
+			if payload[pos] == '}' {
+				return pos + 1, true
+			}
+			if payload[pos] != ',' {
+				return pos, false
+			}
+			pos++
+		}
+	case '[':
+		pos++
+		for {
+			pos = skipCodexJSONWhitespace(payload, pos)
+			if pos >= len(payload) {
+				return pos, false
+			}
+			if payload[pos] == ']' {
+				return pos + 1, true
+			}
+			var ok bool
+			pos, ok = collectCodexBravoPromptCacheJSONReplacements(payload, pos, false, projectKey, clientKey, replacements)
+			if !ok {
+				return pos, false
+			}
+			pos = skipCodexJSONWhitespace(payload, pos)
+			if pos >= len(payload) {
+				return pos, false
+			}
+			if payload[pos] == ']' {
+				return pos + 1, true
+			}
+			if payload[pos] != ',' {
+				return pos, false
+			}
+			pos++
+		}
+	case '"':
+		end, ok := scanCodexJSONString(payload, pos)
+		if !ok {
+			return pos, false
+		}
+		if promptCacheField {
+			var value string
+			if err := json.Unmarshal(payload[pos:end], &value); err != nil {
+				return pos, false
+			}
+			if value == projectKey {
+				encodedClientKey, err := json.Marshal(clientKey)
+				if err != nil {
+					return pos, false
+				}
+				*replacements = append(*replacements, codexJSONReplacement{
+					start: pos,
+					end:   end,
+					value: encodedClientKey,
+				})
+			}
+		}
+		return end, true
+	default:
+		end := pos
+		for end < len(payload) {
+			switch payload[end] {
+			case ',', '}', ']', ' ', '\t', '\r', '\n':
+				return end, end > pos
+			default:
+				end++
+			}
+		}
+		return end, end > pos
+	}
+}
+
+func scanCodexJSONString(payload []byte, start int) (int, bool) {
+	if start >= len(payload) || payload[start] != '"' {
+		return start, false
+	}
+	escaped := false
+	for pos := start + 1; pos < len(payload); pos++ {
+		switch {
+		case escaped:
+			escaped = false
+		case payload[pos] == '\\':
+			escaped = true
+		case payload[pos] == '"':
+			return pos + 1, true
+		}
+	}
+	return len(payload), false
+}
+
+func skipCodexJSONWhitespace(payload []byte, start int) int {
+	for start < len(payload) {
+		switch payload[start] {
+		case ' ', '\t', '\r', '\n':
+			start++
+		default:
+			return start
+		}
+	}
+	return start
 }
 
 func (state *codexIdentityConfuseState) confuseTurnID(turnID string) string {
@@ -2043,6 +2366,21 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func newCodexStatusErrForClient(statusCode int, internalBody []byte, state codexIdentityConfuseState) statusErr {
+	clientBody := internalBody
+	if state.bravoPromptCache.active() {
+		clientBody = applyCodexIdentityExposeResponsePayload(internalBody, state)
+	}
+	return newCodexStatusErr(statusCode, clientBody)
+}
+
+func codexTerminalStatusErrForClient(internalErr statusErr, internalBody []byte, state codexIdentityConfuseState) statusErr {
+	if !state.bravoPromptCache.active() {
+		return internalErr
+	}
+	return newCodexStatusErrForClient(internalErr.StatusCode(), internalBody, state)
 }
 
 func classifyCodexStatusError(statusCode int, body []byte) []byte {

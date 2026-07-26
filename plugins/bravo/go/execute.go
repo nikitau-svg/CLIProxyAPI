@@ -159,12 +159,21 @@ func nestedHostModelRequest(req rpcExecutorRequest, attempt executionAttempt, pr
 		SingleAttempt:   true,
 		AllowImageModel: protocol == protocolOpenAIImage,
 		Model:           physicalModel,
+		UsageAlias:      nestedUsageAlias(req, attempt),
 		Stream:          stream,
 		Body:            body,
 		Headers:         sanitizedNestedHeaders(req.Headers),
 		Query:           sanitizedNestedQuery(req.Query),
 		Alt:             req.Alt,
 	}
+}
+
+func nestedUsageAlias(req rpcExecutorRequest, attempt executionAttempt) string {
+	fallback := ""
+	if logicalName := strings.TrimSpace(attempt.LogicalModel); logicalName != "" {
+		fallback = loadedConfig().Prefix + logicalName
+	}
+	return clientLogicalModelID(req.Model, fallback)
 }
 
 func prepareBravoExecution(req rpcExecutorRequest) (string, logicalModel, pluginConfig, *executionFailure) {

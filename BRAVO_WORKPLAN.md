@@ -153,6 +153,27 @@ the decisions survive across sessions.
   return a precise 422 before any upstream call.
 - Linux/arm64 shared-plugin build in the canary Dockerfile.
 
+## Bravo 0.7.5 source, canary, and production evidence
+
+- Per-project Claude prompt-cache TTL is managed in the standard Management
+  Center as `auto`, `5m`, or `1h`; OpenAI/Codex is explicitly
+  `provider_managed`.
+- CLIProxyAPI core applies trusted Bravo cache metadata after translation in
+  execute, stream, token-count, retry, and pre-response fallback paths.
+- Full Go tests/builds, Bravo race/vet/build, Management Center tests/lint/
+  typecheck/build, management smoke, and Chrome/Playwright QA passed.
+- The exact production image is
+  `cliproxyapi-local:v7.2.94-bravo-native0.7.5-d1a76342`
+  (`sha256:b05b66f484502593fdc7da04e5dc161dd867d0ae9f44049dd324bfef40fbb6de`).
+- A live Claude subscription probe produced a 72,399-token cache write and an
+  identical 72,399-token cache read. A live Codex-primary Responses probe
+  reported 15,104 cached tokens on its second identical request.
+- Both probes used temporary projects and deleted them. Production retained
+  seven original projects, five subscriptions, healthy container status, and
+  zero restart loops after the single cutover.
+- Analytics schema v2 records cache creation, cache read, and provider cached
+  tokens in project/subscription/model breakdowns.
+
 ## Bravo 0.6 source and canary evidence
 
 - Full CLIProxyAPI `go test ./... -count=1` passed after the Opus 5,

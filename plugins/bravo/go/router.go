@@ -106,24 +106,39 @@ func routeModel(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "bravo_disabled"})
 	}
 	_, smartKeyAuthenticated := smartKeyForRoute(req, cfg)
-	logicalName, model, ok := resolveLogicalModel(cfg, req.RequestedModel)
+	logicalName, _, ok := resolveLogicalModel(cfg, req.RequestedModel)
 	if !ok && smartKeyAuthenticated {
-		logicalName, model, ok = resolveUnprefixedLogicalModel(cfg, req.RequestedModel)
+		logicalName, _, ok = resolveUnprefixedLogicalModel(cfg, req.RequestedModel)
 	}
 	if !ok {
-		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
-	}
-	if !hasAnyAvailableProvider(req.AvailableProviders, model.Candidates) {
+		requested := strings.ToLower(strings.TrimSpace(req.RequestedModel))
+		isBravoNamespace := strings.HasPrefix(requested, strings.ToLower(cfg.Prefix))
+		if !isBravoNamespace && !smartKeyAuthenticated {
+			return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+		}
+		// A recognized Bravo project key is itself an authorization boundary.
+		// Unknown prefixed models and unknown unprefixed models requested with
+		// that key must reach prepareBravoExecution, which returns a fail-closed
+		// bravo_model_unknown response. Declining here would let the native host
+		// serve a newly discovered model outside the project's model scope,
+		// allowed_auth_ids, allocator, analytics, and retry policy.
+		reason := "bravo_unknown_prefixed_model"
+		if !isBravoNamespace {
+			reason = "bravo_project_model_gate"
+		}
 		return okEnvelope(pluginapi.ModelRouteResponse{
-			Handled: false,
-			Reason:  "bravo_no_candidate_provider",
+			Handled:    true,
+			TargetKind: pluginapi.ModelRouteTargetSelf,
+			Reason:     reason,
 		})
 	}
 	// Route a recognized prefixed model to the executor even when the request
-	// lacks a valid smart key. Model-router errors are treated as "decline" by
-	// the host, which would otherwise fall through to native routing and turn a
-	// precise 401/403 into a misleading provider 503. prepareBravoExecution is
-	// the authoritative smart-key and model-scope gate.
+	// lacks a valid smart key or no candidate provider is currently available.
+	// Model-router errors are treated as "decline" by the host, which would
+	// otherwise fall through to native routing and turn a precise 401/403 into
+	// a misleading provider 503. prepareBravoExecution is the authoritative
+	// smart-key and model-scope gate; the executor reports pool exhaustion after
+	// those fail-closed checks pass.
 	return okEnvelope(pluginapi.ModelRouteResponse{
 		Handled:    true,
 		TargetKind: pluginapi.ModelRouteTargetSelf,
@@ -156,22 +171,6 @@ func resolveUnprefixedLogicalModel(cfg pluginConfig, requested string) (string, 
 	name := strings.ToLower(strings.Trim(strings.TrimSpace(requested), "/"))
 	item, ok := cfg.Models[name]
 	return name, item, ok
-}
-
-func hasAnyAvailableProvider(available []string, candidates []candidate) bool {
-	if len(available) == 0 {
-		return false
-	}
-	set := make(map[string]struct{}, len(available))
-	for _, provider := range available {
-		set[normalizeProvider(provider)] = struct{}{}
-	}
-	for _, item := range candidates {
-		if _, ok := set[normalizeProvider(item.Provider)]; ok {
-			return true
-		}
-	}
-	return false
 }
 
 func pickPinnedAuth(raw []byte) ([]byte, error) {

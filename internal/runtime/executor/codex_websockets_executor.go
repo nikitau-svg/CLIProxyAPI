@@ -350,13 +350,18 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	body, wsHeaders, errPromptCache := applyCodexPromptCacheHeadersWithContext(ctx, from, req, body, opts.Headers)
+	clientBody := body
+	body, wsHeaders, bravoPromptCache, errPromptCache := applyCodexPromptCacheHeadersWithContextAndScope(ctx, from, req, body, opts.Headers)
 	if errPromptCache != nil {
 		return resp, errPromptCache
 	}
-	clientBody := body
+	if !bravoPromptCache.active() {
+		clientBody = body
+	}
+	identityUserPayload := applyCodexBravoPromptCacheBody(originalPayloadSource, bravoPromptCache)
 	var identityState codexIdentityConfuseState
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, identityUserPayload, body)
+	identityState.bravoPromptCache = bravoPromptCache
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
@@ -401,7 +406,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
-			return resp, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+			return resp, codexWebsocketHandshakeErrorForClient(respHS.StatusCode, bodyErr, identityState)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		return resp, errDial
@@ -469,8 +474,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					return resp, errSendRetry
 				}
 			} else {
-				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
+				bodyErrRetry := websocketHandshakeBody(respHSRetry)
+				if respHSRetry != nil {
+					helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHSRetry.StatusCode, respHSRetry.Header.Clone(), bodyErrRetry)
+				}
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
+				if respHSRetry != nil && respHSRetry.StatusCode > 0 {
+					return resp, codexWebsocketHandshakeErrorForClient(respHSRetry.StatusCode, bodyErrRetry, identityState)
+				}
 				return resp, errDialRetry
 			}
 		} else {
@@ -519,13 +530,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				return resp, errClearReplay
 			}
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
-			return resp, wsErr
+			return resp, codexWebsocketErrorForClient(payload, wsErr, identityState)
 		}
 		if streamErr, terminalBody, ok := codexTerminalFailureErr(payload); ok {
 			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 				return resp, errClearReplay
 			}
-			return resp, streamErr
+			return resp, codexTerminalStatusErrForClient(streamErr, terminalBody, identityState)
 		}
 
 		payload = normalizeCodexWebsocketCompletion(payload)
@@ -602,13 +613,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 
-	body, wsHeaders, errPromptCache := applyCodexPromptCacheHeadersWithContext(ctx, from, req, body, opts.Headers)
+	clientBody := body
+	body, wsHeaders, bravoPromptCache, errPromptCache := applyCodexPromptCacheHeadersWithContextAndScope(ctx, from, req, body, opts.Headers)
 	if errPromptCache != nil {
 		return nil, errPromptCache
 	}
-	clientBody := body
+	if !bravoPromptCache.active() {
+		clientBody = body
+	}
+	identityUserPayload := applyCodexBravoPromptCacheBody(originalPayloadSource, bravoPromptCache)
 	var identityState codexIdentityConfuseState
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, identityUserPayload, body)
+	identityState.bravoPromptCache = bravoPromptCache
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
@@ -656,7 +672,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
-			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+			return nil, codexWebsocketHandshakeErrorForClient(respHS.StatusCode, bodyErr, identityState)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		if sess != nil {
@@ -690,10 +706,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			// Retry once with a new websocket connection for the same execution session.
 			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry != nil || connRetry == nil {
-				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
+				bodyErrRetry := websocketHandshakeBody(respHSRetry)
+				if respHSRetry != nil {
+					helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHSRetry.StatusCode, respHSRetry.Header.Clone(), bodyErrRetry)
+				}
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
+				if respHSRetry != nil && respHSRetry.StatusCode > 0 {
+					return nil, codexWebsocketHandshakeErrorForClient(respHSRetry.StatusCode, bodyErrRetry, identityState)
+				}
 				return nil, errDialRetry
 			}
 			conn = connRetry
@@ -825,8 +847,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					return
 				}
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
-				reporter.PublishFailure(ctx, wsErr)
-				_ = send(cliproxyexecutor.StreamChunk{Err: wsErr})
+				clientWSErr := codexWebsocketErrorForClient(payload, wsErr, identityState)
+				reporter.PublishFailure(ctx, clientWSErr)
+				_ = send(cliproxyexecutor.StreamChunk{Err: clientWSErr})
 				return
 			}
 			if streamErr, terminalBody, ok := codexTerminalFailureErr(payload); ok {
@@ -840,8 +863,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					return
 				}
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", streamErr)
-				reporter.PublishFailure(ctx, streamErr)
-				_ = send(cliproxyexecutor.StreamChunk{Err: streamErr})
+				clientStreamErr := codexTerminalStatusErrForClient(streamErr, terminalBody, identityState)
+				reporter.PublishFailure(ctx, clientStreamErr)
+				_ = send(cliproxyexecutor.StreamChunk{Err: clientStreamErr})
 				return
 			}
 
@@ -1113,9 +1137,14 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 }
 
 func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, headerSets ...http.Header) ([]byte, http.Header, error) {
+	body, headers, _, err := applyCodexPromptCacheHeadersWithContextAndScope(ctx, from, req, rawJSON, headerSets...)
+	return body, headers, err
+}
+
+func applyCodexPromptCacheHeadersWithContextAndScope(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, headerSets ...http.Header) ([]byte, http.Header, codexBravoPromptCacheScope, error) {
 	headers := http.Header{}
 	if len(rawJSON) == 0 {
-		return rawJSON, headers, nil
+		return rawJSON, headers, codexBravoPromptCacheScope{}, nil
 	}
 
 	var requestHeaders http.Header
@@ -1123,6 +1152,7 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 		requestHeaders = headerSets[0]
 	}
 	var cache helps.CodexCache
+	var bravoPromptCache codexBravoPromptCacheScope
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
 		modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
 		if modelName == "" {
@@ -1130,15 +1160,13 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 		}
 		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, requestHeaders)
 		if errCache != nil {
-			return nil, nil, errCache
+			return nil, nil, codexBravoPromptCacheScope{}, errCache
 		}
 		if ok {
 			cache = cached
 		}
 	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
-		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
-		}
+		cache, bravoPromptCache = codexOpenAIResponsesPromptCache(ctx, req)
 	}
 
 	if cache.ID != "" {
@@ -1146,8 +1174,9 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 		setHeaderCasePreserved(headers, "session_id", cache.ID)
 		headers.Set("Conversation_id", cache.ID)
 	}
+	rawJSON = applyCodexBravoPromptCacheBody(rawJSON, bravoPromptCache)
 
-	return rawJSON, headers, nil
+	return rawJSON, headers, bravoPromptCache, nil
 }
 
 func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
@@ -1448,6 +1477,21 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 		statusErr: statusError,
 		headers:   headers,
 	}, true
+}
+
+func codexWebsocketErrorForClient(internalPayload []byte, internalErr error, state codexIdentityConfuseState) error {
+	if !state.bravoPromptCache.active() {
+		return internalErr
+	}
+	clientPayload := applyCodexIdentityExposeResponsePayload(internalPayload, state)
+	if clientErr, ok := parseCodexWebsocketError(clientPayload); ok {
+		return clientErr
+	}
+	return internalErr
+}
+
+func codexWebsocketHandshakeErrorForClient(statusCode int, internalBody []byte, state codexIdentityConfuseState) statusErr {
+	return newCodexStatusErrForClient(statusCode, internalBody, state)
 }
 
 func clearCodexReasoningReplayOnWebsocketError(ctx context.Context, scope codexReasoningReplayScope, payload []byte) error {

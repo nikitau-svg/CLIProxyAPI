@@ -2003,7 +2003,11 @@ func writeResponsesWebsocketError(writer *responsesWebsocketWriter, wsTimelineLo
 		}
 	}
 
-	body := handlers.BuildErrorResponseBody(status, errText)
+	errorCode := ""
+	if errMsg != nil {
+		errorCode = handlers.PreservedErrorCode(status, errMsg.Error)
+	}
+	body := handlers.BuildErrorResponseBodyWithCode(status, errText, errorCode)
 	payload := []byte(`{}`)
 	var errSet error
 	payload, errSet = sjson.SetBytes(payload, "type", wsEventTypeError)
