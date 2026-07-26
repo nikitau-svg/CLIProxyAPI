@@ -3,6 +3,33 @@
 This file tracks the project requirements and the current implementation so
 the decisions survive across sessions.
 
+## Mandatory release gate
+
+Every Bravo production change follows this order without skipping or
+reordering stages:
+
+1. Write the test plan and define the expected failure before changing code.
+2. Implement the smallest reviewed change.
+3. Build and deploy an isolated canary without modifying production state.
+4. Run focused regression tests, the relevant full test suites, and a
+   protocol-level canary smoke that proves the real fallback path.
+5. Only after every check is green, commit and publish the exact tested source
+   to GitHub.
+6. Deploy the image built from that published source with one short production
+   cutover and run a read-only smoke test.
+7. Remove disposable canary containers, temporary build contexts, unused
+   candidate images, and task-owned Docker build cache without pruning images
+   or volumes still used by production.
+
+Any failed or incomplete stage stops the release before GitHub or production.
+The tested commit, image ID, canary evidence, production smoke, and cleanup
+result are recorded in this file.
+
+Before any Go or Docker build, the host must have at least 10 GiB free. Heavy
+test/build jobs run sequentially. If the guard fails, the release stops and
+only exact task-owned builders, candidate images, and caches may be removed;
+shared Docker prune commands are forbidden.
+
 ## Product requirements captured
 
 - Bravo is a configurable smart policy inside CLIProxyAPI, not a separate
@@ -74,10 +101,13 @@ the decisions survive across sessions.
   controls.
 - Structured non-stream and stream errors with `Retry-After`.
 - Semantic account-quota retry classification. Anthropic's HTTP 400
-  `out of extra usage` signal is converted to
+  `out of extra usage` and
+  `Third-party apps now draw from your extra usage` signals are converted to
   `bravo_subscription_quota_exhausted`, so the same client call can continue
   through another Claude account and then a mapped Codex candidate; unrelated
-  invalid-request 400s remain terminal.
+  invalid-request 400s remain terminal. The reviewed quota failure cools the
+  exhausted credential across Claude models, while 429 and upstream faults
+  retain their physical-model scope.
 - No stream fallback after the first client-visible payload.
 - OpenAI Chat, OpenAI Responses, and Anthropic Messages request-contract
   detection.
@@ -152,6 +182,81 @@ the decisions survive across sessions.
 - Synchronous stream capability preflight, so unsupported streaming requests
   return a precise 422 before any upstream call.
 - Linux/arm64 shared-plugin build in the canary Dockerfile.
+
+## Bravo 0.7.7 source and canary evidence
+
+- The test plan is recorded in
+  `plugins/bravo/QUOTA_FAILOVER_TEST_PLAN.md`. Before the classifier changed,
+  the exact Maria-OpenClaw message produced four expected red failures:
+  host classification, pre-commit streaming, full Claude-to-Codex fallback,
+  and cross-model credential cooldown.
+- Three additional red tests reproduced the pre-built-plan defect with
+  `max_attempts: 2` in regular execution, token counting, and streaming:
+  a newly cooled same-account Claude sibling consumed the final plan slot and
+  hid the eligible Codex fallback.
+- The classifier uses the precise reviewed signal
+  `third-party apps now draw from your extra usage`. Generic malformed,
+  schema, and tool-choice HTTP 400 errors remain terminal. Quota evidence is
+  aggregated across the host error code, message, response body, and stream
+  detail, so an earlier generic usage-limit field cannot hide a later exact
+  account-wide Anthropic signal.
+- Confirmed account-quota exhaustion now cools the credential across Claude
+  models. HTTP 429, upstream faults, and model-entitlement errors retain their
+  previous physical-model scope. `max_attempts` caps actual upstream calls;
+  cooldown, contract, and unavailable-lease skips do not spend the budget.
+- Focused quota/fallback/fail-closed tests passed, followed by the full Bravo
+  test suite, explicit hard-cap tests for execute/count/stream, the Bravo race
+  detector, vet, and shared-plugin build. The full CLIProxyAPI Go test suite
+  and repository-wide build also passed sequentially.
+- The pre-publish Linux/arm64 canary image was
+  `cliproxyapi-local:v7.2.94-bravo-native0.7.7-canary-review3-ui9578c1a`
+  (`sha256:250a33332fbf5dc543693939d0b6a99d9c9f262852eaf69fbe8e0a1e8fff00a7`).
+  Its binary reports
+  `v7.2.94-bravo-native0.7.7-canary-review3`/`prepublish-review3`.
+  It embedded the current production Management UI
+  `9578c1aaa24884847aca61dfe3ce9340c538c08b`
+  (`sha256:a971f98da6f816d67604d461c76d592b102a4c3c1c428f52e065581ad22a55be`).
+- The isolated canary used no real credentials or subscription tokens. A fake
+  Claude endpoint returned the verbatim production HTTP 400 and a fake Codex
+  endpoint returned a valid Responses stream. `bravo/sonnet` completed through
+  Codex Terra in the same downstream stream, with the Claude event normalized
+  to retryable `bravo_subscription_quota_exhausted`.
+- An immediate `bravo/haiku` request skipped the same cooled-down Claude
+  credential and completed through Codex Luna. The mock observed exactly one
+  Claude Sonnet call followed by Codex Terra and Codex Luna. The temporary
+  project was deleted; the canary was healthy with zero restarts, was removed,
+  and ports 18319/18991 were released.
+- Chrome/Playwright verified the integrated production Management page after
+  service recovery. Refreshing quotas completed in roughly two seconds; all
+  five accounts showed provider-confirmed `только что`, the refresh button
+  re-enabled, no UI alert appeared, and the 1470 px viewport had no horizontal
+  overflow. No subscription or project setting was changed.
+
+### Release safety incident and guard
+
+- Multiple heavyweight builds were mistakenly started concurrently and reduced
+  Mac mini free space to roughly 156 MiB. Docker Desktop's network/API proxy
+  then stalled, so every container lost outbound provider access even though
+  the production container still reported healthy.
+- The production image, compose configuration, keys, plugin data, and project
+  state were not changed by the incident. Docker Desktop was restarted and the
+  exact previous production image recovered with outbound networking.
+- The release gate now requires at least 10 GiB free, forbids concurrent heavy
+  builds, and allows only exact task-owned cache cleanup.
+
+### Tracked follow-up: Claude Code auto-mode safety classifier
+
+- Claude Code 2.1.220 can spend nearly its whole 60-second caller deadline on
+  the first Claude safety-classifier attempt. Codex may then be selected with
+  less than two seconds remaining and receive `context canceled`, after which
+  Claude Code reports that it cannot determine whether `Edit` is safe.
+- Bravo 0.7.7 fixes the exact quota classification and avoids poisoning Codex
+  with a same-account Claude retry, but it does not reserve fallback time from
+  the caller deadline.
+- A separate release must first normalize caller cancellation as a stable
+  non-retryable 499 without cooldown, then design a Core + SDK + Bravo
+  deadline-aware attempt budget that preserves 10–15 seconds for fallback.
+  This broader contract change is intentionally not mixed into the quota patch.
 
 ## Bravo 0.7.6 source and canary evidence
 

@@ -166,8 +166,10 @@ func TestAllocatorBypassIsInertWithoutAllocatorRejections(t *testing.T) {
 	}
 }
 
-// MaxAttempts caps the bypass the same way it caps a normal plan.
-func TestAllocatorBypassRespectsMaxAttempts(t *testing.T) {
+// Planning keeps every eligible fallback. MaxAttempts is a provider-call
+// budget enforced by the execution loops, so a candidate skipped after the
+// plan was built cannot consume the budget or hide a later provider.
+func TestAllocatorBypassDoesNotSpendProviderCallBudgetWhilePlanning(t *testing.T) {
 	isolateBravoCooldowns(t)
 	now := time.Now()
 	previous := loadedConfig()
@@ -191,8 +193,8 @@ func TestAllocatorBypassRespectsMaxAttempts(t *testing.T) {
 		Reason:   "withheld",
 	}}
 	plan := allocatorBypassPlan("opus", model, textContract(), auths, rejections, "", now)
-	if len(plan) != 1 {
-		t.Fatalf("bypass plan length = %d, want 1 under MaxAttempts=1", len(plan))
+	if len(plan) != 2 {
+		t.Fatalf("bypass plan length = %d, want both eligible accounts before runtime budgeting", len(plan))
 	}
 }
 

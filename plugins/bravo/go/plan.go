@@ -122,9 +122,6 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 			allocated.RequestedEffort = requestedEffortValue(contract.Effort)
 			allocated.EffectiveEffort = normalizeEffort(resolved.Effort)
 			plan = append(plan, allocated)
-			if cfg.MaxAttempts > 0 && len(plan) >= cfg.MaxAttempts {
-				return plan, nil
-			}
 		}
 	}
 	if len(plan) == 0 {
@@ -175,7 +172,6 @@ func allocatorBypassPlan(
 		return nil
 	}
 	plan := make([]executionAttempt, 0, len(withheld))
-	cfg := loadedConfig()
 	for _, item := range model.Candidates {
 		resolved, errContract := resolveCandidateContract(item, contract)
 		if errContract != nil {
@@ -200,9 +196,6 @@ func allocatorBypassPlan(
 				// these, and re-checking its floors here would withhold them again.
 				AllocatorManaged: false,
 			})
-			if cfg.MaxAttempts > 0 && len(plan) >= cfg.MaxAttempts {
-				return plan
-			}
 		}
 	}
 	return plan
@@ -501,9 +494,11 @@ func setCooldown(provider, authID, model, reason string, until time.Time) {
 	runtimeState.Unlock()
 }
 
-// accountWideCooldownStatuses lists the failures that invalidate the whole
-// credential rather than a single model. Everything else (rate limits, quota
-// exhaustion, transient upstream errors) is scoped to the model that failed.
+// accountWideCooldownStatus lists HTTP statuses that invalidate the whole
+// credential rather than a single model. Reviewed account-quota signals carry
+// an explicit internal scope from the precise provider message; ambiguous
+// quota text, model rate limits and transient upstream errors remain scoped to
+// the physical model that failed.
 func accountWideCooldownStatus(status int) bool {
 	switch status {
 	case http.StatusUnauthorized, http.StatusForbidden:

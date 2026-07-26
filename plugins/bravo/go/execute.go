@@ -14,12 +14,13 @@ import (
 )
 
 type executionFailure struct {
-	Code       string
-	Message    string
-	Status     int
-	Retryable  bool
-	Headers    http.Header
-	RetryAfter string
+	Code        string
+	Message     string
+	Status      int
+	Retryable   bool
+	AccountWide bool
+	Headers     http.Header
+	RetryAfter  string
 }
 
 func execute(raw []byte) ([]byte, error) {
@@ -60,7 +61,11 @@ func execute(raw []byte) ([]byte, error) {
 
 	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
 	var lastFailure executionFailure
+	providerCalls := 0
 	for _, attempt := range plan {
+		if skipCoolingExecutionAttempt(attempt, &lastFailure) {
+			continue
+		}
 		if errPreflight := verifyCandidateContract(attempt.Candidate, contract); errPreflight != nil {
 			lastFailure = contractFailure(errPreflight)
 			continue
@@ -75,10 +80,14 @@ func execute(raw []byte) ([]byte, error) {
 				Status:  http.StatusBadRequest,
 			}), nil
 		}
+		if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
+			break
+		}
 		releaseLease, acquired := acquireAttemptLease(attempt)
 		if !acquired {
 			continue
 		}
+		providerCalls++
 		started := time.Now()
 		responseRaw, errCall := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{
 			HostModelExecutionRequest: nestedHostModelRequest(req, attempt, protocol, physicalModel, candidateBody, false),
@@ -359,28 +368,50 @@ func classifyProviderFailureSignal(failure executionFailure, values ...string) e
 // retry on another credential or provider; ordinary malformed-request 400s
 // remain terminal so Bravo never hides a client contract error.
 func classifyProviderQuotaSignal(failure executionFailure, values ...string) executionFailure {
+	matched := false
 	for _, value := range values {
-		if !providerQuotaSignal(value) {
-			continue
+		accountWide := providerAccountWideQuotaSignal(value)
+		if accountWide {
+			failure.AccountWide = true
 		}
+		matched = matched || accountWide || providerQuotaSignal(value)
+	}
+	if matched {
 		failure.Code = "bravo_subscription_quota_exhausted"
 		failure.Retryable = true
-		return failure
 	}
 	return failure
 }
 
 func providerQuotaSignal(value string) bool {
+	if providerAccountWideQuotaSignal(value) {
+		return true
+	}
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return false
+	}
+	for _, signal := range []string{
+		"reached your usage limit",
+		"usage limit has been reached",
+	} {
+		if strings.Contains(value, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerAccountWideQuotaSignal(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {
 		return false
 	}
 	for _, signal := range []string{
 		"out of extra usage",
+		"third-party apps now draw from your extra usage",
 		"extra usage is disabled",
 		"extra usage limit",
-		"reached your usage limit",
-		"usage limit has been reached",
 	} {
 		if strings.Contains(value, signal) {
 			return true
@@ -441,13 +472,38 @@ func applyFailureCooldown(attempt executionAttempt, failure executionFailure) {
 	if until.IsZero() {
 		until = time.Now().Add(time.Duration(loadedConfig().CooldownSeconds) * time.Second)
 	}
-	// Credential-level rejections disable the account everywhere; a rate limit
-	// or upstream fault only disables the model that hit it.
+	// Credential-level rejections and reviewed account-quota exhaustion disable
+	// the account everywhere. A model rate limit or upstream fault only disables
+	// the physical model that hit it.
 	model := attempt.Candidate.Model
-	if accountWideCooldownStatus(failure.Status) {
+	if failure.AccountWide || accountWideCooldownStatus(failure.Status) {
 		model = ""
 	}
 	setCooldown(attempt.Candidate.Provider, pinnedAuthID(attempt.Auth), model, failure.Code, until)
+}
+
+func skipCoolingExecutionAttempt(attempt executionAttempt, lastFailure *executionFailure) bool {
+	if !cooldownActive(
+		attempt.Candidate.Provider,
+		pinnedAuthID(attempt.Auth),
+		attempt.Candidate.Model,
+		time.Now(),
+	) {
+		return false
+	}
+	if lastFailure != nil && lastFailure.Code == "" {
+		*lastFailure = executionFailure{
+			Code:      "bravo_subscription_cooling_down",
+			Message:   "A candidate subscription entered cooldown after the execution plan was built.",
+			Status:    http.StatusServiceUnavailable,
+			Retryable: true,
+		}
+	}
+	return true
+}
+
+func providerCallBudgetExhausted(maxAttempts, providerCalls int) bool {
+	return maxAttempts > 0 && providerCalls >= maxAttempts
 }
 
 func retryAfterTime(value string, now time.Time) time.Time {
