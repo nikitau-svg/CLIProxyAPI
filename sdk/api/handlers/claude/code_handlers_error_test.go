@@ -126,3 +126,48 @@ func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
 		t.Fatalf("pending error = %p, want %p", gotErr, wantErr)
 	}
 }
+
+// bravoStreamFailure models the terminal error a Bravo stream close produces
+// when the pool is exhausted before any bytes reach the client.
+type bravoStreamFailure struct {
+	message    string
+	status     int
+	code       string
+	retryAfter string
+}
+
+func (e bravoStreamFailure) Error() string           { return e.message }
+func (e bravoStreamFailure) StatusCode() int         { return e.status }
+func (e bravoStreamFailure) ErrorCode() string       { return e.code }
+func (e bravoStreamFailure) RetryAfterValue() string { return e.retryAfter }
+
+// The Claude endpoint carries the whole failover contract: 503, the machine
+// readable code, and the backoff hint. The status and code already survived;
+// the header was silently dropped because passthrough-headers is off in prod.
+func TestClaudeWriteErrorResponseEmitsRetryAfter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	handler := &ClaudeCodeAPIHandler{}
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error: bravoStreamFailure{
+			message:    "bravo_no_eligible_account: Bravo has no healthy account for logical model opus",
+			status:     http.StatusServiceUnavailable,
+			code:       "bravo_no_eligible_account",
+			retryAfter: "30",
+		},
+	})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "30" {
+		t.Fatalf("Retry-After = %q, want %q", got, "30")
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.code").String(); got != "bravo_no_eligible_account" {
+		t.Fatalf("error.code = %q, want %q", got, "bravo_no_eligible_account")
+	}
+}

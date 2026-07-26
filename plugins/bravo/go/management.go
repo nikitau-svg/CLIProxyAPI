@@ -67,6 +67,7 @@ const (
 	bravoAuthDisabled    bravoAuthHealth = "disabled"
 	bravoAuthUnavailable bravoAuthHealth = "unavailable"
 	bravoAuthError       bravoAuthHealth = "error"
+	bravoAuthExhausted   bravoAuthHealth = "quota_exhausted"
 
 	bravoStatusAuthUnavailable = "auth_status_unavailable"
 )
@@ -283,6 +284,13 @@ func configuredBravoProviders(cfg pluginConfig) map[string]struct{} {
 	return providers
 }
 
+// classifyBravoAuthHealth reports credential-wide health, ignoring per-model
+// state. Use classifyBravoAuthHealthForModel for routing: the fields read here
+// are roll-ups that a single failing model already poisons, so this function
+// alone would drop a credential that still serves its other models.
+//
+// Only whole-credential conditions belong here — the summary view and the quota
+// refresher have no model in hand and need exactly this verdict.
 func classifyBravoAuthHealth(provider string, auth pluginapi.HostAuthFileEntry, now time.Time) bravoAuthHealth {
 	status := strings.ToLower(strings.TrimSpace(auth.Status))
 	if auth.Disabled || status == "disabled" {
@@ -301,10 +309,157 @@ func classifyBravoAuthHealth(provider string, auth pluginapi.HostAuthFileEntry, 
 	if authID == "" {
 		return bravoAuthUnavailable
 	}
-	if cooldownActive(provider, authID, now) {
+	if cooldownActive(provider, authID, "", now) {
 		return bravoAuthCooldown
 	}
 	return bravoAuthReady
+}
+
+// classifyBravoAuthHealthForModel narrows credential health to a single model,
+// and is the only classifier routing may use.
+//
+// A credential carries two layers of health: per-model state, and a
+// credential-wide roll-up derived from it. The roll-up is lossy in one
+// direction — the host marks the whole credential StatusError as soon as *one*
+// model fails, and aggregates NextRetryAfter only when *every* model is cooling.
+// So when the model has its own state, that state is authoritative and the
+// roll-up must be ignored; this is exactly what the host's native selector does
+// (isAuthBlockedForModel), and reading the roll-up instead is what made
+// bravo/<model> answer 503 while the same credential served the unprefixed model
+// in the same second.
+//
+// Quota is deliberately excluded from classifyBravoAuthHealth itself: the quota
+// refresher gates on that function, so treating an exhausted account as unhealthy
+// there would stop the refresh that later restores it.
+func classifyBravoAuthHealthForModel(provider string, auth pluginapi.HostAuthFileEntry, model string, now time.Time) bravoAuthHealth {
+	if health := classifyBravoAuthHealthGate(provider, auth, model, now); health != bravoAuthReady {
+		return health
+	}
+	if cooldownActive(provider, strings.TrimSpace(auth.ID), model, now) {
+		return bravoAuthCooldown
+	}
+	if quotaExhaustedForModel(auth.AuthIndex, model) {
+		return bravoAuthExhausted
+	}
+	return bravoAuthReady
+}
+
+// classifyBravoAuthHealthGate resolves the host-reported health of one model,
+// preferring the model's own state over the credential-wide roll-up.
+func classifyBravoAuthHealthGate(provider string, auth pluginapi.HostAuthFileEntry, model string, now time.Time) bravoAuthHealth {
+	// Disabled is an operator decision about the whole credential, never a
+	// consequence of one model failing, so it outranks per-model state.
+	if auth.Disabled || strings.EqualFold(strings.TrimSpace(auth.Status), "disabled") {
+		return bravoAuthDisabled
+	}
+	state, ok := hostModelState(auth, model)
+	if !ok {
+		// No per-model state: the roll-up is all the host has. Read only the part
+		// of it that carries a deadline.
+		//
+		// A bare status of "error" or "unavailable" with no NextRetryAfter is a
+		// stuck flag, not a cooldown: the host clears it in
+		// clearAuthStateOnSuccess, which only runs when a request succeeds. Its
+		// own selector never blocks on it (isAuthBlockedForModel reads
+		// Disabled/StatusDisabled and then a deadline), so it keeps sending
+		// traffic and the flag clears itself. Bravo refusing the credential
+		// instead removes the only thing that could clear it, and the account
+		// stays out of the pool for good — which is what a transient network
+		// error such as "unexpected EOF" or a SOCKS hiccup produced in
+		// production.
+		return classifyBravoAuthHealthDeadline(provider, auth, now)
+	}
+	if strings.EqualFold(strings.TrimSpace(state.Status), "disabled") {
+		return bravoAuthDisabled
+	}
+	// An unavailable model with no deadline, or one whose deadline has passed, is
+	// usable again — the host clears those lazily, on the next state update.
+	if state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
+		return bravoAuthCooldown
+	}
+	if state.QuotaExceeded && !state.QuotaRecoverAt.IsZero() && state.QuotaRecoverAt.After(now) {
+		return bravoAuthCooldown
+	}
+	// The credential-level ID check still applies: routing needs an identifier.
+	if strings.TrimSpace(auth.ID) == "" {
+		return bravoAuthUnavailable
+	}
+	if cooldownActive(provider, strings.TrimSpace(auth.ID), "", now) {
+		return bravoAuthCooldown
+	}
+	return bravoAuthReady
+}
+
+// classifyBravoAuthHealthDeadline is the routing verdict for a credential the
+// host reports no per-model state for. It mirrors the native selector: only a
+// live deadline blocks, because every other roll-up field is cleared by a
+// successful request and blocking on it would prevent that request.
+//
+// Bravo's own cooldowns are still honoured — those it sets itself, with a
+// deadline, and it can therefore clear them itself.
+func classifyBravoAuthHealthDeadline(provider string, auth pluginapi.HostAuthFileEntry, now time.Time) bravoAuthHealth {
+	if auth.Disabled || strings.EqualFold(strings.TrimSpace(auth.Status), "disabled") {
+		return bravoAuthDisabled
+	}
+	if !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
+		return bravoAuthCooldown
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return bravoAuthUnavailable
+	}
+	if cooldownActive(provider, authID, "", now) {
+		return bravoAuthCooldown
+	}
+	return bravoAuthReady
+}
+
+// hostModelState looks up per-model health, tolerating the thinking suffixes the
+// host strips when it keys its own model states.
+func hostModelState(auth pluginapi.HostAuthFileEntry, model string) (pluginapi.HostAuthModelState, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" || len(auth.ModelStates) == 0 {
+		return pluginapi.HostAuthModelState{}, false
+	}
+	if state, ok := auth.ModelStates[model]; ok {
+		return state, true
+	}
+	if base := baseModelKey(model); base != "" && base != model {
+		if state, ok := auth.ModelStates[base]; ok {
+			return state, true
+		}
+	}
+	return pluginapi.HostAuthModelState{}, false
+}
+
+// baseModelKey strips a thinking suffix the way the host's canonicalModelKey
+// does, so "claude-opus-5(8192)" finds the state stored under "claude-opus-5".
+// The host's suffix grammar is model-name(value); anything else is returned
+// unchanged.
+func baseModelKey(model string) string {
+	if !strings.HasSuffix(model, ")") {
+		return model
+	}
+	open := strings.LastIndex(model, "(")
+	if open <= 0 {
+		return model
+	}
+	return model[:open]
+}
+
+// quotaExhaustedForModel reports a confirmed zero-headroom quota. Unknown or
+// stale snapshots never exhaust an account here — that call belongs to the
+// allocator, which weighs it against the configured floors.
+func quotaExhaustedForModel(authIndex, model string) bool {
+	if strings.TrimSpace(authIndex) == "" {
+		return false
+	}
+	quota := quotaSnapshot(authIndex)
+	if quotaConfidence(quota) != "confirmed" {
+		return false
+	}
+	session, weekly := effectiveQuotaWindows(quota, model)
+	return session.RemainingPercent <= 0 || weekly.RemainingPercent <= 0
 }
 
 func redactedBravoConfig(cfg pluginConfig) map[string]any {

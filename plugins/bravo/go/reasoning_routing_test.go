@@ -45,20 +45,33 @@ func TestNativeClaudeReasoningReplayContractSkipsIncompatibleCandidates(t *testi
 	assertContractError(t, errResolve, "bravo_contract_unverified", capabilityReasoning)
 }
 
-func TestDefaultClaudeCandidatesDeclareNativeReasoningReplay(t *testing.T) {
+// Both providers declare reasoning in the defaults. Claude replays the signed
+// block verbatim; Codex carries the reasoning text across as prior context.
+// Codex used to be excluded here, which made a replayed-thinking request
+// unroutable as soon as every Claude credential was out of weekly quota — a 503
+// with a fully healthy Codex pool sitting idle. See the liveCapabilityMatrix
+// comment in contract.go for what the degraded Codex path does and does not keep.
+func TestDefaultTextCandidatesDeclareReasoning(t *testing.T) {
 	cfg := defaultPluginConfig()
-	model := cfg.Models["opus"]
-	if len(model.Candidates) == 0 {
-		t.Fatal("default opus policy has no candidates")
-	}
-	for _, item := range model.Candidates {
-		capabilities := newCapabilitySet(item.Capabilities...)
-		_, hasReasoning := capabilities[capabilityReasoning]
-		if normalizeProvider(item.Provider) == "claude" && !hasReasoning {
-			t.Fatalf("default Claude candidate %#v does not declare native reasoning replay", item)
+	for _, name := range []string{"opus", "sonnet", "frontier", "claude-opus-5", "gpt-5.6-sol"} {
+		model := cfg.Models[name]
+		if len(model.Candidates) == 0 {
+			t.Fatalf("default %s policy has no candidates", name)
 		}
-		if normalizeProvider(item.Provider) == "codex" && hasReasoning {
-			t.Fatalf("default cross-provider Codex candidate %#v unexpectedly declares reasoning replay", item)
+		for _, item := range model.Candidates {
+			capabilities := newCapabilitySet(item.Capabilities...)
+			if _, hasReasoning := capabilities[capabilityReasoning]; !hasReasoning {
+				t.Fatalf("default %s candidate %#v does not declare reasoning, so a replayed-thinking request cannot use it", name, item)
+			}
+		}
+	}
+	// Image candidates must stay out of it: they cannot carry reasoning at all.
+	for _, name := range []string{"image", "gpt-image-2"} {
+		for _, item := range cfg.Models[name].Candidates {
+			capabilities := newCapabilitySet(item.Capabilities...)
+			if _, hasReasoning := capabilities[capabilityReasoning]; hasReasoning {
+				t.Fatalf("image candidate %#v unexpectedly declares reasoning", item)
+			}
 		}
 	}
 }

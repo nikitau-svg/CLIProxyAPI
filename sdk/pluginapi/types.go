@@ -736,6 +736,25 @@ type HostRecentRequestEntry struct {
 	Failed int64 `json:"failed"`
 }
 
+// HostAuthModelState is the health of one model on one credential, mirroring the
+// per-model state the host's native selector routes on.
+type HostAuthModelState struct {
+	// Status is the model's own lifecycle status.
+	Status string `json:"status,omitempty"`
+	// StatusMessage carries the latest status detail for this model.
+	StatusMessage string `json:"status_message,omitempty"`
+	// Unavailable reports whether this model is currently blocked for retries.
+	// It is only meaningful together with NextRetryAfter: the host treats an
+	// unavailable model with no deadline as usable again.
+	Unavailable bool `json:"unavailable,omitempty"`
+	// NextRetryAfter is this model's own retry deadline.
+	NextRetryAfter time.Time `json:"next_retry_after,omitempty"`
+	// QuotaExceeded reports whether this model hit a provider quota.
+	QuotaExceeded bool `json:"quota_exceeded,omitempty"`
+	// QuotaRecoverAt is when the quota window is expected to reopen.
+	QuotaRecoverAt time.Time `json:"quota_recover_at,omitempty"`
+}
+
 // HostAuthFileEntry describes one credential exposed through host auth callbacks.
 type HostAuthFileEntry struct {
 	// ID identifies the credential record.
@@ -775,8 +794,23 @@ type HostAuthFileEntry struct {
 	CreatedAt time.Time `json:"created_at,omitempty"`
 	// LastRefresh is the last refresh timestamp.
 	LastRefresh time.Time `json:"last_refresh,omitempty"`
-	// NextRetryAfter is the next retry timestamp.
+	// NextRetryAfter is the next retry timestamp. The host aggregates it across
+	// every model state and only sets it once *all* of a credential's models are
+	// cooling, so it cannot distinguish "one model is rate limited" from "the
+	// whole credential is unusable". A router that cools per model must read
+	// ModelStates instead.
 	NextRetryAfter time.Time `json:"next_retry_after,omitempty"`
+	// ModelStates carries the per-model health the host routes on natively, keyed
+	// by model name.
+	//
+	// Status, StatusMessage, Unavailable and NextRetryAfter on the entry itself
+	// are credential-wide roll-ups: one failing model marks the whole credential
+	// StatusError, and the native selector deliberately ignores that in favour of
+	// the model's own state. A plugin that reads only the roll-up withholds a
+	// credential the host is still happily serving on its other models, so a
+	// model-scoped router must prefer the entry here and fall back to the
+	// credential-wide fields only for models with no state of their own.
+	ModelStates map[string]HostAuthModelState `json:"model_states,omitempty"`
 	// Email is the credential email when available.
 	Email string `json:"email,omitempty"`
 	// ProjectID is the credential project identifier when available.

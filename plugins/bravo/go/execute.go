@@ -241,13 +241,21 @@ func failureEnvelope(failure executionFailure) []byte {
 	if message == "" {
 		message = http.StatusText(status)
 	}
+	// Non-streaming failures need the same backoff hint the streaming path
+	// already synthesizes in closePluginStreamFailure. Pool exhaustion carries
+	// no upstream Retry-After of its own, so without this a 503 reaches the SDK
+	// bare and it retries immediately into the same exhausted pool.
+	retryAfter := strings.TrimSpace(failure.RetryAfter)
+	if retryAfter == "" && status == http.StatusServiceUnavailable {
+		retryAfter = strconv.Itoa(defaultRetryAfterSeconds(failure))
+	}
 	return detailedErrorEnvelope(envelopeError{
 		Code:       code,
 		Message:    message,
 		Retryable:  failure.Retryable,
 		HTTPStatus: status,
 		Headers:    cloneHeader(failure.Headers),
-		RetryAfter: strings.TrimSpace(failure.RetryAfter),
+		RetryAfter: retryAfter,
 	})
 }
 
@@ -424,7 +432,13 @@ func applyFailureCooldown(attempt executionAttempt, failure executionFailure) {
 	if until.IsZero() {
 		until = time.Now().Add(time.Duration(loadedConfig().CooldownSeconds) * time.Second)
 	}
-	setCooldown(attempt.Candidate.Provider, pinnedAuthID(attempt.Auth), failure.Code, until)
+	// Credential-level rejections disable the account everywhere; a rate limit
+	// or upstream fault only disables the model that hit it.
+	model := attempt.Candidate.Model
+	if accountWideCooldownStatus(failure.Status) {
+		model = ""
+	}
+	setCooldown(attempt.Candidate.Provider, pinnedAuthID(attempt.Auth), model, failure.Code, until)
 }
 
 func retryAfterTime(value string, now time.Time) time.Time {
@@ -451,7 +465,7 @@ func recordExecutionAttempt(attempt executionAttempt, started time.Time, status 
 		RequestedEffort: attempt.RequestedEffort,
 		EffectiveEffort: attempt.EffectiveEffort,
 		AuthID:          pinnedAuthID(attempt.Auth),
-		AuthLabel:       firstNonEmpty(attempt.Auth.Label, attempt.Auth.Email, attempt.Auth.Name),
+		AuthLabel:       firstNonEmpty(attempt.Auth.Note, attempt.Auth.Label, attempt.Auth.Email, attempt.Auth.Name),
 		Status:          status,
 		Success:         success,
 		Retryable:       failure.Retryable,

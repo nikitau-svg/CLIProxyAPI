@@ -2,6 +2,8 @@ package pluginhost
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -51,7 +53,7 @@ func TestStreamBridgeCloseUnblocksPendingEmit(t *testing.T) {
 	default:
 	}
 
-	bridge.close(streamID, "")
+	bridge.close(streamID, "", 0, "", "")
 
 	select {
 	case err := <-emitDone:
@@ -127,7 +129,7 @@ func TestStreamBridgeCleanupAbortsPendingGracefulClose(t *testing.T) {
 			t.Fatalf("fill stream buffer: %v", err)
 		}
 	}
-	bridge.close(streamID, "plugin stream failed")
+	bridge.close(streamID, "plugin stream failed", 0, "", "")
 
 	cleanup()
 
@@ -145,7 +147,7 @@ func TestStreamBridgeCloseDeliversTerminalError(t *testing.T) {
 	bridge := newStreamBridge()
 	streamID, chunks, _ := bridge.open(context.Background())
 
-	bridge.close(streamID, "plugin stream failed")
+	bridge.close(streamID, "plugin stream failed", 0, "", "")
 
 	chunk, ok := <-chunks
 	if !ok {
@@ -156,6 +158,34 @@ func TestStreamBridgeCloseDeliversTerminalError(t *testing.T) {
 	}
 	if _, ok = <-chunks; ok {
 		t.Fatal("stream remains open after terminal error")
+	}
+}
+
+// A plugin that closes a stream with an upstream status must surface that
+// status downstream. Without it the terminal error carries no status and the
+// caller renders a bare 500 with no Retry-After, hiding a retryable outage.
+func TestStreamBridgeCloseCarriesStatusMetadata(t *testing.T) {
+	bridge := newStreamBridge()
+	streamID, chunks, _ := bridge.open(context.Background())
+
+	bridge.close(streamID, "bravo_no_eligible_account: no healthy account", http.StatusServiceUnavailable, "bravo_no_eligible_account", "30")
+
+	chunk, ok := <-chunks
+	if !ok {
+		t.Fatal("stream closed before terminal error")
+	}
+	var typed *streamCloseError
+	if !errors.As(chunk.Err, &typed) {
+		t.Fatalf("terminal error = %T, want *streamCloseError", chunk.Err)
+	}
+	if typed.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("StatusCode() = %d, want %d", typed.StatusCode(), http.StatusServiceUnavailable)
+	}
+	if typed.ErrorCode() != "bravo_no_eligible_account" {
+		t.Fatalf("ErrorCode() = %q, want bravo_no_eligible_account", typed.ErrorCode())
+	}
+	if typed.RetryAfterValue() != "30" {
+		t.Fatalf("RetryAfterValue() = %q, want 30", typed.RetryAfterValue())
 	}
 }
 
@@ -171,7 +201,7 @@ func TestStreamBridgeClosePreservesTerminalErrorWhenBufferIsFull(t *testing.T) {
 
 	closeDone := make(chan struct{})
 	go func() {
-		bridge.close(streamID, "plugin stream failed")
+		bridge.close(streamID, "plugin stream failed", 0, "", "")
 		close(closeDone)
 	}()
 	select {

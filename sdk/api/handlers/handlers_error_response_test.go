@@ -219,3 +219,86 @@ func TestEnrichAuthSelectionError_IgnoresOtherErrors(t *testing.T) {
 		t.Fatalf("expected original error to be returned unchanged")
 	}
 }
+
+// retryHintedError models a proxy-authored failure: it computed a backoff hint
+// itself without ever seeing an upstream HTTP response to copy a header from.
+type retryHintedError struct {
+	message    string
+	status     int
+	retryAfter string
+}
+
+func (e retryHintedError) Error() string           { return e.message }
+func (e retryHintedError) StatusCode() int         { return e.status }
+func (e retryHintedError) RetryAfterValue() string { return e.retryAfter }
+
+// A proxy-authored backoff hint must reach the client even with
+// passthrough-headers off. That switch governs forwarding upstream headers
+// verbatim; Retry-After here is the proxy's own RFC 9110 contract. Without it a
+// 503 reads as permanent and SDK clients retry straight back into the pool that
+// just asked them to wait.
+func TestWriteErrorResponse_RetryAfterIgnoresPassthroughSwitch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error: retryHintedError{
+			message:    "bravo_no_eligible_account: no healthy account",
+			status:     http.StatusServiceUnavailable,
+			retryAfter: "30",
+		},
+	})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "30" {
+		t.Fatalf("Retry-After = %q, want %q", got, "30")
+	}
+}
+
+// An upstream Retry-After stays gated behind passthrough-headers: it is copied
+// upstream data, not something the proxy authored.
+func TestWriteErrorResponse_UpstreamRetryAfterStaysGated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New("rate limit"),
+		Addon:      http.Header{"Retry-After": {"120"}},
+	})
+
+	if got := recorder.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("upstream Retry-After leaked with passthrough off: %q", got)
+	}
+}
+
+// A duration-shaped hint must be rendered as whole seconds, rounded up so the
+// client never comes back a fraction of a second early.
+func TestRetryAfterHintFromErrorRoundsDurationsUp(t *testing.T) {
+	if got := retryAfterHintFromError(retryHintedError{retryAfter: "45"}); got != "45" {
+		t.Fatalf("verbatim hint = %q, want %q", got, "45")
+	}
+	if got := retryAfterHintFromError(errors.New("boom")); got != "" {
+		t.Fatalf("plain error produced a hint: %q", got)
+	}
+}
+
+// The addon must carry only real upstream headers. Synthesising a Retry-After
+// into it would smuggle a proxy-authored value through the passthrough gate.
+func TestErrorResponseAddonCarriesOnlyUpstreamHeaders(t *testing.T) {
+	if addon := ErrorResponseAddon(retryHintedError{retryAfter: "30"}); addon != nil {
+		t.Fatalf("addon = %v, want nil for an error with no upstream headers", addon)
+	}
+	if addon := ErrorResponseAddon(nil); addon != nil {
+		t.Fatalf("addon = %v, want nil for a nil error", addon)
+	}
+}

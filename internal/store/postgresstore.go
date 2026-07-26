@@ -656,14 +656,13 @@ func labelFor(metadata map[string]any) string {
 	if metadata == nil {
 		return ""
 	}
-	if v := strings.TrimSpace(valueAsString(metadata["label"])); v != "" {
-		return v
-	}
-	if v := strings.TrimSpace(valueAsString(metadata["email"])); v != "" {
-		return v
-	}
-	if v := strings.TrimSpace(valueAsString(metadata["project_id"])); v != "" {
-		return v
+	// Same precedence as cliproxyauth.DisplayLabelFromMetadata — the note names the
+	// credential — but resolved here because Postgres rows can hold non-string
+	// metadata values that need valueAsString first.
+	for _, key := range cliproxyauth.DisplayLabelMetadataKeys() {
+		if v := strings.TrimSpace(valueAsString(metadata[key])); v != "" {
+			return v
+		}
 	}
 	return ""
 }

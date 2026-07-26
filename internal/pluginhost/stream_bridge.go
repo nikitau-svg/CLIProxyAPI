@@ -40,8 +40,30 @@ type streamBridgeEmit struct {
 
 type streamBridgeClose struct {
 	errorMessage string
+	errorStatus  int
+	errorCode    string
+	retryAfter   string
 	accepted     chan struct{}
 }
+
+// streamCloseError carries the plugin-reported HTTP semantics of a stream that
+// failed before any bytes reached the client. Without it every plugin-side
+// failure surfaces as a bare 500, which tells SDK clients to retry immediately
+// instead of honouring the backoff the plugin asked for.
+type streamCloseError struct {
+	message    string
+	status     int
+	code       string
+	retryAfter string
+}
+
+func (e *streamCloseError) Error() string { return e.message }
+
+func (e *streamCloseError) StatusCode() int { return e.status }
+
+func (e *streamCloseError) ErrorCode() string { return e.code }
+
+func (e *streamCloseError) RetryAfterValue() string { return e.retryAfter }
 
 type rpcStreamEmitRequest struct {
 	StreamID string `json:"stream_id"`
@@ -50,8 +72,11 @@ type rpcStreamEmitRequest struct {
 }
 
 type rpcStreamCloseRequest struct {
-	StreamID string `json:"stream_id"`
-	Error    string `json:"error,omitempty"`
+	StreamID    string `json:"stream_id"`
+	Error       string `json:"error,omitempty"`
+	ErrorStatus int    `json:"error_status,omitempty"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	RetryAfter  string `json:"retry_after,omitempty"`
 }
 
 func newStreamBridge() *streamBridge {
@@ -98,7 +123,16 @@ func (s *streamBridgeStream) run() {
 			s.markClosed()
 			close(request.accepted)
 			if request.errorMessage != "" {
-				queue = append(queue, pluginapi.ExecutorStreamChunk{Err: fmt.Errorf("%s", request.errorMessage)})
+				var closeErr error = fmt.Errorf("%s", request.errorMessage)
+				if request.errorStatus > 0 || request.errorCode != "" || request.retryAfter != "" {
+					closeErr = &streamCloseError{
+						message:    request.errorMessage,
+						status:     request.errorStatus,
+						code:       request.errorCode,
+						retryAfter: request.retryAfter,
+					}
+				}
+				queue = append(queue, pluginapi.ExecutorStreamChunk{Err: closeErr})
 			}
 			for len(queue) > 0 {
 				select {
@@ -161,12 +195,15 @@ func (s *streamBridgeStream) emit(ctx context.Context, chunk pluginapi.ExecutorS
 	return <-request.done
 }
 
-func (s *streamBridgeStream) close(errorMessage string) {
+func (s *streamBridgeStream) close(errorMessage string, errorStatus int, errorCode, retryAfter string) {
 	if s == nil {
 		return
 	}
 	request := streamBridgeClose{
 		errorMessage: errorMessage,
+		errorStatus:  errorStatus,
+		errorCode:    errorCode,
+		retryAfter:   retryAfter,
 		accepted:     make(chan struct{}),
 	}
 	select {
@@ -228,7 +265,7 @@ func (b *streamBridge) emit(ctx context.Context, id string, chunk pluginapi.Exec
 	return nil
 }
 
-func (b *streamBridge) close(id string, errorMessage string) {
+func (b *streamBridge) close(id string, errorMessage string, errorStatus int, errorCode, retryAfter string) {
 	if b == nil || id == "" {
 		return
 	}
@@ -239,5 +276,5 @@ func (b *streamBridge) close(id string, errorMessage string) {
 	if stream == nil {
 		return
 	}
-	stream.close(errorMessage)
+	stream.close(errorMessage, errorStatus, errorCode, retryAfter)
 }
