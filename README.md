@@ -124,6 +124,16 @@ PackyCode provides special discounts for our software users: register using <a h
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
+### Bravo fork
+
+- [Clean AWS deployment (Russian)](AWS_INSTALL_RU.md)
+- [Bravo project keys, models, and routes (Russian)](BRAVO_MODELS_AND_KEYS_RU.md)
+- [Bravo plugin reference](plugins/bravo/README.md)
+
+For Bravo, use `Dockerfile.canary` and the files under `deploy/aws/`. The root
+Dockerfile and Compose file retain upstream-compatible behavior and do not
+produce the complete Bravo production image.
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)

@@ -371,6 +371,8 @@ previously verified UI artifact when its pinned commit and SHA-256 are recorded
 and the served bytes are verified after cutover.
 
 The current clean-install guide is
-[`AWS_INSTALL_RU.md`](../../AWS_INSTALL_RU.md). The separate
+[`AWS_INSTALL_RU.md`](../../AWS_INSTALL_RU.md). The operator guide for project
+keys, model allowlists, existing routes, and provider-specific pools is
+[`BRAVO_MODELS_AND_KEYS_RU.md`](../../BRAVO_MODELS_AND_KEYS_RU.md). The separate
 `BRAVO_PRODUCTION_RUNBOOK_RU.md` is retained only as historical 0.5 migration
 evidence.

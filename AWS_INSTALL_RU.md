@@ -3,6 +3,11 @@
 Эта инструкция создаёт новый независимый production: без переноса конфигурации,
 OAuth-файлов, проектов, ключей и аналитики с MacMini.
 
+После установки используйте отдельный операторский гайд
+[`BRAVO_MODELS_AND_KEYS_RU.md`](BRAVO_MODELS_AND_KEYS_RU.md): там простым
+языком описаны проектные ключи, allowlist моделей, маршруты и сценарий без
+OpenAI/Codex-подписок.
+
 ## Короткий ответ: что именно устанавливать
 
 Не нужно сначала ставить обычный CLIProxyAPI, а затем вручную копировать в него
@@ -30,6 +35,12 @@ CLIPROXYAPI_IMAGE из deploy/aws/release.env
 Bravo использует новые host callbacks и загружается как нативный Linux-плагин
 внутрь процесса. Поэтому `upstream latest + отдельно bravo.so` — неподдерживаемая
 комбинация: версии host ABI, plugin и UI могут разойтись.
+
+Не используйте корневые `Dockerfile` и `docker-compose.yml` этого форка для
+Bravo deployment: они сохраняются для upstream-совместимого режима. В этой
+инструкции намеренно используются только `Dockerfile.canary` и
+`deploy/aws/docker-compose.yml`. Файл `BRAVO_PRODUCTION_RUNBOOK_RU.md` —
+исторический runbook миграции 0.5, а не инструкция актуальной чистой установки.
 
 
 
@@ -78,8 +89,10 @@ ssh -i /path/to/bravo-aws.pem ubuntu@<EC2_PUBLIC_IP>
 На EC2:
 
 ```bash
+set -euo pipefail
+
 sudo apt update
-sudo apt install -y ca-certificates curl git openssl
+sudo apt install -y ca-certificates curl git jq openssl
 
 sudo install -m 0755 -d /etc/apt/keyrings
 sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
@@ -114,6 +127,8 @@ production не используем.
 ## 3. Скачать текущий стабильный комплект
 
 ```bash
+set -euo pipefail
+
 sudo install -d -o ubuntu -g ubuntu /srv/bravo-build
 cd /srv/bravo-build
 
@@ -123,9 +138,15 @@ git clone \
   https://github.com/nikitau-svg/CLIProxyAPI.git \
   CLIProxyAPI
 
+SOURCE_SHA="$(git -C CLIProxyAPI rev-parse HEAD)"
+. ./CLIProxyAPI/deploy/aws/release.env
+
 ./CLIProxyAPI/deploy/aws/fetch-management-ui.sh \
   /srv/bravo-build/Cli-Proxy-API-Management-Center
 ```
+
+Переменная `SOURCE_SHA` действует только в текущем shell. Не выполняйте
+`git pull` и не переключайте ветку между её записью и окончанием сборки.
 
 Скрипт читает frontend repository и точный commit из release manifest. Он не
 берёт независимо обновившуюся `main`/`latest`, поэтому host, plugin и UI
@@ -134,10 +155,14 @@ git clone \
 Проверьте выбранный комплект:
 
 ```bash
+set -euo pipefail
+
 cd /srv/bravo-build/CLIProxyAPI
 . ./deploy/aws/release.env
 
-printf 'Bravo %s, image %s\n' "$BRAVO_VERSION" "$CLIPROXYAPI_IMAGE"
+SOURCE_SHA="$(git rev-parse HEAD)"
+printf 'Source %s, Bravo %s, image %s\n' \
+  "$SOURCE_SHA" "$BRAVO_VERSION" "$CLIPROXYAPI_IMAGE"
 test "$(git -C ../Cli-Proxy-API-Management-Center rev-parse HEAD)" = \
   "$WEBUI_COMMIT"
 ```
@@ -153,6 +178,8 @@ test "$(git -C ../Cli-Proxy-API-Management-Center rev-parse HEAD)" = \
 используем одноразовый официальный контейнер:
 
 ```bash
+set -euo pipefail
+
 cd /srv/bravo-build/Cli-Proxy-API-Management-Center
 
 . ../CLIProxyAPI/deploy/aws/release.env
@@ -176,23 +203,33 @@ sudo docker run --rm \
 install -d ../CLIProxyAPI/.canary-dist
 install -m 0644 dist/index.html \
   ../CLIProxyAPI/.canary-dist/management.html
+
+WEBUI_SHA256="$(
+  sha256sum ../CLIProxyAPI/.canary-dist/management.html | awk '{print $1}'
+)"
+printf 'Management UI %s\n' "$WEBUI_SHA256"
 ```
 
 `bun run verify` должен завершить tests, lint, typecheck и production build без
-ошибок. Официальный Bun image поддерживает Linux arm64:
+ошибок. Сохраните показанный SHA-256 вместе с release-записью: он позволяет
+после запуска проверить, что контейнер обслуживает именно собранный UI.
+Официальный Bun image поддерживает Linux arm64:
 [Bun installation](https://bun.com/docs/installation).
 
 ## 5. Собрать единый production image
 
 ```bash
+set -euo pipefail
+
 cd /srv/bravo-build/CLIProxyAPI
 
 . ./deploy/aws/release.env
+SOURCE_SHA="$(git rev-parse HEAD)"
 
 sudo docker build \
   --platform "$RELEASE_PLATFORM" \
   --build-arg VERSION="$CLIPROXYAPI_VERSION" \
-  --build-arg COMMIT="$(git rev-parse HEAD)" \
+  --build-arg COMMIT="$SOURCE_SHA" \
   --build-arg BUILD_DATE="$(date -u +%F)" \
   --file Dockerfile.canary \
   --tag "$CLIPROXYAPI_IMAGE" \
@@ -212,6 +249,10 @@ sudo docker image inspect \
 images и runtime base закреплены commit SHA и Docker digest. Release tag для
 новой установки не нужен.
 
+Запишите для отката как минимум `SOURCE_SHA`, `WEBUI_COMMIT`,
+`WEBUI_SHA256`, `CLIPROXYAPI_IMAGE` и полученный image ID. Само имя image из
+manifest не является криптографическим доказательством его содержимого.
+
 ## 6. Создать новый runtime и секреты
 
 Deployment хранится отдельно от Git checkout:
@@ -230,6 +271,8 @@ Deployment хранится отдельно от Git checkout:
 Создайте его включённым скриптом:
 
 ```bash
+set -euo pipefail
+
 cd /srv/bravo-build/CLIProxyAPI
 sudo install -d -o ubuntu -g ubuntu /srv/cliproxyapi-prod
 ./deploy/aws/prepare-runtime.sh /srv/cliproxyapi-prod
@@ -268,30 +311,92 @@ grep '^MANAGEMENT_KEY=' /srv/cliproxyapi-prod/secrets.env
 ## 7. Запустить
 
 ```bash
+set -euo pipefail
+
 cd /srv/cliproxyapi-prod
-sudo docker compose up -d
+sudo docker compose config --quiet
+sudo docker compose up -d --wait --wait-timeout 120
 sudo docker compose ps
-sudo docker compose logs --tail 100
 ```
 
 В `docker compose ps` контейнер `CLIProxyAPI-Prod` должен стать `healthy`.
+Флаги `--wait` и `--wait-timeout` входят в актуальный
+[`docker compose up`](https://docs.docker.com/reference/cli/docker/compose/up/)
+и дают ограниченное ожидание healthcheck вместо произвольного `sleep`.
+До подключения аккаунтов можно посмотреть стартовый хвост логов:
+
+```bash
+sudo docker compose logs --tail 100
+```
+
+Проверьте, что запущен именно собранный image и контейнер не перезапускался:
+
+```bash
+set -euo pipefail
+
+cd /srv/cliproxyapi-prod
+. ./.env
+
+EXPECTED_IMAGE_ID="$(
+  sudo docker image inspect --format '{{.Id}}' "$CLIPROXYAPI_IMAGE"
+)"
+
+test "$(
+  sudo docker inspect --format '{{.Image}}' CLIProxyAPI-Prod
+)" = "$EXPECTED_IMAGE_ID"
+test "$(
+  sudo docker inspect --format '{{.State.Health.Status}}' CLIProxyAPI-Prod
+)" = healthy
+test "$(
+  sudo docker inspect --format '{{.RestartCount}}' CLIProxyAPI-Prod
+)" = 0
+test "$(
+  sudo docker inspect --format '{{.State.OOMKilled}}' CLIProxyAPI-Prod
+)" = false
+
+curl -fsS http://127.0.0.1:8317/healthz | jq -e '.status == "ok"'
+curl -fsS http://127.0.0.1:8317/management.html >/dev/null
+```
+
+Если вы сохранили SHA-256 из шага 4, проверьте и обслуживаемый UI:
+
+```bash
+set -euo pipefail
+
+EXPECTED_WEBUI_SHA256='<SHA256_FROM_STEP_4>'
+test "$(
+  curl -fsS http://127.0.0.1:8317/management.html | sha256sum | awk '{print $1}'
+)" = "$EXPECTED_WEBUI_SHA256"
+```
 
 Проверить загрузку Bravo:
 
 ```bash
+set -euo pipefail
+
 cd /srv/cliproxyapi-prod
 . ./.env
 . ./secrets.env
 
-curl -fsS \
-  -H "X-Management-Key: ${MANAGEMENT_KEY}" \
-  http://127.0.0.1:8317/v0/management/bravo/status
+BRAVO_STATUS_JSON="$(
+  curl -fsS \
+    --config <(
+      printf 'header = "X-Management-Key: %s"\n' "$MANAGEMENT_KEY"
+    ) \
+    http://127.0.0.1:8317/v0/management/bravo/status
+)"
 
-unset MANAGEMENT_KEY ORDINARY_API_KEY
+jq -e --arg version "$BRAVO_VERSION" \
+  '.version == $version and .enabled == true and .degraded == false' \
+  <<<"$BRAVO_STATUS_JSON"
+
+unset BRAVO_STATUS_JSON MANAGEMENT_KEY ORDINARY_API_KEY
 ```
 
-В ответе должны присутствовать версия из `BRAVO_VERSION` и состояние enabled.
-Если healthcheck зелёный, но этот запрос не работает, deployment ещё не готов.
+Команда должна вернуть `true`. Если healthcheck зелёный, но версия не
+совпадает, Bravo выключен или `degraded == true`, deployment ещё не готов.
+Критические блоки намеренно включают `set -euo pipefail`: любая невыполненная
+проверка останавливает текущий shell до следующего шага.
 
 ## 8. Открыть админку с Mac и заново подключить аккаунты
 
@@ -326,6 +431,9 @@ http://127.0.0.1:8317/management.html
 5. Создайте новый проект, выберите разрешённый пул и primary-подписку.
 6. Сохраните показанный `brv_...` ключ: plaintext показывается один раз.
 
+Пошаговое объяснение выбора моделей и сценарий без OpenAI/Codex находятся в
+[`BRAVO_MODELS_AND_KEYS_RU.md`](BRAVO_MODELS_AND_KEYS_RU.md).
+
 Порты `1455`, `54545` и `51121` используются только localhost OAuth callback и
 не открыты Security Group. Если конкретный OAuth flow предлагает ручную вставку
 полного callback URL, можно использовать её вместо дополнительного tunnel.
@@ -339,9 +447,9 @@ image-маршруты. Поэтому перед первым запросом 
 
 В `management.html` откройте **Bravo → Маршруты логических моделей**. Там можно
 на горячую полностью изменить цепочку кандидатов существующего маршрута:
-provider, физическую модель, effort, порядок и приоритет. Перед сохранением
-маршрут проверяется; кнопка reset возвращает встроенный default. Изменения
-сохраняются в `config.yaml`.
+provider, физическую модель, effort и порядок; приоритет формируется из этого
+порядка. Перед сохранением маршрут проверяется; кнопка reset возвращает
+встроенный default. Изменения сохраняются в `config.yaml`.
 
 Текущий редактор не создаёт совершенно новый logical ID вроде
 `bravo/my-own-route`: он безопасно переопределяет уже зарегистрированные
@@ -418,9 +526,13 @@ OpenAI base URL:    https://bravo.example.com/v1
 Админка:            только через SSH tunnel на http://127.0.0.1:8317
 ```
 
-Для более строгой AWS-схемы вместо Caddy используйте ALB + ACM: EC2 должен
-принимать `8317` только от Security Group балансировщика, а management paths
-должны быть закрыты правилами балансировщика/WAF.
+Для более строгой AWS-схемы вместо Caddy можно использовать ALB + ACM, но
+текущий Compose намеренно слушает `8317` только на loopback, поэтому ALB до
+него не достучится. Для ALB нужен отдельный проверенный compose override,
+который публикует `8317` на private interface EC2; Security Group instance
+должна разрешать этот порт только от Security Group балансировщика, а
+management paths должны быть закрыты правилами ALB/WAF. Не меняйте loopback
+binding только ради быстрого теста.
 
 ## 11. Backup после настройки
 
@@ -449,7 +561,7 @@ sudo docker compose stop
 После завершения snapshot:
 
 ```bash
-sudo docker compose up -d
+sudo docker compose up -d --wait --wait-timeout 120
 ```
 
 Не используйте `docker kill`: при штатной остановке Bravo успевает сбросить
@@ -459,22 +571,370 @@ ledger на диск.
 
 Сейчас Bravo image не опубликован в GHCR/Docker Hub, поэтому на AWS он
 собирается из согласованных исходников и используется с `pull_policy: never`.
-Runtime-изменение публикуется в `bravo/stable` после зелёной изолированной
-canary, затем именно из опубликованного commit собирается production image.
-Результат production smoke фиксируется отдельным docs-only commit; уже
-развёрнутый image остаётся привязан к отдельно записанному и протестированному
-runtime source SHA и не требует пересборки из-за одних заметок. Файл
-`deploy/aws/release.env` внутри stable является единственным manifest
-совместимых версий; старые release tags сохраняются для точного отката.
+`bravo/stable` — движущийся проверенный канал, а не immutable tag. Поэтому для
+каждой сборки обязательно записывайте backend SHA и локальный image ID.
+Наличие отдельного release tag не предполагается.
 
-До появления release image:
+Не обновляйте код внутри старого `/srv/bravo-build`: скрипт загрузки UI
+специально отказывается перезаписывать существующую директорию. Каждое
+обновление собирайте в новой versioned-директории:
 
-- не переключайте compose на `eceasy/cli-proxy-api:latest`;
-- не запускайте `docker compose pull`;
-- не меняйте backend и WebUI независимо от `release.env`;
-- сначала обновляйте checkout `bravo/stable`, собирайте новый image, проверяйте
-  его на canary, затем
-  меняйте `CLIPROXYAPI_IMAGE`.
+```bash
+set -euo pipefail
+
+RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+BUILD_ROOT="/srv/bravo-build-${RELEASE_ID}"
+
+sudo install -d -o ubuntu -g ubuntu "$BUILD_ROOT"
+git clone \
+  --branch bravo/stable \
+  --single-branch \
+  https://github.com/nikitau-svg/CLIProxyAPI.git \
+  "${BUILD_ROOT}/CLIProxyAPI"
+
+SOURCE_SHA="$(git -C "${BUILD_ROOT}/CLIProxyAPI" rev-parse HEAD)"
+. "${BUILD_ROOT}/CLIProxyAPI/deploy/aws/release.env"
+
+"${BUILD_ROOT}/CLIProxyAPI/deploy/aws/fetch-management-ui.sh" \
+  "${BUILD_ROOT}/Cli-Proxy-API-Management-Center"
+```
+
+Соберите UI именно из нового checkout:
+
+```bash
+set -euo pipefail
+: "${BUILD_ROOT:?run the update clone step first}"
+
+. "${BUILD_ROOT}/CLIProxyAPI/deploy/aws/release.env"
+cd "${BUILD_ROOT}/Cli-Proxy-API-Management-Center"
+
+sudo docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --env HOME=/tmp \
+  --volume "$PWD:/workspace" \
+  --workdir /workspace \
+  "$BUN_IMAGE" \
+  bun install --frozen-lockfile
+
+sudo docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --env HOME=/tmp \
+  --volume "$PWD:/workspace" \
+  --workdir /workspace \
+  "$BUN_IMAGE" \
+  bun run verify
+
+install -d "${BUILD_ROOT}/CLIProxyAPI/.canary-dist"
+install -m 0644 \
+  "${BUILD_ROOT}/Cli-Proxy-API-Management-Center/dist/index.html" \
+  "${BUILD_ROOT}/CLIProxyAPI/.canary-dist/management.html"
+
+WEBUI_SHA256="$(
+  sha256sum "${BUILD_ROOT}/CLIProxyAPI/.canary-dist/management.html" |
+    awk '{print $1}'
+)"
+```
+
+Соберите candidate с уникальным tag, чтобы не затереть rollback image:
+
+```bash
+set -euo pipefail
+: "${RELEASE_ID:?run the update clone step first}"
+: "${BUILD_ROOT:?run the update clone step first}"
+
+cd "${BUILD_ROOT}/CLIProxyAPI"
+
+. ./deploy/aws/release.env
+SOURCE_SHA="$(git rev-parse HEAD)"
+CANDIDATE_IMAGE="${CLIPROXYAPI_IMAGE}-${SOURCE_SHA:0:12}"
+WEBUI_SHA256="$(
+  sha256sum .canary-dist/management.html | awk '{print $1}'
+)"
+
+sudo docker build \
+  --platform "$RELEASE_PLATFORM" \
+  --build-arg VERSION="$CLIPROXYAPI_VERSION" \
+  --build-arg COMMIT="$SOURCE_SHA" \
+  --build-arg BUILD_DATE="$(date -u +%F)" \
+  --file Dockerfile.canary \
+  --tag "$CANDIDATE_IMAGE" \
+  .
+
+CANDIDATE_IMAGE_ID="$(
+  sudo docker image inspect --format '{{.Id}}' "$CANDIDATE_IMAGE"
+)"
+CANDIDATE_BRAVO_VERSION="$BRAVO_VERSION"
+CANDIDATE_HOST_VERSION="$CLIPROXYAPI_VERSION"
+
+sudo tee /srv/bravo-candidate.env >/dev/null <<EOF
+RELEASE_ID=${RELEASE_ID}
+BUILD_ROOT=${BUILD_ROOT}
+SOURCE_SHA=${SOURCE_SHA}
+WEBUI_SHA256=${WEBUI_SHA256}
+CANDIDATE_IMAGE=${CANDIDATE_IMAGE}
+CANDIDATE_IMAGE_ID=${CANDIDATE_IMAGE_ID}
+CANDIDATE_BRAVO_VERSION=${CANDIDATE_BRAVO_VERSION}
+CANDIDATE_HOST_VERSION=${CANDIDATE_HOST_VERSION}
+EOF
+sudo chown ubuntu:ubuntu /srv/bravo-candidate.env
+sudo chmod 0600 /srv/bravo-candidate.env
+```
+
+Если на instance недостаточно запаса CPU/RAM для production и canary
+одновременно, используйте временный второй Graviton. Не урезайте ресурсы
+работающего production ради проверки.
+
+### 12.1. Изолированная canary на том же EC2
+
+Canary создаётся как новый пустой runtime. Она не получает production config,
+OAuth, проекты или state:
+
+```bash
+set -euo pipefail
+
+. /srv/bravo-candidate.env
+: "${RELEASE_ID:?invalid candidate record}"
+: "${BUILD_ROOT:?invalid candidate record}"
+: "${CANDIDATE_IMAGE:?invalid candidate record}"
+: "${CANDIDATE_IMAGE_ID:?invalid candidate record}"
+CANARY_ROOT="/srv/cliproxyapi-canary-${RELEASE_ID}"
+
+test -z "$(sudo ss -ltnH 'sport = :18319')"
+test -z "$(sudo ss -ltnH 'sport = :11455')"
+test -z "$(sudo ss -ltnH 'sport = :15455')"
+test -z "$(sudo ss -ltnH 'sport = :15121')"
+
+sudo install -d -o ubuntu -g ubuntu "$CANARY_ROOT"
+"${BUILD_ROOT}/CLIProxyAPI/deploy/aws/prepare-runtime.sh" "$CANARY_ROOT"
+
+sed -i \
+  -e "s/container_name: CLIProxyAPI-Prod/container_name: CLIProxyAPI-Canary-${RELEASE_ID}/" \
+  -e 's/127.0.0.1:8317:8317/127.0.0.1:18319:8317/' \
+  -e 's/127.0.0.1:1455:1455/127.0.0.1:11455:1455/' \
+  -e 's/127.0.0.1:54545:54545/127.0.0.1:15455:54545/' \
+  -e 's/127.0.0.1:51121:51121/127.0.0.1:15121:51121/' \
+  "${CANARY_ROOT}/docker-compose.yml"
+
+sed -i \
+  -e "s|^BRAVO_VERSION=.*|BRAVO_VERSION=${CANDIDATE_BRAVO_VERSION}|" \
+  -e "s|^CLIPROXYAPI_VERSION=.*|CLIPROXYAPI_VERSION=${CANDIDATE_HOST_VERSION}|" \
+  -e "s|^CLIPROXYAPI_IMAGE=.*|CLIPROXYAPI_IMAGE=${CANDIDATE_IMAGE}|" \
+  "${CANARY_ROOT}/.env"
+
+cd "$CANARY_ROOT"
+sudo docker compose config --quiet
+sudo docker compose up -d --wait --wait-timeout 120
+CANARY_CONTAINER="CLIProxyAPI-Canary-${RELEASE_ID}"
+
+test "$(
+  sudo docker inspect \
+    --format '{{.Image}}' \
+    "$CANARY_CONTAINER"
+)" = "$CANDIDATE_IMAGE_ID"
+test "$(
+  sudo docker inspect --format '{{.State.Health.Status}}' "$CANARY_CONTAINER"
+)" = healthy
+test "$(
+  sudo docker inspect --format '{{.RestartCount}}' "$CANARY_CONTAINER"
+)" = 0
+test "$(
+  sudo docker inspect --format '{{.State.OOMKilled}}' "$CANARY_CONTAINER"
+)" = false
+
+curl -fsS http://127.0.0.1:18319/healthz | jq -e '.status == "ok"'
+test "$(
+  curl -fsS http://127.0.0.1:18319/management.html |
+    sha256sum |
+    awk '{print $1}'
+)" = "$WEBUI_SHA256"
+
+. ./.env
+. ./secrets.env
+CANARY_HEADERS="$(mktemp "${CANARY_ROOT}/headers.XXXXXX")"
+chmod 0600 "$CANARY_HEADERS"
+trap 'rm -f "$CANARY_HEADERS"' EXIT
+
+CANARY_STATUS_JSON="$(
+  curl -fsS \
+    --dump-header "$CANARY_HEADERS" \
+    --config <(
+      printf 'header = "X-Management-Key: %s"\n' "$MANAGEMENT_KEY"
+    ) \
+    http://127.0.0.1:18319/v0/management/bravo/status
+)"
+jq -e --arg version "$CANDIDATE_BRAVO_VERSION" \
+  '.version == $version and .enabled == true and .degraded == false' \
+  <<<"$CANARY_STATUS_JSON"
+CANARY_HOST_VERSION="$(
+  awk '
+    tolower($1) == "x-cpa-version:" {
+      sub(/\r$/, "", $2)
+      print $2
+    }
+  ' "$CANARY_HEADERS" |
+    tail -n 1
+)"
+test "$CANARY_HOST_VERSION" = "$CANDIDATE_HOST_VERSION"
+
+rm -f "$CANARY_HEADERS"
+trap - EXIT
+unset \
+  CANARY_HEADERS \
+  CANARY_HOST_VERSION \
+  CANARY_STATUS_JSON \
+  MANAGEMENT_KEY \
+  ORDINARY_API_KEY
+```
+
+Для canary UI и OAuth откройте отдельный tunnel с Mac:
+
+```bash
+ssh -N \
+  -i /path/to/bravo-aws.pem \
+  -L 18319:127.0.0.1:18319 \
+  -L 1455:127.0.0.1:11455 \
+  -L 54545:127.0.0.1:15455 \
+  -L 51121:127.0.0.1:15121 \
+  ubuntu@<EC2_PUBLIC_IP>
+```
+
+Закройте production tunnel на тех же локальных callback-портах перед запуском
+этой команды, иначе SSH не сможет занять `1455`, `54545` и `51121`.
+
+Откройте `http://127.0.0.1:18319/management.html`, введите management key из
+canary `secrets.env` и подключите отдельные canary-подписки. Проверьте оба
+протокола, streaming, fallback до первого payload, project model gate,
+аналитику и использованную подписку. Не продолжайте, если canary не зелёная.
+
+### 12.2. Короткое production-переключение
+
+Загрузите сохранённые значения кандидата, затем зафиксируйте старый image:
+
+```bash
+set -euo pipefail
+
+. /srv/bravo-candidate.env
+: "${RELEASE_ID:?invalid candidate record}"
+: "${CANDIDATE_IMAGE:?invalid candidate record}"
+: "${CANDIDATE_BRAVO_VERSION:?invalid candidate record}"
+: "${CANDIDATE_HOST_VERSION:?invalid candidate record}"
+
+cd /srv/cliproxyapi-prod
+
+test "$(
+  sudo docker image inspect --format '{{.Id}}' "$CANDIDATE_IMAGE"
+)" = "$CANDIDATE_IMAGE_ID"
+
+. ./.env
+OLD_IMAGE_REF="$CLIPROXYAPI_IMAGE"
+OLD_IMAGE_ID="$(sudo docker image inspect --format '{{.Id}}' "$OLD_IMAGE_REF")"
+test "$(
+  sudo docker inspect --format '{{.Image}}' CLIProxyAPI-Prod
+)" = "$OLD_IMAGE_ID"
+
+BACKUP_ROOT="/srv/cliproxyapi-backups/${RELEASE_ID}"
+test ! -e "$BACKUP_ROOT"
+sudo install -d -m 0700 "$BACKUP_ROOT"
+
+sudo tee /srv/bravo-rollback.env >/dev/null <<EOF
+RELEASE_ID=${RELEASE_ID}
+BACKUP_ROOT=${BACKUP_ROOT}
+OLD_IMAGE_REF=${OLD_IMAGE_REF}
+OLD_IMAGE_ID=${OLD_IMAGE_ID}
+EOF
+sudo chown ubuntu:ubuntu /srv/bravo-rollback.env
+sudo chmod 0600 /srv/bravo-rollback.env
+
+sudo docker compose stop
+sudo cp -a .env docker-compose.yml config.yaml "$BACKUP_ROOT/"
+sudo cp -a bravo-data "$BACKUP_ROOT/"
+
+sed -i \
+  -e "s|^BRAVO_VERSION=.*|BRAVO_VERSION=${CANDIDATE_BRAVO_VERSION}|" \
+  -e "s|^CLIPROXYAPI_VERSION=.*|CLIPROXYAPI_VERSION=${CANDIDATE_HOST_VERSION}|" \
+  -e "s|^CLIPROXYAPI_IMAGE=.*|CLIPROXYAPI_IMAGE=${CANDIDATE_IMAGE}|" \
+  .env
+
+sudo docker compose config --quiet
+sudo docker compose up \
+  -d \
+  --no-deps \
+  --wait \
+  --wait-timeout 120 \
+  cli-proxy-api
+```
+
+Остановка перед копированием нужна, чтобы Bravo штатно сбросил ledger, а
+backup `config.yaml` и `bravo-data` описывали одно состояние. Сразу повторите
+проверки из шага 7, protocol smoke обоих контрактов и сравните количество
+проектов, подписок и маршрутов.
+
+### 12.3. Воспроизводимый rollback
+
+Старый tag должен всё ещё указывать на записанный image ID:
+
+```bash
+set -euo pipefail
+
+. /srv/bravo-rollback.env
+: "${BACKUP_ROOT:?invalid rollback record}"
+: "${OLD_IMAGE_REF:?invalid rollback record}"
+: "${OLD_IMAGE_ID:?invalid rollback record}"
+
+test "$(
+  sudo docker image inspect --format '{{.Id}}' "$OLD_IMAGE_REF"
+)" = "$OLD_IMAGE_ID"
+```
+
+Если release явно не меняет schema состояния, верните согласованный старый
+`.env` и пересоздайте только контейнер:
+
+```bash
+set -euo pipefail
+
+. /srv/bravo-rollback.env
+: "${BACKUP_ROOT:?invalid rollback record}"
+
+cd /srv/cliproxyapi-prod
+test "$(
+  sudo docker image inspect --format '{{.Id}}' "$OLD_IMAGE_REF"
+)" = "$OLD_IMAGE_ID"
+sudo install \
+  -o ubuntu \
+  -g ubuntu \
+  -m 0600 \
+  "${BACKUP_ROOT}/.env" \
+  .env
+sudo docker compose up \
+  -d \
+  --no-deps \
+  --force-recreate \
+  --wait \
+  --wait-timeout 120 \
+  cli-proxy-api
+```
+
+Для будущего schema-changing release одного отката image недостаточно. С
+остановленным контейнером переместите новый `config.yaml` и `bravo-data` в
+отдельный failed-release каталог, восстановите оба объекта из одного
+pre-cutover backup, затем верните старый `.env` и запустите старый image.
+Release без явно документированной стратегии миграции/rollback в production не
+выпускается.
+
+Не запускайте:
+
+- `docker compose pull`;
+- `docker system prune` или широкую очистку Docker;
+- upstream image `eceasy/cli-proxy-api:latest`;
+- `prepare-runtime.sh` поверх существующего production;
+- независимое обновление backend и WebUI вне `release.env`.
+
+После успешного soak остановите canary командой `sudo docker compose down`
+строго из её `CANARY_ROOT`. Удаляйте только точно названные canary-runtime и
+неудачные image этого release. Общий BuildKit cache не имеет надёжного release
+ownership, поэтому его оставляйте; широкие `builder prune`/`system prune`
+запрещены. OAuth `auths`, production config/state и rollback image очисткой не
+затрагиваются.
 
 Следующее инфраструктурное улучшение — GitHub Actions, который собирает
 multi-arch release и публикует его в GHCR. Тогда установка AWS сократится до
