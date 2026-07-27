@@ -10,7 +10,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.7.7"
+	pluginVersion    = "0.7.8"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -86,20 +86,21 @@ type hostAuthListResponse struct {
 }
 
 type pluginConfig struct {
-	Enabled                bool                    `yaml:"enabled" json:"enabled"`
-	Prefix                 string                  `yaml:"prefix" json:"prefix"`
-	RequireSmartKey        bool                    `yaml:"require_smart_key" json:"require_smart_key"`
-	MaxAttempts            int                     `yaml:"max_attempts" json:"max_attempts"`
-	CooldownSeconds        int                     `yaml:"cooldown_seconds" json:"cooldown_seconds"`
-	StatePath              string                  `yaml:"state_path" json:"state_path"`
-	AllocatorMode          string                  `yaml:"allocator_mode" json:"allocator_mode"`
-	QuotaRefreshSeconds    int                     `yaml:"quota_refresh_seconds" json:"quota_refresh_seconds"`
-	UnknownSecondaryPolicy string                  `yaml:"unknown_secondary_policy" json:"unknown_secondary_policy"`
-	Tariffs                []tariffConfig          `yaml:"tariffs" json:"tariffs"`
-	Subscriptions          []subscriptionConfig    `yaml:"subscriptions" json:"subscriptions"`
-	SmartKeys              []smartKeyConfig        `yaml:"smart_keys" json:"smart_keys"`
-	RouteOverrides         []routeOverrideConfig   `yaml:"route_overrides" json:"route_overrides"`
-	Models                 map[string]logicalModel `yaml:"models" json:"models"`
+	Enabled                   bool                    `yaml:"enabled" json:"enabled"`
+	Prefix                    string                  `yaml:"prefix" json:"prefix"`
+	RequireSmartKey           bool                    `yaml:"require_smart_key" json:"require_smart_key"`
+	MaxAttempts               int                     `yaml:"max_attempts" json:"max_attempts"`
+	CooldownSeconds           int                     `yaml:"cooldown_seconds" json:"cooldown_seconds"`
+	FallbackHedgeDelaySeconds int                     `yaml:"fallback_hedge_delay_seconds" json:"fallback_hedge_delay_seconds"`
+	StatePath                 string                  `yaml:"state_path" json:"state_path"`
+	AllocatorMode             string                  `yaml:"allocator_mode" json:"allocator_mode"`
+	QuotaRefreshSeconds       int                     `yaml:"quota_refresh_seconds" json:"quota_refresh_seconds"`
+	UnknownSecondaryPolicy    string                  `yaml:"unknown_secondary_policy" json:"unknown_secondary_policy"`
+	Tariffs                   []tariffConfig          `yaml:"tariffs" json:"tariffs"`
+	Subscriptions             []subscriptionConfig    `yaml:"subscriptions" json:"subscriptions"`
+	SmartKeys                 []smartKeyConfig        `yaml:"smart_keys" json:"smart_keys"`
+	RouteOverrides            []routeOverrideConfig   `yaml:"route_overrides" json:"route_overrides"`
+	Models                    map[string]logicalModel `yaml:"models" json:"models"`
 	// BaseModels is the normalized pre-override model map. It is runtime-only so
 	// deleting an override can restore the configured/default route exactly.
 	BaseModels map[string]logicalModel `yaml:"-" json:"-"`

@@ -35,11 +35,18 @@ func TestHostModelListCallbackReturnsRedactedProviderSnapshot(t *testing.T) {
 	}})
 	t.Cleanup(func() { modelRegistry.UnregisterClient(clientID) })
 
-	rawReq, errMarshal := json.Marshal(pluginapi.HostModelListRequest{HostCallbackID: "callback-id"})
+	host := New()
+	callbackID, closeCallback := host.openCallbackContextForPlugin(context.Background(), "model-list-test")
+	defer closeCallback()
+	rawReq, errMarshal := json.Marshal(pluginapi.HostModelListRequest{HostCallbackID: callbackID})
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
 	}
-	rawResp, errCall := New().callFromPlugin(context.Background(), pluginabi.MethodHostModelList, rawReq)
+	rawResp, errCall := host.callFromPlugin(
+		withHostCallbackPluginID(context.Background(), "model-list-test"),
+		pluginabi.MethodHostModelList,
+		rawReq,
+	)
 	if errCall != nil {
 		t.Fatalf("callFromPlugin() error = %v", errCall)
 	}

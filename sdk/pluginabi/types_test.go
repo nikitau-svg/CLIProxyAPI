@@ -80,6 +80,15 @@ func TestMethodNamesAreStable(t *testing.T) {
 	if MethodHostHTTPStreamRead != "host.http.stream_read" {
 		t.Fatalf("MethodHostHTTPStreamRead = %q", MethodHostHTTPStreamRead)
 	}
+	if MethodHostCallbackFork != "host.callback.fork" {
+		t.Fatalf("MethodHostCallbackFork = %q", MethodHostCallbackFork)
+	}
+	if MethodHostCallbackCommit != "host.callback.commit" {
+		t.Fatalf("MethodHostCallbackCommit = %q", MethodHostCallbackCommit)
+	}
+	if MethodHostCallbackClose != "host.callback.close" {
+		t.Fatalf("MethodHostCallbackClose = %q", MethodHostCallbackClose)
+	}
 	if MethodHostModelExecute != "host.model.execute" {
 		t.Fatalf("MethodHostModelExecute = %q", MethodHostModelExecute)
 	}

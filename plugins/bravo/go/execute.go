@@ -308,13 +308,44 @@ func classifyExecutionError(err error) executionFailure {
 			Headers:    cloneHeader(hostErr.Headers),
 			RetryAfter: firstNonEmpty(hostErr.RetryAfter, hostErr.Headers.Get("Retry-After")),
 		}
+		if failure.Code == "request_canceled" {
+			// Cancellation belongs to the client request, not to a provider or
+			// subscription. Never retry it and never park an otherwise healthy
+			// credential in cooldown.
+			failure.Status = 499
+			failure.Retryable = false
+			failure.AccountWide = false
+			failure.RetryAfter = ""
+			return failure
+		}
+		if localHostFailureCode(failure.Code) {
+			// Callback/bridge failures are local request or ownership failures.
+			// Another provider cannot repair them, and they say nothing about
+			// provider health.
+			failure.Retryable = false
+			failure.AccountWide = false
+			failure.RetryAfter = ""
+			return failure
+		}
 		return classifyProviderFailureSignal(failure, hostErr.Code, hostErr.Message)
 	}
 	return executionFailure{
-		Code:      "bravo_host_call_failed",
-		Message:   err.Error(),
-		Status:    http.StatusBadGateway,
-		Retryable: true,
+		Code:    "bravo_host_call_failed",
+		Message: err.Error(),
+		Status:  http.StatusBadGateway,
+	}
+}
+
+func localHostFailureCode(code string) bool {
+	code = strings.ToLower(strings.TrimSpace(code))
+	switch code {
+	case "host_call_failed",
+		"host_callback_empty",
+		"host_callback_code",
+		"bravo_host_call_failed":
+		return true
+	default:
+		return strings.HasPrefix(code, "host_callback_")
 	}
 }
 

@@ -3,6 +3,7 @@ package auth
 import (
 	"net/http"
 	"testing"
+	"time"
 )
 
 type codedResultTestError struct {
@@ -91,6 +92,39 @@ func TestResultErrorFromErrorKeepsExplicitScopeWhenCodeCannotEncodeBoth(t *testi
 	}
 	if !got.IsRequestScoped() {
 		t.Fatal("explicitly request-scoped error must remain request-scoped")
+	}
+}
+
+func TestResultErrorFromErrorPreservesRequestCanceledScope(t *testing.T) {
+	source := explicitlyScopedCodedResultTestError{
+		codedResultTestError: codedResultTestError{
+			code:      requestCanceledErrorCode,
+			message:   "client request was canceled",
+			status:    499,
+			retryable: false,
+		},
+	}
+
+	got := resultErrorFromError(source)
+	if got == nil {
+		t.Fatal("resultErrorFromError returned nil")
+	}
+	if got.Code != requestCanceledErrorCode {
+		t.Fatalf("Code = %q, want %q", got.Code, requestCanceledErrorCode)
+	}
+	if got.HTTPStatus != 499 {
+		t.Fatalf("HTTPStatus = %d, want 499", got.HTTPStatus)
+	}
+	if got.Retryable {
+		t.Fatal("Retryable = true, want false")
+	}
+	if !isRequestScopedResultError(got) || !got.IsRequestScoped() {
+		t.Fatal("request_canceled must remain request-scoped")
+	}
+	auth := &Auth{ID: "auth-1", Provider: "claude", Status: StatusActive}
+	applyAuthFailureState(auth, got, nil, time.Now(), false)
+	if auth.Unavailable || auth.Status != StatusActive || auth.LastError != nil || !auth.NextRetryAfter.IsZero() {
+		t.Fatalf("request_canceled changed auth availability: %#v", auth)
 	}
 }
 

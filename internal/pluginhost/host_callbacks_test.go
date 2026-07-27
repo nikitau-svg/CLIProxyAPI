@@ -239,6 +239,32 @@ func TestHostStreamCallbacksEmitAndClose(t *testing.T) {
 	}
 }
 
+func TestHostStreamEmitWithCanceledCallbackReturnsRequestCanceled(t *testing.T) {
+	host := New()
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	callbackID, closeCallback := host.openCallbackContextForPlugin(parentCtx, "bravo")
+	defer closeCallback()
+	streamID, _, cleanupStream := host.streams.open(parentCtx)
+
+	cancelParent()
+	cleanupStream()
+
+	emitReq, errMarshal := json.Marshal(map[string]any{
+		"stream_id":        streamID,
+		"host_callback_id": callbackID,
+		"payload":          []byte("must-not-be-emitted"),
+	})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	_, errEmit := host.callFromPlugin(
+		withHostCallbackPluginID(context.Background(), "bravo"),
+		pluginabi.MethodHostStreamEmit,
+		emitReq,
+	)
+	assertHostCallbackScopeError(t, errEmit, "request_canceled", statusClientClosedRequest)
+}
+
 func TestHostModelExecuteCallback(t *testing.T) {
 	host := New()
 	var got handlers.ModelExecutionRequest

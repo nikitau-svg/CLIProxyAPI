@@ -104,15 +104,14 @@ func (h *Host) callHostPluginConfigListMutate(ctx context.Context, request []byt
 	}
 
 	callerPluginID := hostCallbackPluginIDFromContext(ctx)
-	callbackPluginID := h.callbackContextPluginID(req.HostCallbackID)
-	if callerPluginID == "" || callbackPluginID == "" || callerPluginID != callbackPluginID {
+	callbackCtx, errContext := h.requiredModelCallbackContext(ctx, req.HostCallbackID)
+	if errContext != nil || callerPluginID == "" {
 		return nil, pluginConfigMutationError(
 			"plugin_config_callback_forbidden",
 			"plugin config mutation requires a callback owned by the calling plugin",
 			http.StatusForbidden,
 		)
 	}
-	callbackCtx := h.resolveCallbackContext(req.HostCallbackID, ctx)
 	if !pluginManagementMutationAllowed(callbackCtx) {
 		return nil, pluginConfigMutationError(
 			"plugin_config_management_required",

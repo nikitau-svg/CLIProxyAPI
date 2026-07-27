@@ -172,6 +172,31 @@ func TestHostInjectedHTTPClientIsNotEncodedInPluginJSON(t *testing.T) {
 }
 
 func TestHostModelTypesPreserveFields(t *testing.T) {
+	scopeRequest := HostCallbackScopeRequest{HostCallbackID: "callback-parent-1"}
+	rawScopeRequest, errMarshalScope := json.Marshal(scopeRequest)
+	if errMarshalScope != nil {
+		t.Fatalf("marshal HostCallbackScopeRequest: %v", errMarshalScope)
+	}
+	var decodedScopeRequest HostCallbackScopeRequest
+	if errUnmarshalScope := json.Unmarshal(rawScopeRequest, &decodedScopeRequest); errUnmarshalScope != nil {
+		t.Fatalf("unmarshal HostCallbackScopeRequest: %v", errUnmarshalScope)
+	}
+	if decodedScopeRequest.HostCallbackID != scopeRequest.HostCallbackID {
+		t.Fatalf("HostCallbackScopeRequest round trip = %#v", decodedScopeRequest)
+	}
+	scopeResponse := HostCallbackScopeResponse{HostCallbackID: "callback-child-1"}
+	rawScopeResponse, errMarshalScope := json.Marshal(scopeResponse)
+	if errMarshalScope != nil {
+		t.Fatalf("marshal HostCallbackScopeResponse: %v", errMarshalScope)
+	}
+	var decodedScopeResponse HostCallbackScopeResponse
+	if errUnmarshalScope := json.Unmarshal(rawScopeResponse, &decodedScopeResponse); errUnmarshalScope != nil {
+		t.Fatalf("unmarshal HostCallbackScopeResponse: %v", errUnmarshalScope)
+	}
+	if decodedScopeResponse.HostCallbackID != scopeResponse.HostCallbackID {
+		t.Fatalf("HostCallbackScopeResponse round trip = %#v", decodedScopeResponse)
+	}
+
 	request := HostModelExecutionRequest{
 		EntryProtocol:   "openai",
 		ExitProtocol:    "claude",
@@ -268,20 +293,48 @@ func TestHostModelTypesPreserveFields(t *testing.T) {
 		t.Fatalf("HostModelStreamResponse round trip = %#v", decodedStreamResponse)
 	}
 
-	readRequest := HostModelStreamReadRequest{StreamID: "stream-1"}
+	readRequest := HostModelStreamReadRequest{
+		StreamID:       "stream-1",
+		HostCallbackID: "callback-child-1",
+	}
 	rawReadRequest, errMarshalReadRequest := json.Marshal(readRequest)
 	if errMarshalReadRequest != nil {
 		t.Fatalf("marshal HostModelStreamReadRequest: %v", errMarshalReadRequest)
 	}
-	if !strings.Contains(string(rawReadRequest), `"stream_id"`) {
-		t.Fatalf("HostModelStreamReadRequest JSON missing stream_id: %s", rawReadRequest)
+	for _, field := range []string{"stream_id", "host_callback_id"} {
+		if !strings.Contains(string(rawReadRequest), `"`+field+`"`) {
+			t.Fatalf("HostModelStreamReadRequest JSON missing %s: %s", field, rawReadRequest)
+		}
 	}
 	var decodedReadRequest HostModelStreamReadRequest
 	if errUnmarshalReadRequest := json.Unmarshal(rawReadRequest, &decodedReadRequest); errUnmarshalReadRequest != nil {
 		t.Fatalf("unmarshal HostModelStreamReadRequest: %v", errUnmarshalReadRequest)
 	}
-	if decodedReadRequest.StreamID != readRequest.StreamID {
+	if decodedReadRequest.StreamID != readRequest.StreamID ||
+		decodedReadRequest.HostCallbackID != readRequest.HostCallbackID {
 		t.Fatalf("HostModelStreamReadRequest round trip = %#v", decodedReadRequest)
+	}
+
+	closeRequest := HostModelStreamCloseRequest{
+		StreamID:       "stream-1",
+		HostCallbackID: "callback-child-1",
+	}
+	rawCloseRequest, errMarshalCloseRequest := json.Marshal(closeRequest)
+	if errMarshalCloseRequest != nil {
+		t.Fatalf("marshal HostModelStreamCloseRequest: %v", errMarshalCloseRequest)
+	}
+	for _, field := range []string{"stream_id", "host_callback_id"} {
+		if !strings.Contains(string(rawCloseRequest), `"`+field+`"`) {
+			t.Fatalf("HostModelStreamCloseRequest JSON missing %s: %s", field, rawCloseRequest)
+		}
+	}
+	var decodedCloseRequest HostModelStreamCloseRequest
+	if errUnmarshalCloseRequest := json.Unmarshal(rawCloseRequest, &decodedCloseRequest); errUnmarshalCloseRequest != nil {
+		t.Fatalf("unmarshal HostModelStreamCloseRequest: %v", errUnmarshalCloseRequest)
+	}
+	if decodedCloseRequest.StreamID != closeRequest.StreamID ||
+		decodedCloseRequest.HostCallbackID != closeRequest.HostCallbackID {
+		t.Fatalf("HostModelStreamCloseRequest round trip = %#v", decodedCloseRequest)
 	}
 
 	readResponse := HostModelStreamReadResponse{
@@ -323,21 +376,6 @@ func TestHostModelTypesPreserveFields(t *testing.T) {
 		t.Fatalf("HostModelStreamReadResponse round trip = %#v", decodedReadResponse)
 	}
 
-	closeRequest := HostModelStreamCloseRequest{StreamID: "stream-1"}
-	rawCloseRequest, errMarshalCloseRequest := json.Marshal(closeRequest)
-	if errMarshalCloseRequest != nil {
-		t.Fatalf("marshal HostModelStreamCloseRequest: %v", errMarshalCloseRequest)
-	}
-	if !strings.Contains(string(rawCloseRequest), `"stream_id"`) {
-		t.Fatalf("HostModelStreamCloseRequest JSON missing stream_id: %s", rawCloseRequest)
-	}
-	var decodedCloseRequest HostModelStreamCloseRequest
-	if errUnmarshalCloseRequest := json.Unmarshal(rawCloseRequest, &decodedCloseRequest); errUnmarshalCloseRequest != nil {
-		t.Fatalf("unmarshal HostModelStreamCloseRequest: %v", errUnmarshalCloseRequest)
-	}
-	if decodedCloseRequest.StreamID != closeRequest.StreamID {
-		t.Fatalf("HostModelStreamCloseRequest round trip = %#v", decodedCloseRequest)
-	}
 }
 
 func TestSchedulerTypesExposeRoutingFields(t *testing.T) {

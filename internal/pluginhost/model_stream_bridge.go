@@ -77,6 +77,19 @@ func (b *modelStreamBridge) read(ctx context.Context, id string) (handlers.Model
 	}
 }
 
+func (b *modelStreamBridge) owner(id string) (string, bool) {
+	if b == nil || id == "" {
+		return "", false
+	}
+	b.mu.Lock()
+	entry, ok := b.streams[id]
+	b.mu.Unlock()
+	if !ok {
+		return "", false
+	}
+	return entry.ownerCallbackID, true
+}
+
 func (b *modelStreamBridge) close(id string) {
 	if b == nil || id == "" {
 		return

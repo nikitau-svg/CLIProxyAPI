@@ -215,15 +215,16 @@ func defaultPluginConfig() pluginConfig {
 	models["auto"] = models["frontier"]
 
 	return pluginConfig{
-		Enabled:                true,
-		Prefix:                 defaultPrefix,
-		RequireSmartKey:        false,
-		MaxAttempts:            0,
-		CooldownSeconds:        30,
-		StatePath:              defaultStatePath,
-		AllocatorMode:          "enforce",
-		QuotaRefreshSeconds:    60,
-		UnknownSecondaryPolicy: "block",
+		Enabled:                   true,
+		Prefix:                    defaultPrefix,
+		RequireSmartKey:           false,
+		MaxAttempts:               0,
+		CooldownSeconds:           30,
+		FallbackHedgeDelaySeconds: 40,
+		StatePath:                 defaultStatePath,
+		AllocatorMode:             "enforce",
+		QuotaRefreshSeconds:       60,
+		UnknownSecondaryPolicy:    "block",
 		Tariffs: []tariffConfig{
 			{ID: "x1", SessionFloorPercent: 50, WeeklyFloorPercent: 50, Multiplier: 1, ReservationPercent: 0.5},
 			{ID: "x5", SessionFloorPercent: 30, WeeklyFloorPercent: 30, Multiplier: 5, ReservationPercent: 0.1},
@@ -288,6 +289,9 @@ func normalizeConfig(cfg *pluginConfig) error {
 	}
 	if cfg.CooldownSeconds <= 0 {
 		cfg.CooldownSeconds = 30
+	}
+	if cfg.FallbackHedgeDelaySeconds < 0 {
+		return fmt.Errorf("fallback_hedge_delay_seconds must be zero or positive")
 	}
 	cfg.StatePath = strings.TrimSpace(cfg.StatePath)
 	if cfg.StatePath == "" {

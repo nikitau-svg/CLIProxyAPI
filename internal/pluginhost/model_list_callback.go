@@ -18,7 +18,9 @@ func (h *Host) callHostModelList(ctx context.Context, request []byte) ([]byte, e
 			return nil, fmt.Errorf("decode host model list request: %w", errUnmarshal)
 		}
 	}
-	_ = h.resolveCallbackContext(req.HostCallbackID, ctx)
+	if _, errContext := h.requiredModelCallbackContext(ctx, req.HostCallbackID); errContext != nil {
+		return nil, errContext
+	}
 
 	modelRegistry := registry.GetGlobalRegistry()
 	entriesByKey := make(map[string]pluginapi.HostModelListEntry)
