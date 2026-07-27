@@ -391,6 +391,65 @@ shared Docker prune commands are forbidden.
   identity, will be rebuilt into the final image, and that exact image will
   receive a fresh isolated smoke before production.
 
+## Bravo 0.7.8 published release and production evidence
+
+- GitHub PR
+  [`#10`](https://github.com/nikitau-svg/CLIProxyAPI/pull/10) merged tested
+  feature commit
+  `433736a43009e76b941daca7d45cbe50b5b4e124` into `bravo/stable` as
+  `9c8eeed09b3ce0911ef5f92a57b2a53c4622d819`. The feature and merge commits
+  have the same source tree,
+  `bbf0c910198f9bd5b4e268bfea1cd19e3a6d6156`. GitHub Actions
+  `translator-path-guard` and `pr-test-build` both passed before merge.
+- The final Linux/arm64 image was rebuilt from a `git archive` of that exact
+  merge commit; it was not retagged from the pre-publish candidate. The image
+  is `cliproxyapi-local:v7.2.94-bravo-native0.7.8`
+  (`sha256:10add75aaceb25512b46e8a9d5a3b68cb86a060fb38866a768c2f40f06c1d871`;
+  platform manifest
+  `sha256:5f7336efca73079b644be8459958dc044009cc9a69f81948aedc362b067f8575`;
+  config
+  `sha256:552521b404e6ed6cf642296cfea633fbb4037c1c41f97bb4e66786c25b4dcf1b`).
+  Its binary reports `v7.2.94-bravo-native0.7.8`,
+  commit `9c8eeed09b3ce0911ef5f92a57b2a53c4622d819`, and build date
+  `2026-07-27`. The embedded Management UI checksum remains
+  `a971f98da6f816d67604d461c76d592b102a4c3c1c428f52e065581ad22a55be`.
+- A clean isolated canary was created from the final image on
+  `127.0.0.1:18319`, with fresh state and fake providers only. The exact
+  final-image smoke passed 8/8: Bravo 0.7.8/config identity, subscription
+  readiness, invisible slow-Claude-to-fast-Codex hedge, one canceled loser,
+  neutral superseded accounting, Codex-only Core success, zero cooldown, and
+  winner-only analytics. Its disposable project was removed and the container
+  exited with restart count zero.
+- Immediately before cutover, production 0.7.7 was healthy with restart count
+  zero. The read-only baseline was 8 projects, 5 subscriptions, 39 routes,
+  64 ordinary-key models, and 23/23 compatible profiles with zero required
+  actions. The Compose diff changed only the recorded image ID and image tag.
+  A pre-cutover backup of Compose, config, and Bravo state was saved at
+  `/Users/juloaipc/projects/cliproxyapi-prod/backups/pre-bravo-0.7.8-20260727T023039Z`;
+  auth files were intentionally excluded. The retained rollback image is
+  `cliproxyapi-local:v7.2.94-bravo-native0.7.7`
+  (`sha256:394234330795a0f70bd4d06db7ce97b132983db7d7a5d865ff8698231bf2d017`).
+- Compose performed one health-gated service replacement. Production now runs
+  container `081e9e687f192a7b869ea20b21f06baca15e4de6d084d365cda4eb2ff7619135`
+  from the exact final image. It is healthy, has restart count zero,
+  `OOMKilled=false`, and retains the same port, network, mounts, 1 GiB memory,
+  2 CPU, and 256-PID limits. The post-cutover read-only baseline matched all
+  pre-cutover counts exactly.
+- A production Anthropic Messages streaming smoke created a one-time
+  `sonnet`-only project, sent `bravo/sonnet` with adaptive thinking and
+  explicit `effort=low`, observed assistant text plus a complete
+  `message_stop`, and removed the project in `ensure`. An earlier strict probe
+  with only 64 output tokens was deliberately not accepted: the successful
+  Claude response spent that budget on adaptive thinking/signature and had no
+  visible text. Final project count remained 8.
+- Cleanup removed all three task-owned 0.7.8 canary containers, both
+  superseded candidate image tags, the fake-provider process and listener,
+  exported build contexts/archives, isolated canary runtimes, and local/remote
+  smoke files. Only the final 0.7.8 and rollback 0.7.7 images remain. Shared
+  BuildKit cache was not broadly pruned because it also serves 28 running
+  containers and individual layer ownership cannot be proven; host free space
+  after cleanup was 12 GiB.
+
 ## Bravo 0.7.6 source and canary evidence
 
 - Subscription identity is now operator-first everywhere: the auth-file note
