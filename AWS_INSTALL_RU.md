@@ -599,6 +599,10 @@ SOURCE_SHA="$(git -C "${BUILD_ROOT}/CLIProxyAPI" rev-parse HEAD)"
   "${BUILD_ROOT}/Cli-Proxy-API-Management-Center"
 ```
 
+До появления `/srv/bravo-candidate.env` эти блоки предполагают один SSH shell.
+Если соединение оборвалось раньше, начните сборку заново с новым `RELEASE_ID`;
+production на этой стадии ещё не затронут.
+
 Соберите UI именно из нового checkout:
 
 ```bash
@@ -775,12 +779,23 @@ CANARY_HOST_VERSION="$(
     tail -n 1
 )"
 test "$CANARY_HOST_VERSION" = "$CANDIDATE_HOST_VERSION"
+CANARY_SOURCE_SHA="$(
+  awk '
+    tolower($1) == "x-cpa-commit:" {
+      sub(/\r$/, "", $2)
+      print $2
+    }
+  ' "$CANARY_HEADERS" |
+    tail -n 1
+)"
+test "$CANARY_SOURCE_SHA" = "$SOURCE_SHA"
 
 rm -f "$CANARY_HEADERS"
 trap - EXIT
 unset \
   CANARY_HEADERS \
   CANARY_HOST_VERSION \
+  CANARY_SOURCE_SHA \
   CANARY_STATUS_JSON \
   MANAGEMENT_KEY \
   ORDINARY_API_KEY
