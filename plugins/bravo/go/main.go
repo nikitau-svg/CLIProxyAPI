@@ -166,6 +166,7 @@ func pluginRegistration() registration {
 				{Name: "require_smart_key", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Require a Bravo smart key for logical models."},
 				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Description: "Global provider-call budget. Zero means every eligible configured account."},
 				{Name: "cooldown_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Fallback cooldown when Retry-After is absent."},
+				{Name: "fallback_hedge_delay_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Delay before one cross-provider streaming-bootstrap hedge. Zero disables hedging."},
 				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "Private persistent Bravo usage and quota snapshot."},
 				{Name: "allocator_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Allocator mode: off, observe, or enforce."},
 				{Name: "quota_refresh_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Confirmed quota cache lifetime."},

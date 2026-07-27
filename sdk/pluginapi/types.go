@@ -599,6 +599,20 @@ type HostHTTPClient interface {
 	DoStream(context.Context, HTTPRequest) (HTTPStreamResponse, error)
 }
 
+// HostCallbackScopeRequest identifies a host callback context owned by the
+// calling plugin. Fork uses it as the parent; Commit and Close use it as the
+// speculative child.
+type HostCallbackScopeRequest struct {
+	HostCallbackID string `json:"host_callback_id"`
+}
+
+// HostCallbackScopeResponse returns a child callback context with isolated
+// cancellation and deferred Core result accounting. Commit selects its result;
+// Close cancels it and discards any uncommitted result.
+type HostCallbackScopeResponse struct {
+	HostCallbackID string `json:"host_callback_id"`
+}
+
 // HostModelExecutionRequest describes a model execution request issued through the host.
 type HostModelExecutionRequest struct {
 	// EntryProtocol is the inbound client protocol format.
@@ -654,6 +668,8 @@ type HostModelStreamResponse struct {
 type HostModelStreamReadRequest struct {
 	// StreamID identifies the host-owned stream.
 	StreamID string `json:"stream_id"`
+	// HostCallbackID identifies the child callback scope that owns the stream.
+	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
 // HostModelStreamReadResponse returns one model stream chunk or terminal state.
@@ -688,6 +704,8 @@ type HostModelExecutionError struct {
 type HostModelStreamCloseRequest struct {
 	// StreamID identifies the host-owned stream.
 	StreamID string `json:"stream_id"`
+	// HostCallbackID identifies the callback scope that owns the stream.
+	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
 // HostModelListRequest asks the host for a redacted snapshot of its reviewed

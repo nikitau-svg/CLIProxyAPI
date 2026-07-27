@@ -66,9 +66,10 @@ func (e *streamCloseError) ErrorCode() string { return e.code }
 func (e *streamCloseError) RetryAfterValue() string { return e.retryAfter }
 
 type rpcStreamEmitRequest struct {
-	StreamID string `json:"stream_id"`
-	Payload  []byte `json:"payload,omitempty"`
-	Error    string `json:"error,omitempty"`
+	StreamID       string `json:"stream_id"`
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+	Payload        []byte `json:"payload,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
 
 type rpcStreamCloseRequest struct {

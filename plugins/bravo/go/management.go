@@ -19,20 +19,21 @@ type managementRegistrationResponse struct {
 }
 
 type bravoStatus struct {
-	Version       string                 `json:"version"`
-	Enabled       bool                   `json:"enabled"`
-	Degraded      bool                   `json:"degraded"`
-	StatusCode    string                 `json:"status_code,omitempty"`
-	Mode          string                 `json:"mode"`
-	Prefix        string                 `json:"prefix"`
-	SmartKeyCount int                    `json:"smart_key_count"`
-	ModelCount    int                    `json:"model_count"`
-	Models        []bravoStatusModel     `json:"models"`
-	Providers     []bravoProviderSummary `json:"providers"`
-	Cooldowns     int                    `json:"cooldowns"`
-	RecentSuccess int                    `json:"recent_success"`
-	RecentFailure int                    `json:"recent_failure"`
-	GeneratedAt   time.Time              `json:"generated_at"`
+	Version          string                 `json:"version"`
+	Enabled          bool                   `json:"enabled"`
+	Degraded         bool                   `json:"degraded"`
+	StatusCode       string                 `json:"status_code,omitempty"`
+	Mode             string                 `json:"mode"`
+	Prefix           string                 `json:"prefix"`
+	SmartKeyCount    int                    `json:"smart_key_count"`
+	ModelCount       int                    `json:"model_count"`
+	Models           []bravoStatusModel     `json:"models"`
+	Providers        []bravoProviderSummary `json:"providers"`
+	Cooldowns        int                    `json:"cooldowns"`
+	RecentSuccess    int                    `json:"recent_success"`
+	RecentSuperseded int                    `json:"recent_superseded"`
+	RecentFailure    int                    `json:"recent_failure"`
+	GeneratedAt      time.Time              `json:"generated_at"`
 }
 
 type bravoStatusModel struct {
@@ -210,15 +211,25 @@ func collectBravoStatus(hostCallbackID string) (bravoStatus, error) {
 	}
 
 	runtimeState.RLock()
-	for _, event := range runtimeState.Attempts {
-		if event.Success {
+	summarizeRecentAttempts(&status, runtimeState.Attempts)
+	runtimeState.RUnlock()
+	return status, nil
+}
+
+func summarizeRecentAttempts(status *bravoStatus, attempts []attemptRecord) {
+	if status == nil {
+		return
+	}
+	for _, event := range attempts {
+		switch {
+		case event.Success:
 			status.RecentSuccess++
-		} else {
+		case strings.EqualFold(strings.TrimSpace(event.ErrorCode), "bravo_attempt_superseded"):
+			status.RecentSuperseded++
+		default:
 			status.RecentFailure++
 		}
 	}
-	runtimeState.RUnlock()
-	return status, nil
 }
 
 func markBravoStatusDegraded(status *bravoStatus, code string) {
@@ -482,18 +493,19 @@ func redactedBravoConfig(cfg pluginConfig) map[string]any {
 		})
 	}
 	return map[string]any{
-		"enabled":                  cfg.Enabled,
-		"prefix":                   cfg.Prefix,
-		"require_smart_key":        cfg.RequireSmartKey,
-		"max_attempts":             cfg.MaxAttempts,
-		"cooldown_seconds":         cfg.CooldownSeconds,
-		"allocator_mode":           cfg.AllocatorMode,
-		"quota_refresh_seconds":    cfg.QuotaRefreshSeconds,
-		"unknown_secondary_policy": cfg.UnknownSecondaryPolicy,
-		"tariffs":                  append([]tariffConfig(nil), cfg.Tariffs...),
-		"subscriptions":            append([]subscriptionConfig(nil), cfg.Subscriptions...),
-		"smart_keys":               keys,
-		"models":                   models,
+		"enabled":                      cfg.Enabled,
+		"prefix":                       cfg.Prefix,
+		"require_smart_key":            cfg.RequireSmartKey,
+		"max_attempts":                 cfg.MaxAttempts,
+		"cooldown_seconds":             cfg.CooldownSeconds,
+		"fallback_hedge_delay_seconds": cfg.FallbackHedgeDelaySeconds,
+		"allocator_mode":               cfg.AllocatorMode,
+		"quota_refresh_seconds":        cfg.QuotaRefreshSeconds,
+		"unknown_secondary_policy":     cfg.UnknownSecondaryPolicy,
+		"tariffs":                      append([]tariffConfig(nil), cfg.Tariffs...),
+		"subscriptions":                append([]subscriptionConfig(nil), cfg.Subscriptions...),
+		"smart_keys":                   keys,
+		"models":                       models,
 	}
 }
 
@@ -588,8 +600,8 @@ const q=s=>document.querySelector(s);
 q("#projectCount").textContent=data.smart_key_count;
 q("#modelCount").textContent=data.model_count+" моделей";
 q("#cooldownCount").textContent=data.cooldowns;
-q("#attemptCount").textContent=data.recent_success+data.recent_failure;
-q("#attemptBreakdown").innerHTML=`+"`"+`<span class="ok">${data.recent_success} успешно</span> · <span class="${data.recent_failure?"bad":""}">${data.recent_failure} ошибок</span>`+"`"+`;
+q("#attemptCount").textContent=data.recent_success+data.recent_superseded+data.recent_failure;
+q("#attemptBreakdown").innerHTML=`+"`"+`<span class="ok">${data.recent_success} успешно</span> · <span>${data.recent_superseded} переключено</span> · <span class="${data.recent_failure?"bad":""}">${data.recent_failure} ошибок</span>`+"`"+`;
 q("#healthyCount").textContent=data.providers.reduce((n,p)=>n+p.healthy,0);
 function escapeHTML(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function providerDetails(p){const details=[];if(p.cooldown)details.push(p.cooldown+" cooldown");if(p.disabled)details.push(p.disabled+" выключено");if(p.errors)details.push(p.errors+" с ошибкой");return details.length?"<small>"+details.join(" · ")+"</small>":""}

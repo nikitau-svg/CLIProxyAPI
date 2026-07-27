@@ -99,6 +99,26 @@ func TestDashboardDisclosuresStartClosedAndDynamicDataIsEscaped(t *testing.T) {
 	}
 }
 
+func TestSupersededHedgeIsNeutralInRecentStatus(t *testing.T) {
+	status := bravoStatus{}
+	summarizeRecentAttempts(&status, []attemptRecord{
+		{Success: true, Status: http.StatusOK},
+		{Status: 499, ErrorCode: "bravo_attempt_superseded"},
+		{Status: http.StatusBadGateway, ErrorCode: "upstream_failed"},
+	})
+	if status.RecentSuccess != 1 ||
+		status.RecentSuperseded != 1 ||
+		status.RecentFailure != 1 {
+		t.Fatalf("recent attempt summary = %#v, want success/superseded/failure = 1/1/1", status)
+	}
+
+	page := string(renderBravoDashboard(status))
+	if !strings.Contains(page, "data.recent_superseded") ||
+		!strings.Contains(page, "переключено") {
+		t.Fatal("dashboard does not render superseded attempts as a neutral bucket")
+	}
+}
+
 func TestRedactedBravoConfigOmitsSmartKeyDigest(t *testing.T) {
 	const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	raw, errMarshal := json.Marshal(redactedBravoConfig(pluginConfig{

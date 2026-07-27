@@ -14,9 +14,10 @@ import (
 )
 
 type rpcStreamEmitRequest struct {
-	StreamID string `json:"stream_id"`
-	Payload  []byte `json:"payload,omitempty"`
-	Error    string `json:"error,omitempty"`
+	StreamID       string `json:"stream_id"`
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+	Payload        []byte `json:"payload,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
 
 type rpcStreamCloseRequest struct {
@@ -63,8 +64,17 @@ func executeStream(raw []byte) ([]byte, error) {
 }
 
 func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
+	launchedRuns := make([]*bravoStreamAttemptRun, 0, 2)
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			failure := executionFailure{
+				Code:    "bravo_stream_panic",
+				Message: fmt.Sprintf("Bravo stream coordinator panic: %v", recovered),
+				Status:  http.StatusInternalServerError,
+			}
+			for _, run := range launchedRuns {
+				run.abort(failure)
+			}
 			closePluginStream(pluginStreamID, fmt.Sprintf("bravo_stream_panic: %v", recovered))
 		}
 	}()
@@ -86,6 +96,8 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 		closePluginStream(pluginStreamID, "bravo_request_invalid: "+errStrip.Error())
 		return
 	}
+	hedgeDelay := time.Duration(cfg.FallbackHedgeDelaySeconds) * time.Second
+	hedgeAt := time.Time{}
 	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
 	if errPlan != nil {
 		closePluginStreamFailure(pluginStreamID, executionFailure{
@@ -99,97 +111,342 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
 	var lastFailure executionFailure
 	providerCalls := 0
+	attempted := make(map[int]bool, len(plan))
+	hedgeUsed := false
 
-	for _, attempt := range plan {
+	canHedgeFrom := func(index int) bool {
+		if hedgeUsed ||
+			hedgeDelay <= 0 ||
+			strings.TrimSpace(req.HostCallbackID) == "" ||
+			providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls+1) {
+			return false
+		}
+		provider := normalizeProvider(plan[index].Candidate.Provider)
+		for next := index + 1; next < len(plan); next++ {
+			if attempted[next] ||
+				normalizeProvider(plan[next].Candidate.Provider) == provider ||
+				verifyCandidateContract(plan[next].Candidate, contract) != nil {
+				continue
+			}
+			return true
+		}
+		return false
+	}
+
+	startAttempt := func(index int, childScope bool) (*bravoStreamAttemptRun, *executionFailure, bool) {
+		attempt := plan[index]
 		if skipCoolingExecutionAttempt(attempt, &lastFailure) {
-			continue
+			return nil, nil, false
 		}
 		if errPreflight := verifyCandidateContract(attempt.Candidate, contract); errPreflight != nil {
-			lastFailure = contractFailure(errPreflight)
-			continue
+			failure := contractFailure(errPreflight)
+			lastFailure = failure
+			return nil, &failure, false
 		}
 		physicalModel := candidateModelName(attempt.Candidate)
 		candidateBody, errRewrite := rewriteCandidateRequest(candidateSourceBody, protocol, physicalModel, true, req.Headers.Get("Content-Type"))
 		if errRewrite != nil {
-			closePluginStream(pluginStreamID, "bravo_request_invalid: "+errRewrite.Error())
-			return
+			failure := executionFailure{
+				Code:    "bravo_request_invalid",
+				Message: errRewrite.Error(),
+				Status:  http.StatusBadRequest,
+			}
+			return nil, &failure, false
 		}
 		if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
-			break
+			return nil, nil, false
+		}
+		callbackID := req.HostCallbackID
+		ownsScope := false
+		if childScope {
+			childID, errFork := forkHostCallbackScope(req.HostCallbackID)
+			if errFork != nil {
+				failure := classifyExecutionError(errFork)
+				return nil, &failure, false
+			}
+			callbackID = childID
+			ownsScope = true
 		}
 		releaseLease, acquired := acquireAttemptLease(attempt)
 		if !acquired {
-			continue
+			if ownsScope {
+				_ = closeHostCallbackScope(callbackID)
+			}
+			return nil, nil, false
 		}
 		providerCalls++
-		started := time.Now()
-		rawResponse, errCall := callHost(pluginabi.MethodHostModelExecuteStream, hostModelExecutionRequest{
-			HostModelExecutionRequest: nestedHostModelRequest(req, attempt, protocol, physicalModel, candidateBody, true),
-			HostCallbackID:            req.HostCallbackID,
-		})
-		if errCall != nil {
-			releaseLease(false)
-			failure := classifyExecutionError(errCall)
-			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
-			applyFailureCooldown(attempt, failure)
-			lastFailure = failure
-			if failure.Retryable {
-				continue
-			}
-			closePluginStreamFailure(pluginStreamID, failure)
-			return
-		}
-
-		var response pluginapi.HostModelStreamResponse
-		if errDecode := json.Unmarshal(rawResponse, &response); errDecode != nil {
-			releaseLease(true)
-			lastFailure = executionFailure{
-				Code:      "bravo_host_stream_invalid",
-				Message:   errDecode.Error(),
-				Status:    http.StatusBadGateway,
-				Retryable: true,
-			}
-			recordExecutionAttempt(attempt, started, lastFailure.Status, false, lastFailure)
-			continue
-		}
-		if strings.TrimSpace(response.StreamID) == "" {
-			releaseLease(true)
-			lastFailure = executionFailure{
-				Code:      "bravo_host_stream_missing",
-				Message:   "host returned an empty stream_id",
-				Status:    http.StatusBadGateway,
-				Retryable: true,
-			}
-			recordExecutionAttempt(attempt, started, lastFailure.Status, false, lastFailure)
-			continue
-		}
-
-		committed, streamFailure := forwardCandidateStream(
-			context.Background(),
-			response.StreamID,
-			pluginStreamID,
+		run := launchBravoStreamAttempt(
+			req,
+			attempt,
 			protocol,
 			physicalModel,
-			logicalModelID,
+			candidateBody,
+			callbackID,
+			ownsScope,
+			releaseLease,
 		)
-		_ = closeHostModelStream(response.StreamID)
-		releaseLease(true)
-		if streamFailure == nil {
-			recordExecutionAttempt(attempt, started, http.StatusOK, true, executionFailure{})
-			closePluginStream(pluginStreamID, "")
-			return
+		launchedRuns = append(launchedRuns, run)
+		return run, nil, true
+	}
+
+	findHedge := func(primaryIndex int) (*bravoStreamAttemptRun, *executionFailure, bool) {
+		primaryProvider := normalizeProvider(plan[primaryIndex].Candidate.Provider)
+		for index := primaryIndex + 1; index < len(plan); index++ {
+			if attempted[index] || normalizeProvider(plan[index].Candidate.Provider) == primaryProvider {
+				continue
+			}
+			run, failure, launched := startAttempt(index, true)
+			if launched {
+				attempted[index] = true
+				return run, nil, true
+			}
+			if failure != nil {
+				if failure.Status == http.StatusUnprocessableEntity {
+					attempted[index] = true
+					lastFailure = *failure
+					continue
+				}
+				return nil, failure, false
+			}
+			// The account entered cooldown or lost its local reservation after
+			// the plan was built. A same-request retry cannot make it eligible.
+			attempted[index] = true
 		}
-		recordExecutionAttempt(attempt, started, streamFailure.Status, false, *streamFailure)
-		applyFailureCooldown(attempt, *streamFailure)
-		if committed {
-			// Switching provider after the client observed bytes would splice two
-			// unrelated streams. Fail closed and let the caller retry explicitly.
-			closePluginStream(pluginStreamID, streamFailure.Code+": "+streamFailure.Message)
-			return
+		return nil, nil, false
+	}
+
+	for index := 0; index < len(plan); index++ {
+		if attempted[index] {
+			continue
 		}
-		lastFailure = *streamFailure
-		if !streamFailure.Retryable {
-			closePluginStreamFailure(pluginStreamID, *streamFailure)
+		attempted[index] = true
+		primaryCanHedge := canHedgeFrom(index)
+		primary, preflightFailure, launched := startAttempt(index, primaryCanHedge)
+		if preflightFailure != nil {
+			lastFailure = *preflightFailure
+			if preflightFailure.Status == http.StatusUnprocessableEntity {
+				continue
+			}
+			if !preflightFailure.Retryable {
+				closePluginStreamFailure(pluginStreamID, *preflightFailure)
+				return
+			}
+			continue
+		}
+		if !launched || primary == nil {
+			if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
+				break
+			}
+			continue
+		}
+		if primaryCanHedge && hedgeAt.IsZero() {
+			// Planning and quota discovery do not consume the primary's head
+			// start. The request-wide hedge clock begins with the first real
+			// provider attempt.
+			hedgeAt = primary.started.Add(hedgeDelay)
+		}
+
+		primaryResults := (<-chan bravoStreamBootstrapResult)(primary.results)
+		var hedge *bravoStreamAttemptRun
+		var hedgeResults <-chan bravoStreamBootstrapResult
+		var hedgeTimer *time.Timer
+		var hedgeTimerC <-chan time.Time
+		if primaryCanHedge {
+			delay := time.Until(hedgeAt)
+			if delay < 0 {
+				delay = 0
+			}
+			hedgeTimer = time.NewTimer(delay)
+			hedgeTimerC = hedgeTimer.C
+		}
+		stopHedgeTimer := func() {
+			hedgeTimerC = nil
+			if hedgeTimer == nil {
+				return
+			}
+			if !hedgeTimer.Stop() {
+				select {
+				case <-hedgeTimer.C:
+				default:
+				}
+			}
+			hedgeTimer = nil
+		}
+		var deferredHedgeTerminal *executionFailure
+
+		for primaryResults != nil || hedgeResults != nil {
+			select {
+			case result := <-primaryResults:
+				primaryResults = nil
+				if result.response != nil {
+					stopHedgeTimer()
+					finished, winnerFailure := forwardBravoStreamWinner(
+						primary,
+						result.response,
+						pluginStreamID,
+						protocol,
+						logicalModelID,
+						func() error {
+							if hedgeResults != nil {
+								settleBravoCompetingAttempt(hedge, hedgeResults, nil)
+								hedgeResults = nil
+							}
+							return primary.commitScope()
+						},
+					)
+					if finished {
+						if hedgeResults != nil {
+							settleBravoCompetingAttempt(hedge, hedgeResults, nil)
+							hedgeResults = nil
+						}
+						return
+					}
+					if winnerFailure != nil {
+						lastFailure = *winnerFailure
+						if !winnerFailure.Retryable {
+							if hedgeResults != nil {
+								settleBravoCompetingAttempt(hedge, hedgeResults, winnerFailure)
+								hedgeResults = nil
+							}
+							closePluginStreamFailure(pluginStreamID, *winnerFailure)
+							return
+						}
+					}
+					if hedgeResults == nil && deferredHedgeTerminal != nil {
+						closePluginStreamFailure(pluginStreamID, *deferredHedgeTerminal)
+						return
+					}
+					continue
+				}
+				if result.failure == nil {
+					result.failure = &executionFailure{
+						Code:      "bravo_host_stream_invalid",
+						Message:   "host returned an empty stream bootstrap result",
+						Status:    http.StatusBadGateway,
+						Retryable: true,
+					}
+				}
+				finishBravoStreamAttemptFailure(primary, *result.failure, result.accepted)
+				lastFailure = *result.failure
+				if !result.failure.Retryable {
+					stopHedgeTimer()
+					if hedgeResults != nil {
+						settleBravoCompetingAttempt(hedge, hedgeResults, result.failure)
+						hedgeResults = nil
+					}
+					closePluginStreamFailure(pluginStreamID, *result.failure)
+					return
+				}
+				if hedgeResults == nil && deferredHedgeTerminal != nil {
+					closePluginStreamFailure(pluginStreamID, *deferredHedgeTerminal)
+					return
+				}
+			case result := <-hedgeResults:
+				hedgeResults = nil
+				if result.response != nil {
+					finished, winnerFailure := forwardBravoStreamWinner(
+						hedge,
+						result.response,
+						pluginStreamID,
+						protocol,
+						logicalModelID,
+						func() error {
+							if primaryResults != nil {
+								settleBravoCompetingAttempt(primary, primaryResults, nil)
+								primaryResults = nil
+							}
+							return hedge.commitScope()
+						},
+					)
+					if finished {
+						if primaryResults != nil {
+							settleBravoCompetingAttempt(primary, primaryResults, nil)
+							primaryResults = nil
+						}
+						return
+					}
+					if winnerFailure != nil {
+						lastFailure = *winnerFailure
+						if !winnerFailure.Retryable {
+							if winnerFailure.Code == "request_canceled" {
+								if primaryResults != nil {
+									settleBravoCompetingAttempt(primary, primaryResults, winnerFailure)
+									primaryResults = nil
+								}
+								closePluginStreamFailure(pluginStreamID, *winnerFailure)
+								return
+							}
+							if primaryResults != nil {
+								failureCopy := *winnerFailure
+								deferredHedgeTerminal = &failureCopy
+							} else {
+								closePluginStreamFailure(pluginStreamID, *winnerFailure)
+								return
+							}
+						}
+					}
+					continue
+				}
+				if result.failure == nil {
+					result.failure = &executionFailure{
+						Code:      "bravo_host_stream_invalid",
+						Message:   "host returned an empty hedge bootstrap result",
+						Status:    http.StatusBadGateway,
+						Retryable: true,
+					}
+				}
+				finishBravoStreamAttemptFailure(hedge, *result.failure, result.accepted)
+				lastFailure = *result.failure
+				if !result.failure.Retryable {
+					if result.failure.Code == "request_canceled" {
+						if primaryResults != nil {
+							settleBravoCompetingAttempt(primary, primaryResults, result.failure)
+							primaryResults = nil
+						}
+						closePluginStreamFailure(pluginStreamID, *result.failure)
+						return
+					}
+					if primaryResults != nil {
+						failureCopy := *result.failure
+						deferredHedgeTerminal = &failureCopy
+					} else {
+						closePluginStreamFailure(pluginStreamID, *result.failure)
+						return
+					}
+				}
+			case <-hedgeTimerC:
+				hedgeTimerC = nil
+				hedgeUsed = true
+				var hedgeFailure *executionFailure
+				var hedgeLaunched bool
+				hedge, hedgeFailure, hedgeLaunched = findHedge(index)
+				if hedgeFailure != nil {
+					lastFailure = *hedgeFailure
+					if !hedgeFailure.Retryable {
+						if hedgeFailure.Code == "request_canceled" {
+							if primaryResults != nil {
+								settleBravoCompetingAttempt(primary, primaryResults, hedgeFailure)
+								primaryResults = nil
+							}
+							closePluginStreamFailure(pluginStreamID, *hedgeFailure)
+							return
+						}
+						if primaryResults == nil {
+							closePluginStreamFailure(pluginStreamID, *hedgeFailure)
+							return
+						}
+						failureCopy := *hedgeFailure
+						deferredHedgeTerminal = &failureCopy
+					}
+				}
+				if hedgeLaunched && hedge != nil {
+					hedgeResults = hedge.results
+				}
+			}
+		}
+		stopHedgeTimer()
+		if deferredHedgeTerminal != nil {
+			closePluginStreamFailure(pluginStreamID, *deferredHedgeTerminal)
 			return
 		}
 	}
@@ -204,7 +461,71 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 	closePluginStreamFailure(pluginStreamID, lastFailure)
 }
 
-func forwardCandidateStream(ctx context.Context, hostStreamID, pluginStreamID, protocol, physicalModel, logicalModel string) (bool, *executionFailure) {
+func forwardBravoStreamWinner(
+	run *bravoStreamAttemptRun,
+	response *pluginapi.HostModelStreamResponse,
+	pluginStreamID, protocol, logicalModelID string,
+	onCommit func() error,
+) (bool, *executionFailure) {
+	if run == nil || response == nil {
+		failure := executionFailure{
+			Code:      "bravo_host_stream_invalid",
+			Message:   "host returned an empty winning stream",
+			Status:    http.StatusBadGateway,
+			Retryable: true,
+		}
+		return false, &failure
+	}
+	committed, streamFailure := forwardCandidateStream(
+		context.Background(),
+		response.StreamID,
+		pluginStreamID,
+		protocol,
+		run.physicalModel,
+		logicalModelID,
+		run.callbackID,
+		onCommit,
+	)
+	if !committed && streamFailure == nil {
+		if errCommit := run.commitScope(); errCommit != nil {
+			failure := classifyExecutionError(errCommit)
+			streamFailure = &failure
+		}
+	} else if !committed && streamFailure != nil && shouldCommitBravoCoreAccounting(*streamFailure) {
+		if errCommit := run.commitScope(); errCommit != nil {
+			failure := classifyExecutionError(errCommit)
+			streamFailure = &failure
+		}
+	}
+	_ = closeHostModelStream(response.StreamID, run.callbackID)
+	run.closeScope()
+	run.release(true)
+	if !run.finalized.CompareAndSwap(false, true) {
+		return true, nil
+	}
+	if streamFailure == nil {
+		recordExecutionAttempt(run.attempt, run.started, http.StatusOK, true, executionFailure{})
+		closePluginStream(pluginStreamID, "")
+		return true, nil
+	}
+	recordExecutionAttempt(run.attempt, run.started, streamFailure.Status, false, *streamFailure)
+	if shouldCommitBravoCoreAccounting(*streamFailure) {
+		applyFailureCooldown(run.attempt, *streamFailure)
+	}
+	if committed {
+		// Switching provider after the client observed bytes would splice two
+		// unrelated streams. Fail closed and let the caller retry explicitly.
+		closePluginStream(pluginStreamID, streamFailure.Code+": "+streamFailure.Message)
+		return true, streamFailure
+	}
+	return false, streamFailure
+}
+
+func forwardCandidateStream(
+	ctx context.Context,
+	hostStreamID, pluginStreamID, protocol, physicalModel, logicalModel, hostCallbackID string,
+	onCommit func() error,
+) (bool, *executionFailure) {
 	rewriter := streamModelRewriter{
 		physical: physicalModel,
 		logical:  logicalModel,
@@ -213,7 +534,8 @@ func forwardCandidateStream(ctx context.Context, hostStreamID, pluginStreamID, p
 	committed := false
 	for {
 		rawChunk, errRead := callHost(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{
-			StreamID: hostStreamID,
+			StreamID:       hostStreamID,
+			HostCallbackID: hostCallbackID,
 		})
 		if errRead != nil {
 			failure := classifyExecutionError(errRead)
@@ -239,21 +561,39 @@ func forwardCandidateStream(ctx context.Context, hostStreamID, pluginStreamID, p
 			if len(payload) == 0 {
 				continue
 			}
-			if errEmit := emitPluginStreamChunk(ctx, pluginStreamID, payload); errEmit != nil {
+			if errEmit := emitPluginStreamChunk(ctx, pluginStreamID, hostCallbackID, payload); errEmit != nil {
 				failure := classifyExecutionError(errEmit)
 				failure.Retryable = false
 				return committed, &failure
 			}
-			committed = true
+			if !committed {
+				committed = true
+				if onCommit != nil {
+					if errCommit := onCommit(); errCommit != nil {
+						failure := classifyExecutionError(errCommit)
+						failure.Retryable = false
+						return true, &failure
+					}
+				}
+			}
 		}
 		if chunk.Done {
 			if tail := rewriter.Flush(); len(tail) > 0 {
-				if errEmit := emitPluginStreamChunk(ctx, pluginStreamID, tail); errEmit != nil {
+				if errEmit := emitPluginStreamChunk(ctx, pluginStreamID, hostCallbackID, tail); errEmit != nil {
 					failure := classifyExecutionError(errEmit)
 					failure.Retryable = false
 					return committed, &failure
 				}
-				committed = true
+				if !committed {
+					committed = true
+					if onCommit != nil {
+						if errCommit := onCommit(); errCommit != nil {
+							failure := classifyExecutionError(errCommit)
+							failure.Retryable = false
+							return true, &failure
+						}
+					}
+				}
 			}
 			return committed, nil
 		}
@@ -280,10 +620,11 @@ func streamChunkFailure(chunk pluginapi.HostModelStreamReadResponse) executionFa
 	}, chunk.Error)
 }
 
-func emitPluginStreamChunk(ctx context.Context, streamID string, payload []byte) error {
+func emitPluginStreamChunk(ctx context.Context, streamID, hostCallbackID string, payload []byte) error {
 	_, errCall := callHost(pluginabi.MethodHostStreamEmit, rpcStreamEmitRequest{
-		StreamID: streamID,
-		Payload:  payload,
+		StreamID:       streamID,
+		HostCallbackID: hostCallbackID,
+		Payload:        payload,
 	})
 	return errCall
 }
@@ -341,9 +682,10 @@ func defaultRetryAfterSeconds(failure executionFailure) int {
 	return seconds
 }
 
-func closeHostModelStream(streamID string) error {
+func closeHostModelStream(streamID, hostCallbackID string) error {
 	_, errCall := callHost(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{
-		StreamID: streamID,
+		StreamID:       streamID,
+		HostCallbackID: hostCallbackID,
 	})
 	return errCall
 }

@@ -17,7 +17,43 @@ import (
 const (
 	modelExecutionMetadataSourceKey = "source"
 	modelExecutionInternalSource    = "plugin_host_model_callback"
+	modelExecutionCanceledCode      = "request_canceled"
+	modelExecutionCanceledStatus    = 499
 )
+
+type modelExecutionCanceledError struct {
+	cause error
+}
+
+func (e *modelExecutionCanceledError) Error() string {
+	if e == nil || e.cause == nil {
+		return "client request was canceled"
+	}
+	return e.cause.Error()
+}
+
+func (e *modelExecutionCanceledError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *modelExecutionCanceledError) ErrorCode() string {
+	return modelExecutionCanceledCode
+}
+
+func (e *modelExecutionCanceledError) StatusCode() int {
+	return modelExecutionCanceledStatus
+}
+
+func (e *modelExecutionCanceledError) Retryable() bool {
+	return false
+}
+
+func (e *modelExecutionCanceledError) IsRequestScoped() bool {
+	return true
+}
 
 type modelExecutionOptions struct {
 	Headers                 http.Header
@@ -116,6 +152,9 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 	if req.Stream {
 		return ModelExecutionResponse{}, modelExecutionModeError("ExecuteModel requires Stream=false")
 	}
+	if errMsg := canceledModelExecutionError(ctx); errMsg != nil {
+		return ModelExecutionResponse{}, errMsg
+	}
 	body, headers, errMsg := h.executeWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, req.AllowImageModel, modelExecutionOptions{
 		Headers:                 req.Headers,
 		Query:                   req.Query,
@@ -128,7 +167,7 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 		SkipRouterPluginID:      req.SkipRouterPluginID,
 	})
 	if errMsg != nil {
-		return ModelExecutionResponse{}, errMsg
+		return ModelExecutionResponse{}, normalizeCanceledModelExecutionError(ctx, errMsg)
 	}
 	return ModelExecutionResponse{
 		StatusCode: http.StatusOK,
@@ -143,6 +182,9 @@ func (h *BaseAPIHandler) CountModelTokens(ctx context.Context, req ModelExecutio
 	if req.Stream {
 		return ModelExecutionResponse{}, modelExecutionModeError("CountModelTokens requires Stream=false")
 	}
+	if errMsg := canceledModelExecutionError(ctx); errMsg != nil {
+		return ModelExecutionResponse{}, errMsg
+	}
 	body, headers, errMsg := h.executeCountWithAuthManager(ctx, req.EntryProtocol, req.Model, cloneBytes(req.Body), req.Alt, modelExecutionOptions{
 		Headers:                 req.Headers,
 		Query:                   req.Query,
@@ -155,7 +197,7 @@ func (h *BaseAPIHandler) CountModelTokens(ctx context.Context, req ModelExecutio
 		SkipRouterPluginID:      req.SkipRouterPluginID,
 	})
 	if errMsg != nil {
-		return ModelExecutionResponse{}, errMsg
+		return ModelExecutionResponse{}, normalizeCanceledModelExecutionError(ctx, errMsg)
 	}
 	return ModelExecutionResponse{
 		StatusCode: http.StatusOK,
@@ -172,6 +214,9 @@ func (h *BaseAPIHandler) ExecuteModelStream(ctx context.Context, req ModelExecut
 	if !req.Stream {
 		return ModelExecutionStream{}, modelExecutionModeError("ExecuteModelStream requires Stream=true")
 	}
+	if errMsg := canceledModelExecutionError(ctx); errMsg != nil {
+		return ModelExecutionStream{}, errMsg
+	}
 	dataChan, headers, errChan := h.executeStreamWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, req.AllowImageModel, modelExecutionOptions{
 		Headers:                 req.Headers,
 		Query:                   req.Query,
@@ -185,7 +230,7 @@ func (h *BaseAPIHandler) ExecuteModelStream(ctx context.Context, req ModelExecut
 	})
 	chunks, errMsg := prepareModelExecutionStream(ctx, dataChan, errChan)
 	if errMsg != nil {
-		return ModelExecutionStream{}, errMsg
+		return ModelExecutionStream{}, normalizeCanceledModelExecutionError(ctx, errMsg)
 	}
 	return ModelExecutionStream{
 		StatusCode: http.StatusOK,
@@ -243,6 +288,23 @@ func (h *BaseAPIHandler) ExecuteProtocolStreamWithAuthManager(ctx context.Contex
 
 func modelExecutionModeError(message string) *interfaces.ErrorMessage {
 	return &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errors.New(message)}
+}
+
+func canceledModelExecutionError(ctx context.Context) *interfaces.ErrorMessage {
+	if ctx == nil || ctx.Err() == nil {
+		return nil
+	}
+	return &interfaces.ErrorMessage{
+		StatusCode: modelExecutionCanceledStatus,
+		Error:      &modelExecutionCanceledError{cause: ctx.Err()},
+	}
+}
+
+func normalizeCanceledModelExecutionError(ctx context.Context, errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	if canceled := canceledModelExecutionError(ctx); canceled != nil {
+		return canceled
+	}
+	return errMsg
 }
 
 func modelExecutionResponseProtocol(entryProtocol, exitProtocol string) string {
@@ -313,20 +375,29 @@ func receiveInitialModelExecutionChunk(ctx context.Context, dataChan <-chan []by
 		case payload, ok := <-dataChan:
 			if !ok {
 				dataChan = nil
+				if dataChan == nil && errChan == nil {
+					return nil, dataChan, errChan, canceledModelExecutionError(ctx)
+				}
 				continue
 			}
 			return []ModelExecutionChunk{{Payload: cloneBytes(payload)}}, dataChan, errChan, nil
 		case errMsg, ok := <-errChan:
 			if !ok {
 				errChan = nil
+				if dataChan == nil && errChan == nil {
+					return nil, dataChan, errChan, canceledModelExecutionError(ctx)
+				}
 				continue
 			}
 			if errMsg != nil {
 				return nil, dataChan, errChan, errMsg
 			}
 		case <-done:
-			return nil, dataChan, errChan, nil
+			return nil, dataChan, errChan, canceledModelExecutionError(ctx)
 		}
+	}
+	if canceled := canceledModelExecutionError(ctx); canceled != nil {
+		return nil, dataChan, errChan, canceled
 	}
 	return nil, dataChan, errChan, nil
 }

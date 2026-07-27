@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -73,6 +74,39 @@ type dynamicHostCallbackEntry struct {
 
 type hostCallbackPluginIDKey struct{}
 
+const statusClientClosedRequest = 499
+
+type hostCallbackScopeError struct {
+	code    string
+	message string
+	status  int
+}
+
+func (e *hostCallbackScopeError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func (e *hostCallbackScopeError) ErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.code
+}
+
+func (e *hostCallbackScopeError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.status
+}
+
+func (e *hostCallbackScopeError) Retryable() bool {
+	return false
+}
+
 func withHostCallbackPluginID(ctx context.Context, pluginID string) context.Context {
 	pluginID = strings.TrimSpace(pluginID)
 	if pluginID == "" {
@@ -97,6 +131,12 @@ func hostCallbackPluginIDFromContext(ctx context.Context) string {
 
 func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
+	case pluginabi.MethodHostCallbackFork:
+		return h.callHostCallbackFork(ctx, request)
+	case pluginabi.MethodHostCallbackCommit:
+		return h.callHostCallbackCommit(ctx, request)
+	case pluginabi.MethodHostCallbackClose:
+		return h.callHostCallbackClose(ctx, request)
 	case pluginabi.MethodHostModelExecute:
 		return h.callHostModelExecute(ctx, request)
 	case pluginabi.MethodHostModelCountTokens:
@@ -106,7 +146,7 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 	case pluginabi.MethodHostModelStreamRead:
 		return h.callHostModelStreamRead(ctx, request)
 	case pluginabi.MethodHostModelStreamClose:
-		return h.callHostModelStreamClose(request)
+		return h.callHostModelStreamClose(ctx, request)
 	case pluginabi.MethodHostModelList:
 		return h.callHostModelList(ctx, request)
 	case pluginabi.MethodHostHTTPDo:
@@ -140,6 +180,115 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 	}
 }
 
+func (h *Host) callHostCallbackCommit(ctx context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.HostCallbackScopeRequest
+	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host callback commit request: %w", errUnmarshal)
+	}
+	callbackID := strings.TrimSpace(req.HostCallbackID)
+	if callbackID == "" {
+		return nil, invalidHostCallbackScopeError()
+	}
+	ok, forbidden, canceled := h.commitOwnedCallbackContext(callbackID, hostCallbackPluginIDFromContext(ctx))
+	if forbidden {
+		return nil, forbiddenHostCallbackScopeError()
+	}
+	if canceled {
+		return nil, canceledHostCallbackScopeError()
+	}
+	if !ok {
+		return nil, invalidHostCallbackScopeError()
+	}
+	return marshalRPCResult(rpcEmptyResponse{})
+}
+
+func (h *Host) callHostCallbackFork(ctx context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.HostCallbackScopeRequest
+	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host callback fork request: %w", errUnmarshal)
+	}
+	callbackID := strings.TrimSpace(req.HostCallbackID)
+	if callbackID == "" {
+		return nil, invalidHostCallbackScopeError()
+	}
+	childID, ok, forbidden, canceled := h.forkCallbackContext(callbackID, hostCallbackPluginIDFromContext(ctx))
+	if forbidden {
+		return nil, forbiddenHostCallbackScopeError()
+	}
+	if canceled {
+		return nil, canceledHostCallbackScopeError()
+	}
+	if !ok || childID == "" {
+		return nil, invalidHostCallbackScopeError()
+	}
+	return marshalRPCResult(pluginapi.HostCallbackScopeResponse{HostCallbackID: childID})
+}
+
+func (h *Host) callHostCallbackClose(ctx context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.HostCallbackScopeRequest
+	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host callback close request: %w", errUnmarshal)
+	}
+	callbackID := strings.TrimSpace(req.HostCallbackID)
+	if callbackID == "" {
+		return nil, invalidHostCallbackScopeError()
+	}
+	ok, forbidden := h.closeOwnedCallbackContext(callbackID, hostCallbackPluginIDFromContext(ctx))
+	if forbidden {
+		return nil, forbiddenHostCallbackScopeError()
+	}
+	if !ok {
+		return nil, invalidHostCallbackScopeError()
+	}
+	return marshalRPCResult(rpcEmptyResponse{})
+}
+
+func invalidHostCallbackScopeError() error {
+	return &hostCallbackScopeError{
+		code:    "host_callback_invalid",
+		message: "host callback context is unknown or closed",
+		status:  http.StatusBadRequest,
+	}
+}
+
+func forbiddenHostCallbackScopeError() error {
+	return &hostCallbackScopeError{
+		code:    "host_callback_forbidden",
+		message: "host callback context belongs to another plugin",
+		status:  http.StatusForbidden,
+	}
+}
+
+func canceledHostCallbackScopeError() error {
+	return &hostCallbackScopeError{
+		code:    "request_canceled",
+		message: "client request was canceled",
+		status:  statusClientClosedRequest,
+	}
+}
+
+func (h *Host) requiredModelCallbackContext(ctx context.Context, callbackID string) (context.Context, error) {
+	callbackID = strings.TrimSpace(callbackID)
+	if callbackID == "" {
+		if ctx == nil {
+			return context.Background(), nil
+		}
+		return ctx, nil
+	}
+	callerPluginID := strings.TrimSpace(hostCallbackPluginIDFromContext(ctx))
+	callbackCtx, ownerPluginID, active, canceled := h.resolveRequiredCallbackContext(callbackID)
+	if ownerPluginID != "" && callerPluginID != "" && ownerPluginID != callerPluginID {
+		return nil, forbiddenHostCallbackScopeError()
+	}
+	if canceled {
+		return nil, canceledHostCallbackScopeError()
+	}
+	if !active || callbackCtx == nil {
+		return nil, invalidHostCallbackScopeError()
+	}
+	return callbackCtx, nil
+}
+
 func (h *Host) callbackCallerPluginID(ctx context.Context, callbackID string) string {
 	if pluginID := hostCallbackPluginIDFromContext(ctx); pluginID != "" {
 		return pluginID
@@ -152,7 +301,10 @@ func (h *Host) callHostHTTPDo(ctx context.Context, request []byte) ([]byte, erro
 	if errDecode != nil {
 		return nil, errDecode
 	}
-	ctx = h.resolveCallbackContext(callbackID, ctx)
+	ctx, errDecode = h.requiredModelCallbackContext(ctx, callbackID)
+	if errDecode != nil {
+		return nil, errDecode
+	}
 	resp, errDo := h.newHTTPClient(nil).Do(ctx, httpReq)
 	if errDo != nil {
 		return nil, errDo
@@ -165,9 +317,9 @@ func (h *Host) callHostHTTPDoStream(ctx context.Context, request []byte) ([]byte
 	if errDecode != nil {
 		return nil, errDecode
 	}
-	ctx = h.resolveCallbackContext(callbackID, ctx)
-	if ctx == nil {
-		ctx = context.Background()
+	ctx, errDecode = h.requiredModelCallbackContext(ctx, callbackID)
+	if errDecode != nil {
+		return nil, errDecode
 	}
 	streamCtx, cancel := context.WithCancel(ctx)
 	resp, errDo := h.newHTTPClient(nil).DoStream(streamCtx, httpReq)
@@ -255,11 +407,19 @@ func (h *Host) callHostStreamEmit(ctx context.Context, request []byte) ([]byte, 
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode stream emit request: %w", errUnmarshal)
 	}
+	emitCtx, errContext := h.requiredModelCallbackContext(ctx, req.HostCallbackID)
+	if errContext != nil {
+		return nil, errContext
+	}
 	chunk := pluginapi.ExecutorStreamChunk{Payload: append([]byte(nil), req.Payload...)}
 	if req.Error != "" {
 		chunk.Err = fmt.Errorf("%s", req.Error)
 	}
-	if errEmit := h.streams.emit(ctx, req.StreamID, chunk); errEmit != nil {
+	errEmit := h.streams.emit(emitCtx, req.StreamID, chunk)
+	if emitCtx != nil && emitCtx.Err() != nil {
+		return nil, canceledHostCallbackScopeError()
+	}
+	if errEmit != nil {
 		return nil, errEmit
 	}
 	return marshalRPCResult(rpcEmptyResponse{})
@@ -287,7 +447,11 @@ func (h *Host) callHostModelExecute(ctx context.Context, request []byte) ([]byte
 		return nil, fmt.Errorf("host model executor is unavailable")
 	}
 	skipPluginID := h.callbackCallerPluginID(ctx, req.HostCallbackID)
-	ctx = h.resolveCallbackContext(req.HostCallbackID, ctx)
+	var errContext error
+	ctx, errContext = h.requiredModelCallbackContext(ctx, req.HostCallbackID)
+	if errContext != nil {
+		return nil, errContext
+	}
 	resp, errMsg := executor.ExecuteModel(ctx, modelExecutionRequestFromPlugin(req.HostModelExecutionRequest, skipPluginID))
 	if errMsg != nil {
 		return nil, modelExecutionError(errMsg)
@@ -316,7 +480,11 @@ func (h *Host) callHostModelCountTokens(ctx context.Context, request []byte) ([]
 		return nil, fmt.Errorf("host model token counter is unavailable")
 	}
 	skipPluginID := h.callbackCallerPluginID(ctx, req.HostCallbackID)
-	ctx = h.resolveCallbackContext(req.HostCallbackID, ctx)
+	var errContext error
+	ctx, errContext = h.requiredModelCallbackContext(ctx, req.HostCallbackID)
+	if errContext != nil {
+		return nil, errContext
+	}
 	resp, errMsg := counter.CountModelTokens(ctx, modelExecutionRequestFromPlugin(req.HostModelExecutionRequest, skipPluginID))
 	if errMsg != nil {
 		return nil, modelExecutionError(errMsg)
@@ -357,7 +525,11 @@ func (h *Host) callHostLog(ctx context.Context, request []byte) ([]byte, error) 
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode host log request: %w", errUnmarshal)
 	}
-	ctx = h.resolveCallbackContext(req.HostCallbackID, ctx)
+	var errContext error
+	ctx, errContext = h.requiredModelCallbackContext(ctx, req.HostCallbackID)
+	if errContext != nil {
+		return nil, errContext
+	}
 	message := strings.TrimSpace(req.Message)
 	if message == "" {
 		message = "plugin log"

@@ -2618,6 +2618,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			if errCtx := execCtx.Err(); errCtx != nil {
+				return cliproxyexecutor.Response{}, errCtx
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -2743,6 +2746,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			if errCtx := execCtx.Err(); errCtx != nil {
+				return cliproxyexecutor.Response{}, errCtx
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -2874,6 +2880,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			if errCtx := execCtx.Err(); errCtx != nil {
+				return nil, errCtx
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -3799,10 +3808,29 @@ func waitForCooldown(ctx context.Context, wait, maxWait time.Duration) error {
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
-	if result.AuthID == "" {
+	if result.AuthID == "" || (ctx != nil && ctx.Err() != nil) {
 		return
 	}
+	if gate := deferredResultAccountingFromContext(ctx); gate != nil {
+		deferredResult := result
+		deferredResult.Error = cloneError(result.Error)
+		if result.RetryAfter != nil {
+			retryAfter := *result.RetryAfter
+			deferredResult.RetryAfter = &retryAfter
+		}
+		applyCtx := context.Background()
+		if ctx != nil {
+			applyCtx = context.WithoutCancel(ctx)
+		}
+		gate.deferApply(func() {
+			m.markResult(applyCtx, deferredResult)
+		})
+		return
+	}
+	m.markResult(ctx, result)
+}
 
+func (m *Manager) markResult(ctx context.Context, result Result) {
 	shouldResumeModel := false
 	shouldSuspendModel := false
 	suspendReason := ""
@@ -3988,10 +4016,29 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 }
 
 func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Result) {
-	if result.AuthID == "" {
+	if result.AuthID == "" || (ctx != nil && ctx.Err() != nil) {
 		return
 	}
+	if gate := deferredResultAccountingFromContext(ctx); gate != nil {
+		deferredResult := result
+		deferredResult.Error = cloneError(result.Error)
+		if result.RetryAfter != nil {
+			retryAfter := *result.RetryAfter
+			deferredResult.RetryAfter = &retryAfter
+		}
+		applyCtx := context.Background()
+		if ctx != nil {
+			applyCtx = context.WithoutCancel(ctx)
+		}
+		gate.deferApply(func() {
+			m.recordAvailabilityNeutralResultNow(applyCtx, deferredResult)
+		})
+		return
+	}
+	m.recordAvailabilityNeutralResultNow(ctx, result)
+}
 
+func (m *Manager) recordAvailabilityNeutralResultNow(ctx context.Context, result Result) {
 	var authSnapshot *Auth
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -4440,6 +4487,7 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 func isRequestScopedResultError(err *Error) bool {
 	return err != nil &&
 		(err.Code == requestScopedErrorCode ||
+			err.Code == requestCanceledErrorCode ||
 			isRequestInvalidResultError(err) ||
 			isRequestScopedNotFoundResultError(err))
 }

@@ -40,6 +40,10 @@ plugins:
       require_smart_key: true
       max_attempts: 0
       cooldown_seconds: 30
+      # Start one contract-compatible cross-provider stream attempt if the
+      # primary has not produced its first payload after this many seconds.
+      # Set to 0 to keep purely sequential fallback.
+      fallback_hedge_delay_seconds: 40
       state_path: bravo-data/bravo-state.json
       allocator_mode: enforce
       quota_refresh_seconds: 60
