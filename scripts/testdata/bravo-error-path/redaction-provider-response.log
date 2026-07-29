@@ -1,0 +1,36 @@
+=== REQUEST INFO ===
+URL: /v1/messages
+Method: POST
+Timestamp: 2026-07-30T00:00:00Z
+
+=== HEADERS ===
+Authorization: Bearer brv_supersecret
+
+=== REQUEST BODY ===
+{"model":"bravo/sonnet","messages":[{"role":"user","content":"prompt-body-must-never-appear"}]}
+
+=== API REQUEST 1 ===
+Timestamp: 2026-07-30T00:00:01Z
+Upstream URL: https://api.anthropic.com/v1/messages
+HTTP Method: POST
+Auth: provider=claude, auth_id=auth-secret, label=Личный аккаунт, type=oauth
+
+Headers:
+Authorization: Bearer oauth-super-secret
+
+Body:
+{"model":"claude-fable-5","messages":[]}
+
+=== API RESPONSE 1 ===
+Timestamp: 2026-07-30T00:00:02Z
+Status: 429
+Headers:
+Content-Type: application/json
+
+Body:
+{"type":"error","authorization":"Bearer oauth-super-secret","error":{"type":"rate_limit_error","access_token":"oauth-super-secret","message":"Use sk-proj-supersecret then brv_supersecret; raw={\"api_key\":\"plainsecretvalue\"}"}}
+
+=== RESPONSE ===
+Status: 502
+
+{"type":"error","error":{"type":"api_error","message":"upstream failed"}}

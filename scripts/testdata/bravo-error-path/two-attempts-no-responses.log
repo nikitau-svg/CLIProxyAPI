@@ -1,0 +1,39 @@
+=== REQUEST INFO ===
+URL: /v1/messages
+Method: POST
+Timestamp: 2026-07-30T00:00:00Z
+
+=== HEADERS ===
+X-Claude-Code-Session-Id: session-two
+
+=== REQUEST BODY ===
+{"model":"bravo/opus","messages":[],"stream":true}
+
+=== API REQUEST 1 ===
+Timestamp: 2026-07-30T00:00:01Z
+Upstream URL: https://chatgpt.com/backend-api/codex/responses
+HTTP Method: POST
+Auth: provider=codex, auth_id=secret-auth-id, label=Codex primary, type=oauth
+
+Headers:
+Authorization: Bearer upstream-secret
+
+Body:
+{"model":"gpt-5.6-sol","input":"private first request"}
+
+=== API REQUEST 2 ===
+Timestamp: 2026-07-30T00:00:02Z
+Upstream URL: https://api.anthropic.com/v1/messages
+HTTP Method: POST
+Auth: provider=claude, auth_id=other-secret-id, label=Claude fallback, type=oauth
+
+Headers:
+X-Api-Key: upstream-secret
+
+Body:
+{"model":"claude-fable-5","messages":[{"role":"user","content":"private retry"}]}
+
+=== RESPONSE ===
+Status: 502
+
+{"type":"error","error":{"type":"api_error","message":"all attempts failed"}}

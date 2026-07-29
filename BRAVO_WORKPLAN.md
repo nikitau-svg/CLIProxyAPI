@@ -67,6 +67,23 @@ shared Docker prune commands are forbidden.
   Request IDs, payment/CTA fields, credentials, raw provider JSON, and other
   unreviewed fields stay out of API responses, UI, analytics, logs, and
   persistent state.
+- Error-path diagnostics use a separate local operator trace instead of the
+  general request log. The trace never stores prompts or request bodies. It
+  carries one outer request ID, the authenticated Bravo project ID/name,
+  logical model and route revision, plus ordered child attempt IDs for plan
+  rejection, provider start, provider error, retry decision, success, and
+  final response.
+- A provider error may be retained for diagnostics only as a bounded,
+  recursively redacted JSON document in a mode-0600 local store with short
+  retention. The trace keeps its hash and truncation state. Credentials,
+  cookies, authorization headers, payment identifiers, and arbitrary request
+  content remain forbidden; the unredacted provider body never crosses the
+  plugin ABI or reaches the client.
+- The integrated Management UI needs a project-aware error-path page. It must
+  show the exact route taken, skipped candidates and their eligibility reason,
+  every executed provider/model/subscription attempt, the sanitized provider
+  error, the retry decision, and missing-evidence warnings. Correlation by
+  session ID or timestamp alone is never presented as fact.
 - The integrated admin UI must expose a model compatibility/update center.
   Newly discovered provider models are never silently promoted into Bravo:
   the operator sees whether the current host, plugin, contract matrix, and

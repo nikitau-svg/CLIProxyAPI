@@ -1,0 +1,22 @@
+=== REQUEST INFO ===
+Version: test
+URL: /v1/messages?beta=true
+Method: POST
+Timestamp: 2026-07-30T00:24:24.294878752+08:00
+
+=== HEADERS ===
+Authorization: Bearer brv_live_secret
+X-Claude-Code-Session-Id: session-safe-123
+
+=== REQUEST BODY ===
+{"model":"bravo/gpt-5.6-sol","messages":[{"role":"user","content":"never print this prompt"},{"role":"assistant","content":"also private"}],"system":[{"type":"text","text":"private system"}],"tools":[{"name":"Read","description":"private tool description"}],"stream":true,"max_tokens":32000,"output_config":{"effort":"max"}}
+
+=== API RESPONSE ===
+Timestamp: 2026-07-30T00:24:24.933112627+08:00
+{"type":"error","error":{"type":"api_error","message":"bravo_no_eligible_account: Bravo has no healthy account for logical model gpt-5.6-sol (codex/gpt-5.6-sol eligibility(bravo_no_eligible_account): 1 codex credential(s): cooldown=1; claude/claude-fable-5 eligibility(bravo_no_eligible_account): 3 claude credential(s): cooldown=2 quota_exhausted=1)","code":"bravo_no_eligible_account"}}
+
+=== RESPONSE ===
+Status: 503
+Retry-After: 30
+
+{"type":"error","error":{"type":"api_error","message":"bravo_no_eligible_account: Bravo has no healthy account for logical model gpt-5.6-sol (codex/gpt-5.6-sol eligibility(bravo_no_eligible_account): 1 codex credential(s): cooldown=1; claude/claude-fable-5 eligibility(bravo_no_eligible_account): 3 claude credential(s): cooldown=2 quota_exhausted=1)","code":"bravo_no_eligible_account"}}
