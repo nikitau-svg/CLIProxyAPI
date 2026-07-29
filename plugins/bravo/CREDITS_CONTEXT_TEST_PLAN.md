@@ -284,6 +284,75 @@ Recorded RED evidence:
   variants leaked the rewritten Codex prelude before returning the terminal
   request-scoped context error.
 
+A post-merge smart-key canary adds a tenth RED phase:
+
+- creating, replacing, rotating, or deleting a project may trigger both the
+  management-request reload and the filesystem-watcher reload;
+- those reloads must never execute concurrently or let an older callback
+  complete after a newer callback;
+- every successful project-create or rotate response is a runtime contract:
+  its returned plaintext key must authenticate immediately on every protocol;
+- a deleted or superseded key must remain unavailable, and an older config
+  callback must never resurrect it;
+- the regression test must deterministically block the first config callback,
+  start a second reload after writing a newer config, and prove that callbacks
+  complete in persisted order without overlap. The final runtime callback and
+  watcher snapshot must both contain the newer config.
+
+Recorded canary evidence before the fix:
+
+- the final merged 0.7.9 image passed five synthetic scenarios, then
+  intermittently returned `401 Missing API key` for newly created project keys
+  on Anthropic Messages, OpenAI Responses, and reverse Codex-to-Claude paths;
+- the same canary and production container stayed healthy, and no production
+  state was modified;
+- successful creation and persistence followed by protocol-dependent 401s
+  exclude key generation and request-header parsing. The remaining
+  interleaving is concurrent config reload callbacks applying plugin runtime
+  snapshots out of order.
+
+Recorded RED tests:
+
+- `TestReloadConfigIfChangedSerializesCallbacksInPersistedOrder` proved that a
+  newer callback could enter while an older callback was still active;
+- `TestReloadConfigIfChangedDoesNotAcknowledgeUnappliedWrite` applied port 8080,
+  wrote port 9090 during the callback, then skipped 9090 because the old reload
+  acknowledged the newer file hash;
+- `TestLoadConfigDataDoesNotRewriteNewerLiveFile` proved that parsing a captured
+  snapshot with an older plaintext management secret could rewrite the newer
+  live YAML;
+- transaction review found a second mutation could enter after plugin-local
+  installation but before the first post-call reload. The deterministic
+  `TestPluginConfigListMutationSerializesThroughPostCallReload` now covers
+  overlapping append, append, and delete operations on actual `smart_keys`.
+
+The focused normal tests and ten repeated race-detector runs are GREEN after:
+
+- parsing and hashing one immutable captured YAML snapshot without live-file
+  writes;
+- serializing all manual and fsnotify config reloads;
+- deferring the plugin config reload until the native management call exits;
+- holding a dedicated plugin-mutation transaction lock through that reload;
+- refusing an already-closed callback lifecycle instead of running a
+  re-entrant cleanup inline.
+
+Pre-PR canary evidence:
+
+- candidate image
+  `sha256:86a3406ab64600efb8da7c3691d65c424e3e9ef1462b9ae474d0e2a02b84978f`
+  ran with the previously approved management UI bytes
+  `74da7ec03778a29b284a9fe7729c611707f5d098cbe6cd828763b018dd40171e`;
+- seven consecutive isolated smoke runs each passed all nine
+  credits/context/stream/fallback scenarios (63/63 total);
+- those runs performed 28 immediate post-create authentication probes and 28
+  immediate post-delete rejection probes without reproducing the stale
+  smart-key runtime;
+- the final three runs also rotated a live project key, immediately rejected
+  the superseded key, and authenticated the replacement key before continuing;
+- the canary finished healthy with no remaining disposable smart keys or
+  critical log markers. Production remained healthy on the unchanged 0.7.8
+  image throughout the test.
+
 ## Core and host regression coverage
 
 - The executor extracts nested `details.error_code=credits_required` from both

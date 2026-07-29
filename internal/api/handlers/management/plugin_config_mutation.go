@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	log "github.com/sirupsen/logrus"
 )
 
 const maxPluginConfigMutationValueBytes = 1 << 20
@@ -40,6 +42,14 @@ func (h *Handler) mutatePluginConfigList(
 			http.StatusBadRequest,
 		)
 	}
+
+	h.pluginConfigMutationMu.Lock()
+	releaseMutationLock := true
+	defer func() {
+		if releaseMutationLock {
+			h.pluginConfigMutationMu.Unlock()
+		}
+	}()
 
 	h.mu.Lock()
 	if h.cfg == nil {
@@ -121,7 +131,6 @@ func (h *Handler) mutatePluginConfigList(
 	snapshot := h.reloadSnapshotConfigLocked()
 	h.mu.Unlock()
 
-	h.reloadConfigAfterManagementSaveAsync(ctx, snapshot)
 	result, errResult := pluginConfigListMutationResult(next)
 	if errResult != nil {
 		return pluginhost.PluginConfigListMutationResult{}, pluginConfigMutationFailure(
@@ -130,6 +139,28 @@ func (h *Handler) mutatePluginConfigList(
 			http.StatusInternalServerError,
 		)
 	}
+	reloadCtx := context.Background()
+	if ctx != nil {
+		reloadCtx = context.WithoutCancel(ctx)
+	}
+	var finishOnce sync.Once
+	finishMutation := func(applyReload bool) {
+		finishOnce.Do(func() {
+			defer h.pluginConfigMutationMu.Unlock()
+			if !applyReload {
+				return
+			}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.WithField("panic", recovered).Error("management: deferred plugin config reload panicked")
+				}
+			}()
+			h.reloadConfigAfterManagementSave(reloadCtx, snapshot)
+		})
+	}
+	result.AfterPluginCall = func() { finishMutation(true) }
+	result.AbortPluginCall = func() { finishMutation(false) }
+	releaseMutationLock = false
 	return result, nil
 }
 

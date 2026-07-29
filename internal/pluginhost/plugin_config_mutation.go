@@ -22,6 +22,13 @@ type PluginConfigListMutationRequest struct {
 // mutated list so the caller can immediately synchronize its runtime state.
 type PluginConfigListMutationResult struct {
 	Items []json.RawMessage `json:"items"`
+	// AfterPluginCall runs after the active plugin management RPC returns but
+	// before its HTTP response is released. It is host-only and never crosses
+	// the plugin ABI.
+	AfterPluginCall func() `json:"-"`
+	// AbortPluginCall releases host-only mutation resources when the callback
+	// lifecycle closes before AfterPluginCall can be registered.
+	AbortPluginCall func() `json:"-"`
 }
 
 // PluginConfigListMutator persists an atomic list mutation scoped to pluginID.
@@ -134,6 +141,18 @@ func (h *Host) callHostPluginConfigListMutate(ctx context.Context, request []byt
 	result, errMutate := mutator(callbackCtx, callerPluginID, req.PluginConfigListMutationRequest)
 	if errMutate != nil {
 		return nil, errMutate
+	}
+	if result.AfterPluginCall != nil {
+		if !h.deferCallbackCleanup(req.HostCallbackID, result.AfterPluginCall) {
+			if result.AbortPluginCall != nil {
+				result.AbortPluginCall()
+			}
+			return nil, pluginConfigMutationError(
+				"plugin_config_callback_closed",
+				"plugin management callback closed before the configuration reload barrier was installed",
+				http.StatusServiceUnavailable,
+			)
+		}
 	}
 	return marshalRPCResult(result)
 }
