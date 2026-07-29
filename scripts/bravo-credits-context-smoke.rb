@@ -58,6 +58,7 @@ class BravoCreditsContextSmoke
       cleanup_stale_canary_projects
       claude_context, claude_messages, claude_chat, claude_responses, codex = isolated_subscriptions
       context_project = create_project("credits-context", claude_context, codex)
+      context_project = rotate_project(context_project)
 
       check("HTTP credits_required keeps the Fable reason beside the terminal context error") do
         started = Time.now.utc - 1
@@ -568,6 +569,12 @@ class BravoCreditsContextSmoke
     key = response.fetch("plaintext_key")
     @projects << project.fetch("id")
     @project_keys << key
+    request(
+      :get,
+      endpoint(@base, "/v1/models"),
+      key: key,
+      expected: 200
+    )
     { id: project.fetch("id"), key: key }
   rescue KeyError
     raise CreditsContextSmokeFailure, "project creation response is incomplete"
@@ -586,6 +593,37 @@ class BravoCreditsContextSmoke
     id = project.fetch(:id)
     management_json(:delete, "/v0/management/bravo/projects", { "id" => id })
     @projects.delete(id)
+    request(
+      :get,
+      endpoint(@base, "/v1/models"),
+      key: project.fetch(:key),
+      expected: 401
+    )
+  end
+
+  def rotate_project(project)
+    response = management_json(
+      :post,
+      "/v0/management/bravo/projects/rotate",
+      { "id" => project.fetch(:id) }
+    )
+    key = response.fetch("plaintext_key")
+    @project_keys << key
+    request(
+      :get,
+      endpoint(@base, "/v1/models"),
+      key: project.fetch(:key),
+      expected: 401
+    )
+    request(
+      :get,
+      endpoint(@base, "/v1/models"),
+      key: key,
+      expected: 200
+    )
+    { id: project.fetch(:id), key: key }
+  rescue KeyError
+    raise CreditsContextSmokeFailure, "project rotation response is incomplete"
   end
 
   def anthropic_request(key, model, text, stream:)

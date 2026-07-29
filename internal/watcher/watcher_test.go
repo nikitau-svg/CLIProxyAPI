@@ -228,6 +228,182 @@ func TestReloadConfigIfChanged_TriggersOnChangeAndSkipsUnchanged(t *testing.T) {
 	}
 }
 
+func TestReloadConfigIfChangedSerializesCallbacksInPersistedOrder(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	writeConfig := func(port int) {
+		t.Helper()
+		data, errMarshal := yaml.Marshal(&config.Config{
+			Port:    port,
+			AuthDir: authDir,
+		})
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		if errWrite := os.WriteFile(configPath, data, 0o644); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+	}
+
+	firstRelease := make(chan struct{})
+	callbackEntered := make(chan int, 2)
+	var completedMu sync.Mutex
+	completed := make([]int, 0, 2)
+	w := &Watcher{
+		configPath:     configPath,
+		authDir:        authDir,
+		lastAuthHashes: make(map[string]string),
+		reloadCallback: func(cfg *config.Config) {
+			callbackEntered <- cfg.Port
+			if cfg.Port == 8080 {
+				<-firstRelease
+			}
+			completedMu.Lock()
+			completed = append(completed, cfg.Port)
+			completedMu.Unlock()
+		},
+	}
+
+	writeConfig(8080)
+	firstDone := make(chan struct{})
+	go func() {
+		w.reloadConfigIfChanged()
+		close(firstDone)
+	}()
+	select {
+	case port := <-callbackEntered:
+		if port != 8080 {
+			t.Fatalf("first callback port = %d, want 8080", port)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first config callback did not start")
+	}
+	if w.configReloadRunMu.TryLock() {
+		w.configReloadRunMu.Unlock()
+		t.Fatal("config reload run lock was released while its callback was active")
+	}
+
+	writeConfig(9090)
+	secondDone := make(chan struct{})
+	go func() {
+		w.reloadConfigIfChanged()
+		close(secondDone)
+	}()
+	close(firstRelease)
+
+	for name, done := range map[string]<-chan struct{}{
+		"first":  firstDone,
+		"second": secondDone,
+	} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("%s config reload did not finish", name)
+		}
+	}
+	select {
+	case port := <-callbackEntered:
+		if port != 9090 {
+			t.Fatalf("second callback port = %d, want 9090", port)
+		}
+	default:
+		t.Fatal("second config callback did not run")
+	}
+
+	completedMu.Lock()
+	gotCompleted := append([]int(nil), completed...)
+	completedMu.Unlock()
+	if len(gotCompleted) != 2 || gotCompleted[0] != 8080 || gotCompleted[1] != 9090 {
+		t.Fatalf("callback completion order = %v, want [8080 9090]", gotCompleted)
+	}
+	w.clientsMutex.RLock()
+	finalConfig := w.config
+	w.clientsMutex.RUnlock()
+	if finalConfig == nil || finalConfig.Port != 9090 {
+		t.Fatalf("final watcher config = %#v, want port 9090", finalConfig)
+	}
+}
+
+func TestReloadConfigIfChangedDoesNotAcknowledgeUnappliedWrite(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	writeConfig := func(port int) {
+		t.Helper()
+		data, errMarshal := yaml.Marshal(&config.Config{
+			Port:    port,
+			AuthDir: authDir,
+		})
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		if errWrite := os.WriteFile(configPath, data, 0o644); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+	}
+
+	firstEntered := make(chan struct{})
+	firstRelease := make(chan struct{})
+	var callbackMu sync.Mutex
+	callbacks := make([]int, 0, 2)
+	w := &Watcher{
+		configPath:     configPath,
+		authDir:        authDir,
+		lastAuthHashes: make(map[string]string),
+		reloadCallback: func(cfg *config.Config) {
+			if cfg.Port == 8080 {
+				close(firstEntered)
+				<-firstRelease
+			}
+			callbackMu.Lock()
+			callbacks = append(callbacks, cfg.Port)
+			callbackMu.Unlock()
+		},
+	}
+
+	writeConfig(8080)
+	firstDone := make(chan struct{})
+	go func() {
+		w.reloadConfigIfChanged()
+		close(firstDone)
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first config callback did not start")
+	}
+
+	writeConfig(9090)
+	close(firstRelease)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first config reload did not finish")
+	}
+
+	w.reloadConfigIfChanged()
+
+	callbackMu.Lock()
+	gotCallbacks := append([]int(nil), callbacks...)
+	callbackMu.Unlock()
+	if len(gotCallbacks) != 2 || gotCallbacks[0] != 8080 || gotCallbacks[1] != 9090 {
+		t.Fatalf("config callbacks = %v, want [8080 9090]", gotCallbacks)
+	}
+	w.clientsMutex.RLock()
+	finalConfig := w.config
+	w.clientsMutex.RUnlock()
+	if finalConfig == nil || finalConfig.Port != 9090 {
+		t.Fatalf("final watcher config = %#v, want port 9090", finalConfig)
+	}
+}
+
 func TestStartAndStopSuccess(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := filepath.Join(tmpDir, "auth")

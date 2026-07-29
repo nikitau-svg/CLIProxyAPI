@@ -343,6 +343,20 @@ func (r *callbackContextRegistry) addCleanup(id string, cleanup func()) bool {
 	return true
 }
 
+func (r *callbackContextRegistry) deferCleanup(id string, cleanup func()) bool {
+	if r == nil || id == "" || cleanup == nil {
+		return false
+	}
+	r.mu.Lock()
+	entry, ok := r.contexts[id]
+	if ok {
+		entry.cleanup = append(entry.cleanup, cleanup)
+		r.contexts[id] = entry
+	}
+	r.mu.Unlock()
+	return ok
+}
+
 func (r *callbackContextRegistry) resolve(id string, fallback context.Context) context.Context {
 	if fallback == nil {
 		fallback = context.Background()
@@ -378,6 +392,13 @@ func (h *Host) addCallbackCleanup(id string, cleanup func()) bool {
 		return false
 	}
 	return h.callbackContexts.addCleanup(id, cleanup)
+}
+
+func (h *Host) deferCallbackCleanup(id string, cleanup func()) bool {
+	if h == nil || h.callbackContexts == nil {
+		return false
+	}
+	return h.callbackContexts.deferCleanup(id, cleanup)
 }
 
 func (h *Host) resolveCallbackContext(id string, fallback context.Context) context.Context {

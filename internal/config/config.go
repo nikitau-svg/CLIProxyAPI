@@ -744,7 +744,16 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.NormalizePluginsConfig()
 		return cfg, nil
 	}
+	return loadConfigData(configFile, data, optional, true)
+}
 
+// LoadConfigData parses one captured YAML configuration snapshot while
+// preserving the same defaults, normalization, and path handling as LoadConfig.
+func LoadConfigData(configFile string, data []byte) (*Config, error) {
+	return loadConfigData(configFile, data, false, false)
+}
+
+func loadConfigData(configFile string, data []byte, optional bool, persistSecretNormalization bool) (*Config, error) {
 	// Unmarshal the YAML data into the Config struct.
 	var cfg Config
 	// Set defaults before unmarshal so that absent keys keep defaults.
@@ -762,14 +771,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
-	if err = yaml.Unmarshal(data, &cfg); err != nil {
+	if errUnmarshal := yaml.Unmarshal(data, &cfg); errUnmarshal != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
 			cfgOptional := &Config{}
 			cfgOptional.NormalizePluginsConfig()
 			return cfgOptional, nil
 		}
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+		return nil, fmt.Errorf("failed to parse config file: %w", errUnmarshal)
 	}
 
 	// Hash remote management key if plaintext is detected (nested)
@@ -781,9 +790,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 		cfg.RemoteManagement.SecretKey = hashed
 
-		// Persist the hashed value back to the config file to avoid re-hashing on next startup.
-		// Preserve YAML comments and ordering; update only the nested key.
-		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "secret-key"}, hashed)
+		if persistSecretNormalization {
+			// Persist the hashed value back to the config file to avoid re-hashing on next startup.
+			// Preserve YAML comments and ordering; update only the nested key.
+			_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "secret-key"}, hashed)
+		}
 	}
 
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
