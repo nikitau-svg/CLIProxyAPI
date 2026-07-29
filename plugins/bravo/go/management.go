@@ -254,7 +254,7 @@ func summarizeBravoProviders(cfg pluginConfig, auths []pluginapi.HostAuthFileEnt
 			providers[provider] = summary
 		}
 		summary.Accounts++
-		switch classifyBravoAuthHealth(provider, auth, now) {
+		switch classifyBravoAuthPoolHealth(provider, auth, now) {
 		case bravoAuthReady:
 			summary.Healthy++
 		case bravoAuthCooldown:
@@ -326,6 +326,18 @@ func classifyBravoAuthHealth(provider string, auth pluginapi.HostAuthFileEntry, 
 	return bravoAuthReady
 }
 
+// classifyBravoAuthPoolHealth is the credential-level verdict for quota
+// refreshes and provider summaries. Once Core exposes any per-model state, the
+// top-level status/deadline may be an aggregate derived solely from one failed
+// model. In that case only explicit credential facts may block the account.
+// Without model states, preserve the legacy credential-wide classification.
+func classifyBravoAuthPoolHealth(provider string, auth pluginapi.HostAuthFileEntry, now time.Time) bravoAuthHealth {
+	if len(auth.ModelStates) > 0 {
+		return classifyBravoAuthCredentialGate(provider, auth, now)
+	}
+	return classifyBravoAuthHealth(provider, auth, now)
+}
+
 // classifyBravoAuthHealthForModel narrows credential health to a single model,
 // and is the only classifier routing may use.
 //
@@ -365,6 +377,13 @@ func classifyBravoAuthHealthGate(provider string, auth pluginapi.HostAuthFileEnt
 	}
 	state, ok := hostModelState(auth, model)
 	if !ok {
+		if len(auth.ModelStates) > 0 {
+			// Match Core's native selector exactly: once any per-model state
+			// exists, an absent state for the requested model is available.
+			// The aggregate deadline may have been derived solely from the
+			// known failed model and cannot be applied to an unseen sibling.
+			return classifyBravoAuthCredentialGate(provider, auth, now)
+		}
 		// No per-model state: the roll-up is all the host has. Read only the part
 		// of it that carries a deadline.
 		//
@@ -401,6 +420,23 @@ func classifyBravoAuthHealthGate(provider string, auth pluginapi.HostAuthFileEnt
 	return bravoAuthReady
 }
 
+// classifyBravoAuthCredentialGate applies only credential-wide facts. It
+// deliberately ignores the host's aggregate availability/deadline because
+// those fields can be a lossy roll-up of one known model state.
+func classifyBravoAuthCredentialGate(provider string, auth pluginapi.HostAuthFileEntry, now time.Time) bravoAuthHealth {
+	if auth.Disabled || strings.EqualFold(strings.TrimSpace(auth.Status), "disabled") {
+		return bravoAuthDisabled
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return bravoAuthUnavailable
+	}
+	if cooldownActive(provider, authID, "", now) {
+		return bravoAuthCooldown
+	}
+	return bravoAuthReady
+}
+
 // classifyBravoAuthHealthDeadline is the routing verdict for a credential the
 // host reports no per-model state for. It mirrors the native selector: only a
 // live deadline blocks, because every other roll-up field is cleared by a
@@ -425,22 +461,47 @@ func classifyBravoAuthHealthDeadline(provider string, auth pluginapi.HostAuthFil
 	return bravoAuthReady
 }
 
-// hostModelState looks up per-model health, tolerating the thinking suffixes the
-// host strips when it keys its own model states.
+// hostModelState looks up per-model health by physical model. Core persists the
+// actual execution key, including an automatic effort suffix such as "(xhigh)",
+// while Bravo plans against the base candidate name. Aggregate every equivalent
+// stored key so map iteration or a clean state for another effort cannot hide an
+// active cooldown for the same physical model.
 func hostModelState(auth pluginapi.HostAuthFileEntry, model string) (pluginapi.HostAuthModelState, bool) {
-	model = strings.TrimSpace(model)
+	model = baseModelKey(strings.TrimSpace(model))
 	if model == "" || len(auth.ModelStates) == 0 {
 		return pluginapi.HostAuthModelState{}, false
 	}
-	if state, ok := auth.ModelStates[model]; ok {
-		return state, true
+	var aggregate pluginapi.HostAuthModelState
+	matched := false
+	for storedModel, state := range auth.ModelStates {
+		if baseModelKey(strings.TrimSpace(storedModel)) != model {
+			continue
+		}
+		matched = true
+		aggregate = mergeHostModelHealthState(aggregate, state)
 	}
-	if base := baseModelKey(model); base != "" && base != model {
-		if state, ok := auth.ModelStates[base]; ok {
-			return state, true
+	return aggregate, matched
+}
+
+func mergeHostModelHealthState(
+	aggregate, state pluginapi.HostAuthModelState,
+) pluginapi.HostAuthModelState {
+	if aggregate.Status == "" || strings.EqualFold(strings.TrimSpace(state.Status), "disabled") {
+		aggregate.Status = state.Status
+	}
+	if state.Unavailable {
+		aggregate.Unavailable = true
+		if state.NextRetryAfter.After(aggregate.NextRetryAfter) {
+			aggregate.NextRetryAfter = state.NextRetryAfter
 		}
 	}
-	return pluginapi.HostAuthModelState{}, false
+	if state.QuotaExceeded {
+		aggregate.QuotaExceeded = true
+		if state.QuotaRecoverAt.After(aggregate.QuotaRecoverAt) {
+			aggregate.QuotaRecoverAt = state.QuotaRecoverAt
+		}
+	}
+	return aggregate
 }
 
 // baseModelKey strips a thinking suffix the way the host's canonicalModelKey

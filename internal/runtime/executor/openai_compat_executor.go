@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/sjson"
@@ -782,16 +783,41 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 }
 
 type statusErr struct {
-	code       int
-	msg        string
-	retryAfter *time.Duration
+	code          int
+	msg           string
+	retryAfter    *time.Duration
+	providerError *providererror.Detail
 }
 
 func (e statusErr) Error() string {
+	if detail, ok := e.ProviderErrorDetail(); ok {
+		if summary := strings.TrimSpace(detail.Summary()); summary != "" {
+			return summary
+		}
+	}
 	if e.msg != "" {
 		return e.msg
 	}
 	return fmt.Sprintf("status %d", e.code)
+}
+func (e statusErr) ErrorCode() string {
+	if detail, ok := e.ProviderErrorDetail(); ok {
+		return detail.Code
+	}
+	detail, ok := providererror.Parse(e.msg)
+	if !ok {
+		return ""
+	}
+	return detail.Code
+}
+func (e statusErr) ProviderErrorDetail() (providererror.Detail, bool) {
+	if e.providerError != nil {
+		detail := providererror.Sanitize(*e.providerError)
+		if detail.Code != "" || detail.Type != "" || detail.Message != "" {
+			return detail, true
+		}
+	}
+	return providererror.Parse(e.msg)
 }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 )
 
 // Plugin is the host-side representation produced from a dynamic plugin registration.
@@ -698,6 +700,8 @@ type HostModelExecutionError struct {
 	Headers http.Header `json:"headers,omitempty"`
 	// RetryAfter preserves the Retry-After header value when present.
 	RetryAfter string `json:"retry_after,omitempty"`
+	// ProviderError carries only reviewed, sanitized provider diagnostics.
+	ProviderError *providererror.Detail `json:"provider_error,omitempty"`
 }
 
 // HostModelStreamCloseRequest asks the host to close a model stream.
@@ -762,8 +766,30 @@ type HostRecentRequestEntry struct {
 type HostAuthModelState struct {
 	// Status is the model's own lifecycle status.
 	Status string `json:"status,omitempty"`
-	// StatusMessage carries the latest status detail for this model.
+	// StatusMessage carries a safe, human-readable status summary for this
+	// model. Provider response bodies and request identifiers must not cross the
+	// host callback boundary through this field.
 	StatusMessage string `json:"status_message,omitempty"`
+	// ErrorCode is the safe machine-readable provider or normalized error code.
+	ErrorCode string `json:"error_code,omitempty"`
+	// ErrorMessage is a safe provider message with structured response
+	// envelopes and request identifiers removed.
+	ErrorMessage string `json:"error_message,omitempty"`
+	// ProviderModel is the provider-native model named by the failure.
+	ProviderModel string `json:"provider_model,omitempty"`
+	// ProviderModelDisplayName is the provider's safe human-readable model name.
+	ProviderModelDisplayName string `json:"provider_model_display_name,omitempty"`
+	// ProviderNoticeTitle is the safe title from a reviewed provider notice.
+	ProviderNoticeTitle string `json:"provider_notice_title,omitempty"`
+	// ProviderNoticeText is the safe explanatory text from a reviewed provider
+	// notice.
+	ProviderNoticeText string `json:"provider_notice_text,omitempty"`
+	// ProviderDisabledReason is a safe machine-readable provider restriction.
+	ProviderDisabledReason string `json:"provider_disabled_reason,omitempty"`
+	// Scope reports whether the failure applies to a model or a credential.
+	Scope string `json:"scope,omitempty"`
+	// Reason is the normalized safe reason used for operator presentation.
+	Reason string `json:"reason,omitempty"`
 	// Unavailable reports whether this model is currently blocked for retries.
 	// It is only meaningful together with NextRetryAfter: the host treats an
 	// unavailable model with no deadline as usable again.
@@ -774,6 +800,8 @@ type HostAuthModelState struct {
 	QuotaExceeded bool `json:"quota_exceeded,omitempty"`
 	// QuotaRecoverAt is when the quota window is expected to reopen.
 	QuotaRecoverAt time.Time `json:"quota_recover_at,omitempty"`
+	// UpdatedAt is when the host last updated this model state.
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 // HostAuthFileEntry describes one credential exposed through host auth callbacks.

@@ -137,7 +137,7 @@ func refreshQuotaSnapshots(hostCallbackID string, auths []pluginapi.HostAuthFile
 		if provider != "claude" && provider != "codex" {
 			continue
 		}
-		if strings.TrimSpace(auth.AuthIndex) == "" || classifyBravoAuthHealth(provider, auth, time.Now()) != bravoAuthReady {
+		if strings.TrimSpace(auth.AuthIndex) == "" || classifyBravoAuthPoolHealth(provider, auth, time.Now()) != bravoAuthReady {
 			continue
 		}
 		wg.Add(1)

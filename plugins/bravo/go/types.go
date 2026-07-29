@@ -5,12 +5,13 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.7.8"
+	pluginVersion    = "0.7.9"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -29,12 +30,13 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code       string      `json:"code"`
-	Message    string      `json:"message"`
-	Retryable  bool        `json:"retryable,omitempty"`
-	HTTPStatus int         `json:"http_status,omitempty"`
-	Headers    http.Header `json:"headers,omitempty"`
-	RetryAfter string      `json:"retry_after,omitempty"`
+	Code          string                `json:"code"`
+	Message       string                `json:"message"`
+	Retryable     bool                  `json:"retryable,omitempty"`
+	HTTPStatus    int                   `json:"http_status,omitempty"`
+	Headers       http.Header           `json:"headers,omitempty"`
+	RetryAfter    string                `json:"retry_after,omitempty"`
+	ProviderError *providererror.Detail `json:"provider_error,omitempty"`
 }
 
 type lifecycleRequest struct {
@@ -185,30 +187,39 @@ type executionAttempt struct {
 }
 
 type attemptRecord struct {
-	At              time.Time `json:"at"`
-	LogicalModel    string    `json:"logical_model"`
-	Provider        string    `json:"provider"`
-	Model           string    `json:"model"`
-	Effort          string    `json:"effort,omitempty"`
-	RequestedEffort string    `json:"requested_effort,omitempty"`
-	EffectiveEffort string    `json:"effective_effort,omitempty"`
-	AuthID          string    `json:"auth_id"`
-	AuthLabel       string    `json:"auth_label,omitempty"`
-	Status          int       `json:"status"`
-	Success         bool      `json:"success"`
-	Retryable       bool      `json:"retryable,omitempty"`
-	ErrorCode       string    `json:"error_code,omitempty"`
-	Error           string    `json:"error,omitempty"`
-	LatencyMS       int64     `json:"latency_ms"`
+	At                       time.Time `json:"at"`
+	LogicalModel             string    `json:"logical_model"`
+	Provider                 string    `json:"provider"`
+	Model                    string    `json:"model"`
+	Effort                   string    `json:"effort,omitempty"`
+	RequestedEffort          string    `json:"requested_effort,omitempty"`
+	EffectiveEffort          string    `json:"effective_effort,omitempty"`
+	AuthID                   string    `json:"auth_id"`
+	AuthLabel                string    `json:"auth_label,omitempty"`
+	Status                   int       `json:"status"`
+	Success                  bool      `json:"success"`
+	Retryable                bool      `json:"retryable,omitempty"`
+	ErrorCode                string    `json:"error_code,omitempty"`
+	Error                    string    `json:"error,omitempty"`
+	ProviderErrorCode        string    `json:"provider_error_code,omitempty"`
+	ProviderModel            string    `json:"provider_model,omitempty"`
+	ProviderModelDisplayName string    `json:"provider_model_display_name,omitempty"`
+	ProviderNoticeTitle      string    `json:"provider_notice_title,omitempty"`
+	ProviderNoticeText       string    `json:"provider_notice_text,omitempty"`
+	ProviderDisabledReason   string    `json:"provider_disabled_reason,omitempty"`
+	ProviderErrorReason      string    `json:"provider_error_reason,omitempty"`
+	Scope                    string    `json:"scope,omitempty"`
+	LatencyMS                int64     `json:"latency_ms"`
 }
 
 type hostCallError struct {
-	Code       string
-	Message    string
-	Retryable  bool
-	HTTPStatus int
-	Headers    http.Header
-	RetryAfter string
+	Code          string
+	Message       string
+	Retryable     bool
+	HTTPStatus    int
+	Headers       http.Header
+	RetryAfter    string
+	ProviderError *providererror.Detail
 }
 
 func (e *hostCallError) Error() string {
@@ -219,6 +230,28 @@ func (e *hostCallError) Error() string {
 		return e.Message
 	}
 	return e.Code + ": " + e.Message
+}
+
+func (e *hostCallError) ProviderErrorDetail() (providererror.Detail, bool) {
+	if e == nil || e.ProviderError == nil {
+		return providererror.Detail{}, false
+	}
+	detail := providererror.Sanitize(*e.ProviderError)
+	if detail.Code == "" && detail.Type == "" && detail.Message == "" {
+		return providererror.Detail{}, false
+	}
+	return detail, true
+}
+
+func sanitizedProviderErrorPointer(source *providererror.Detail) *providererror.Detail {
+	if source == nil {
+		return nil
+	}
+	detail := providererror.Sanitize(*source)
+	if detail.Code == "" && detail.Type == "" && detail.Message == "" {
+		return nil
+	}
+	return &detail
 }
 
 type capabilitySet map[string]struct{}

@@ -110,9 +110,30 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 	}
 	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
 	var lastFailure executionFailure
+	failureTraces := make([]executionFailureTrace, 0, len(plan))
 	providerCalls := 0
 	attempted := make(map[int]bool, len(plan))
 	hedgeUsed := false
+
+	rememberFailure := func(run *bravoStreamAttemptRun, failure executionFailure) {
+		lastFailure = failure
+		if run == nil {
+			return
+		}
+		failureTraces = appendExecutionFailureTrace(failureTraces, run.attempt, failure)
+	}
+	closeTerminalFailure := func(failure executionFailure) {
+		closePluginStreamFailure(pluginStreamID, finalExecutionFailure(failureTraces, failure))
+	}
+	canContinueStreamingRoute := func(failure executionFailure) bool {
+		// A context overflow is request-scoped and never cools the credential,
+		// but blindly moving to another model can only repeat the failure or
+		// silently change behavior. Candidate config does not yet carry a
+		// verified context-window size, so streaming must fail closed until a
+		// strictly larger compatible candidate can be proven.
+		return executionFailureCanContinueRoute(failure) &&
+			!executionFailureBlocksPhysicalModel(failure)
+	}
 
 	canHedgeFrom := func(index int) bool {
 		if hedgeUsed ||
@@ -227,8 +248,8 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 			if preflightFailure.Status == http.StatusUnprocessableEntity {
 				continue
 			}
-			if !preflightFailure.Retryable {
-				closePluginStreamFailure(pluginStreamID, *preflightFailure)
+			if !canContinueStreamingRoute(*preflightFailure) {
+				closeTerminalFailure(*preflightFailure)
 				return
 			}
 			continue
@@ -302,18 +323,18 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 						return
 					}
 					if winnerFailure != nil {
-						lastFailure = *winnerFailure
-						if !winnerFailure.Retryable {
+						rememberFailure(primary, *winnerFailure)
+						if !canContinueStreamingRoute(*winnerFailure) {
 							if hedgeResults != nil {
 								settleBravoCompetingAttempt(hedge, hedgeResults, winnerFailure)
 								hedgeResults = nil
 							}
-							closePluginStreamFailure(pluginStreamID, *winnerFailure)
+							closeTerminalFailure(*winnerFailure)
 							return
 						}
 					}
 					if hedgeResults == nil && deferredHedgeTerminal != nil {
-						closePluginStreamFailure(pluginStreamID, *deferredHedgeTerminal)
+						closeTerminalFailure(*deferredHedgeTerminal)
 						return
 					}
 					continue
@@ -327,18 +348,18 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 					}
 				}
 				finishBravoStreamAttemptFailure(primary, *result.failure, result.accepted)
-				lastFailure = *result.failure
-				if !result.failure.Retryable {
+				rememberFailure(primary, *result.failure)
+				if !canContinueStreamingRoute(*result.failure) {
 					stopHedgeTimer()
 					if hedgeResults != nil {
 						settleBravoCompetingAttempt(hedge, hedgeResults, result.failure)
 						hedgeResults = nil
 					}
-					closePluginStreamFailure(pluginStreamID, *result.failure)
+					closeTerminalFailure(*result.failure)
 					return
 				}
 				if hedgeResults == nil && deferredHedgeTerminal != nil {
-					closePluginStreamFailure(pluginStreamID, *deferredHedgeTerminal)
+					closeTerminalFailure(*deferredHedgeTerminal)
 					return
 				}
 			case result := <-hedgeResults:
@@ -366,21 +387,21 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 						return
 					}
 					if winnerFailure != nil {
-						lastFailure = *winnerFailure
-						if !winnerFailure.Retryable {
+						rememberFailure(hedge, *winnerFailure)
+						if !canContinueStreamingRoute(*winnerFailure) {
 							if winnerFailure.Code == "request_canceled" {
 								if primaryResults != nil {
 									settleBravoCompetingAttempt(primary, primaryResults, winnerFailure)
 									primaryResults = nil
 								}
-								closePluginStreamFailure(pluginStreamID, *winnerFailure)
+								closeTerminalFailure(*winnerFailure)
 								return
 							}
 							if primaryResults != nil {
 								failureCopy := *winnerFailure
 								deferredHedgeTerminal = &failureCopy
 							} else {
-								closePluginStreamFailure(pluginStreamID, *winnerFailure)
+								closeTerminalFailure(*winnerFailure)
 								return
 							}
 						}
@@ -396,21 +417,21 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 					}
 				}
 				finishBravoStreamAttemptFailure(hedge, *result.failure, result.accepted)
-				lastFailure = *result.failure
-				if !result.failure.Retryable {
+				rememberFailure(hedge, *result.failure)
+				if !canContinueStreamingRoute(*result.failure) {
 					if result.failure.Code == "request_canceled" {
 						if primaryResults != nil {
 							settleBravoCompetingAttempt(primary, primaryResults, result.failure)
 							primaryResults = nil
 						}
-						closePluginStreamFailure(pluginStreamID, *result.failure)
+						closeTerminalFailure(*result.failure)
 						return
 					}
 					if primaryResults != nil {
 						failureCopy := *result.failure
 						deferredHedgeTerminal = &failureCopy
 					} else {
-						closePluginStreamFailure(pluginStreamID, *result.failure)
+						closeTerminalFailure(*result.failure)
 						return
 					}
 				}
@@ -422,17 +443,17 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 				hedge, hedgeFailure, hedgeLaunched = findHedge(index)
 				if hedgeFailure != nil {
 					lastFailure = *hedgeFailure
-					if !hedgeFailure.Retryable {
+					if !canContinueStreamingRoute(*hedgeFailure) {
 						if hedgeFailure.Code == "request_canceled" {
 							if primaryResults != nil {
 								settleBravoCompetingAttempt(primary, primaryResults, hedgeFailure)
 								primaryResults = nil
 							}
-							closePluginStreamFailure(pluginStreamID, *hedgeFailure)
+							closeTerminalFailure(*hedgeFailure)
 							return
 						}
 						if primaryResults == nil {
-							closePluginStreamFailure(pluginStreamID, *hedgeFailure)
+							closeTerminalFailure(*hedgeFailure)
 							return
 						}
 						failureCopy := *hedgeFailure
@@ -446,7 +467,7 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 		}
 		stopHedgeTimer()
 		if deferredHedgeTerminal != nil {
-			closePluginStreamFailure(pluginStreamID, *deferredHedgeTerminal)
+			closeTerminalFailure(*deferredHedgeTerminal)
 			return
 		}
 	}
@@ -458,7 +479,7 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 			Status:  http.StatusUnprocessableEntity,
 		}
 	}
-	closePluginStreamFailure(pluginStreamID, lastFailure)
+	closeTerminalFailure(lastFailure)
 }
 
 func forwardBravoStreamWinner(
@@ -481,6 +502,7 @@ func forwardBravoStreamWinner(
 		response.StreamID,
 		pluginStreamID,
 		protocol,
+		run.attempt.Candidate.Provider,
 		run.physicalModel,
 		logicalModelID,
 		run.callbackID,
@@ -523,15 +545,64 @@ func forwardBravoStreamWinner(
 
 func forwardCandidateStream(
 	ctx context.Context,
-	hostStreamID, pluginStreamID, protocol, physicalModel, logicalModel, hostCallbackID string,
+	hostStreamID, pluginStreamID, protocol, provider, physicalModel, logicalModel, hostCallbackID string,
 	onCommit func() error,
 ) (bool, *executionFailure) {
+	const maxBufferedPreludeBytes = 256 << 10
+
 	rewriter := streamModelRewriter{
 		physical: physicalModel,
 		logical:  logicalModel,
 		protocol: protocol,
 	}
 	committed := false
+	claudeProviderStream := normalizeProvider(provider) == "claude"
+	pendingPrelude := make([][]byte, 0, 2)
+	pendingPreludeBytes := 0
+
+	commitBeforeEmit := func() *executionFailure {
+		if committed {
+			return nil
+		}
+		// Once a substantive block is observed, fallback would splice two
+		// provider streams even if the downstream emit itself fails.
+		committed = true
+		if onCommit == nil {
+			return nil
+		}
+		if errCommit := onCommit(); errCommit != nil {
+			failure := classifyExecutionError(errCommit)
+			failure.Retryable = false
+			return &failure
+		}
+		return nil
+	}
+	emitPayload := func(payload []byte) *executionFailure {
+		if len(payload) == 0 {
+			return nil
+		}
+		if errEmit := emitPluginStreamChunk(ctx, pluginStreamID, hostCallbackID, payload); errEmit != nil {
+			failure := classifyExecutionError(errEmit)
+			failure.Retryable = false
+			return &failure
+		}
+		return nil
+	}
+	flushPendingPrelude := func(payload []byte) *executionFailure {
+		if failure := commitBeforeEmit(); failure != nil {
+			return failure
+		}
+		buffered := pendingPrelude
+		pendingPrelude = nil
+		pendingPreludeBytes = 0
+		for _, prelude := range buffered {
+			if failure := emitPayload(prelude); failure != nil {
+				return failure
+			}
+		}
+		return emitPayload(payload)
+	}
+
 	for {
 		rawChunk, errRead := callHost(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{
 			StreamID:       hostStreamID,
@@ -552,19 +623,41 @@ func forwardCandidateStream(
 		}
 		if chunk.ErrorDetail != nil || strings.TrimSpace(chunk.Error) != "" {
 			failure := streamChunkFailure(chunk)
-			if committed {
-				failure.Retryable = false
-			}
 			return committed, &failure
+		}
+		if claudeProviderStream && len(chunk.Payload) > 0 {
+			// Claude may deliver a provider error as an ordinary SSE payload
+			// instead of ErrorDetail. Intercept reviewed credits_required and
+			// fail closed on other structured error envelopes so neither raw
+			// request IDs nor payment details reach the client.
+			if failure := claudeStreamPayloadFailure(chunk.Payload); failure != nil {
+				return committed, failure
+			}
 		}
 		for _, payload := range rewriter.Push(chunk.Payload) {
 			if len(payload) == 0 {
 				continue
 			}
-			if errEmit := emitPluginStreamChunk(ctx, pluginStreamID, hostCallbackID, payload); errEmit != nil {
-				failure := classifyExecutionError(errEmit)
-				failure.Retryable = false
-				return committed, &failure
+			if !committed {
+				// Host streams are already translated to the client protocol.
+				// Buffer its recognized non-substantive prelude regardless of
+				// which physical provider produced it, so a terminal failure
+				// cannot commit an otherwise invisible attempt.
+				contentful := providerStreamPayloadContainsContent(protocol, payload)
+				if !contentful && pendingPreludeBytes+len(payload) <= maxBufferedPreludeBytes {
+					pendingPrelude = append(pendingPrelude, append([]byte(nil), payload...))
+					pendingPreludeBytes += len(payload)
+					continue
+				}
+				if len(pendingPrelude) > 0 {
+					if failure := flushPendingPrelude(payload); failure != nil {
+						return true, failure
+					}
+					continue
+				}
+			}
+			if failure := emitPayload(payload); failure != nil {
+				return committed, failure
 			}
 			if !committed {
 				committed = true
@@ -578,11 +671,14 @@ func forwardCandidateStream(
 			}
 		}
 		if chunk.Done {
+			if !committed && len(pendingPrelude) > 0 {
+				if failure := flushPendingPrelude(nil); failure != nil {
+					return true, failure
+				}
+			}
 			if tail := rewriter.Flush(); len(tail) > 0 {
-				if errEmit := emitPluginStreamChunk(ctx, pluginStreamID, hostCallbackID, tail); errEmit != nil {
-					failure := classifyExecutionError(errEmit)
-					failure.Retryable = false
-					return committed, &failure
+				if failure := emitPayload(tail); failure != nil {
+					return committed, failure
 				}
 				if !committed {
 					committed = true
@@ -600,6 +696,143 @@ func forwardCandidateStream(
 	}
 }
 
+func claudeStreamPayloadFailure(payload []byte) *executionFailure {
+	raw, ok := firstStreamJSONObject(payload)
+	if !ok {
+		return nil
+	}
+	if _, reviewed := creditsRequiredProviderDetail(raw); reviewed {
+		failure := classifyProviderFailureSignal(executionFailure{
+			Code:      "bravo_host_stream_error",
+			Message:   "Provider model credits are exhausted.",
+			Status:    http.StatusTooManyRequests,
+			Retryable: true,
+		}, raw)
+		return &failure
+	}
+
+	var envelope struct {
+		Type  string          `json:"type"`
+		Error json.RawMessage `json:"error"`
+	}
+	if errUnmarshal := json.Unmarshal([]byte(raw), &envelope); errUnmarshal != nil ||
+		!strings.EqualFold(strings.TrimSpace(envelope.Type), "error") {
+		return nil
+	}
+	return &executionFailure{
+		Code:    "bravo_provider_stream_error",
+		Message: "Provider returned an unrecognized structured error before completing the response.",
+		Status:  http.StatusBadGateway,
+	}
+}
+
+func providerStreamPayloadContainsContent(protocol string, payload []byte) bool {
+	switch normalizeContractProtocol(protocol) {
+	case protocolClaude:
+		return claudeStreamPayloadContainsContent(payload)
+	case protocolOpenAI:
+		return !openAIChatStreamPrelude(payload)
+	case protocolOpenAIResponse:
+		return !openAIResponsesStreamPrelude(payload)
+	default:
+		// Unknown translated shapes are client-visible by definition. Commit
+		// rather than widening the fallback window by guessing.
+		return true
+	}
+}
+
+func claudeStreamPayloadContainsContent(payload []byte) bool {
+	raw, ok := firstStreamJSONObject(payload)
+	if !ok {
+		// Unknown bytes may already be meaningful to the client. Preserve the
+		// original fail-closed boundary instead of treating them as prelude.
+		return true
+	}
+	var event struct {
+		Type string `json:"type"`
+	}
+	if errUnmarshal := json.Unmarshal([]byte(raw), &event); errUnmarshal != nil {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(event.Type)) {
+	case "message_start", "ping", "message_delta", "message_stop":
+		return false
+	case "content_block_start", "content_block_delta", "content_block_stop":
+		return true
+	default:
+		return true
+	}
+}
+
+func openAIChatStreamPrelude(payload []byte) bool {
+	raw, ok := firstStreamJSONObject(payload)
+	if !ok {
+		return false
+	}
+	var chunk struct {
+		Object  string `json:"object"`
+		Choices []struct {
+			Delta        map[string]json.RawMessage `json:"delta"`
+			FinishReason json.RawMessage            `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if errUnmarshal := json.Unmarshal([]byte(raw), &chunk); errUnmarshal != nil ||
+		chunk.Object != "chat.completion.chunk" ||
+		len(chunk.Choices) == 0 {
+		return false
+	}
+	for _, choice := range chunk.Choices {
+		if value := strings.TrimSpace(string(choice.FinishReason)); value != "" && value != "null" {
+			return false
+		}
+		if len(choice.Delta) != 1 {
+			return false
+		}
+		role, okRole := choice.Delta["role"]
+		if !okRole {
+			return false
+		}
+		var roleValue string
+		if errRole := json.Unmarshal(role, &roleValue); errRole != nil || roleValue != "assistant" {
+			return false
+		}
+	}
+	return true
+}
+
+func openAIResponsesStreamPrelude(payload []byte) bool {
+	raw, ok := firstStreamJSONObject(payload)
+	if !ok {
+		return false
+	}
+	var event struct {
+		Type string `json:"type"`
+	}
+	if errUnmarshal := json.Unmarshal([]byte(raw), &event); errUnmarshal != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(event.Type)) {
+	case "response.created", "response.in_progress":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstStreamJSONObject(payload []byte) (string, bool) {
+	value := strings.TrimSpace(string(payload))
+	objectStart := strings.IndexByte(value, '{')
+	if objectStart < 0 {
+		return "", false
+	}
+	decoder := json.NewDecoder(strings.NewReader(value[objectStart:]))
+	var raw json.RawMessage
+	if errDecode := decoder.Decode(&raw); errDecode != nil || len(raw) == 0 {
+		return "", false
+	}
+	return string(raw), true
+}
+
 func streamChunkFailure(chunk pluginapi.HostModelStreamReadResponse) executionFailure {
 	if detail := chunk.ErrorDetail; detail != nil {
 		failure := executionFailure{
@@ -610,6 +843,14 @@ func streamChunkFailure(chunk pluginapi.HostModelStreamReadResponse) executionFa
 			Headers:    cloneHeader(detail.Headers),
 			RetryAfter: firstNonEmpty(detail.RetryAfter, detail.Headers.Get("Retry-After")),
 		}
+		if terminalProviderStreamErrorCode(detail.Code) {
+			failure.Code = "bravo_provider_stream_error"
+			failure.Message = "Provider returned an unrecognized structured error before completing the response."
+			failure.Retryable = false
+		}
+		if detail.ProviderError != nil {
+			return classifyProviderFailureDetail(failure, *detail.ProviderError)
+		}
 		return classifyProviderFailureSignal(failure, detail.Code, detail.Message, chunk.Error)
 	}
 	return classifyProviderFailureSignal(executionFailure{
@@ -618,6 +859,15 @@ func streamChunkFailure(chunk pluginapi.HostModelStreamReadResponse) executionFa
 		Status:    http.StatusBadGateway,
 		Retryable: true,
 	}, chunk.Error)
+}
+
+func terminalProviderStreamErrorCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "provider_stream_error", "bravo_provider_stream_error":
+		return true
+	default:
+		return false
+	}
 }
 
 func emitPluginStreamChunk(ctx context.Context, streamID, hostCallbackID string, payload []byte) error {
@@ -641,6 +891,7 @@ func closePluginStream(streamID, errorMessage string) {
 // so without this a pool exhaustion reaches the SDK as a bare 500 and triggers
 // an immediate retry into the same exhausted pool.
 func closePluginStreamFailure(streamID string, failure executionFailure) {
+	failure = sanitizeExecutionFailure(failure)
 	status := failure.Status
 	if status <= 0 {
 		status = http.StatusServiceUnavailable

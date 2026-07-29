@@ -9,6 +9,14 @@ current physical model before moving to the next mapped model/provider, pins
 each nested call to one credential, and disables the host's implicit retry
 loops. A stream may fall back only before the first client-visible payload.
 
+When a reviewed provider error reports `credits_required` for a named physical
+model, Bravo treats it as model-scoped spend exhaustion. It may try another
+eligible credential for that model and then the next mapped candidate, while
+sibling models on the original credential remain eligible. If a later fallback
+cannot fit the request in its context window, the terminal diagnostic retains
+both ordered failures; context overflow itself is request-scoped and never
+creates a credential, model, or provider cooldown.
+
 ## Client endpoints
 
 OpenAI-compatible clients:
@@ -165,6 +173,10 @@ plugins:
 
 `max_attempts: 0` means all eligible accounts may be tried. Ordinary API keys
 keep native CLIProxyAPI routing and cannot enter the `bravo/*` namespace.
+The configured `cooldown_seconds` still controls a generic retryable 429 with
+no provider hint. Exact model-credits exhaustion without a valid
+`Retry-After` uses a conservative 15-minute probe barrier; any valid explicit
+`Retry-After`, including a shorter value, remains authoritative.
 
 The authenticated CLIProxyAPI Management API owns project-key persistence:
 
@@ -221,7 +233,9 @@ POST  /v0/management/bravo/quotas/refresh
 Project and credential usage summaries include requests, failures, latency,
 input/output/reasoning/cache tokens, and total tokens. State is atomically
 persisted outside the credential discovery directory in
-`bravo-data/bravo-state.json`.
+`bravo-data/bravo-state.json`. The same schema-v2 snapshot optionally stores
+active provider/auth/physical-model cooldowns with reviewed, sanitized
+provider detail. Existing snapshots without that field continue to load.
 
 Schema v2 also retains hourly analytics for 31 days and daily analytics for
 400 days. The authenticated analytics endpoint supports project,
@@ -240,6 +254,13 @@ Subscription responses expose the operator-authored `note` separately and a
 deterministic `display_name`. The display name prefers the note and otherwise
 combines workspace and email; the legacy `label` remains the same display name
 for older Management Center builds.
+
+Each subscription may also expose a redacted `model_issues` list. A model card
+can therefore explain that Fable 5 reached its monthly spend limit without
+marking the whole Claude workspace unavailable. Raw provider JSON, request IDs,
+payment state, CTA fields, tokens, and credentials are never part of this
+management contract. Attempt analytics keeps the ordered subscriptions,
+physical models, and safe reasons that led to a fallback.
 
 The native Management UI provides 24h/7d/30d/90d/custom periods,
 previous-period comparison, charts, tables, CSV export, and
@@ -297,12 +318,14 @@ replay is supported only on the native Anthropic-Messages-to-Claude route.
 
 Machine-readable contract failures survive the core execution path and the
 OpenAI Chat, Responses, and Anthropic error envelopes. Clients can distinguish
-codes such as `bravo_effort_invalid` and `bravo_contract_unverified`; the
+codes such as `bravo_effort_invalid`, `bravo_contract_unverified`, and
+`bravo_subscription_model_credits_exhausted`. Contract and context-window
 errors remain request-scoped and do not mark the selected credential
-unhealthy. Existing status-derived OpenAI codes remain unchanged. Typed detail
-after a stream has already emitted client-visible payload still requires the
-planned stream-close ABI extension; the current ABI carries a legacy string at
-that point.
+unhealthy. A model-credits error affects only the reported
+provider/auth/physical-model tuple. Existing status-derived OpenAI codes remain
+unchanged. Typed detail after a stream has already emitted client-visible
+payload still requires the planned stream-close ABI extension; the current ABI
+carries a legacy string at that point.
 
 ## Verification
 
@@ -352,6 +375,9 @@ scripts/bravo-claude-cli-smoke.rb
 scripts/bravo-quota-allocator-smoke.rb
 scripts/bravo-string-diagnostic.rb
 scripts/bravo-vision-smoke.rb
+scripts/bravo-credits-context-provider.rb
+scripts/bravo-credits-context-canary-setup.rb
+scripts/bravo-credits-context-smoke.rb
 ```
 
 The live harnesses read credentials from files and avoid printing secrets or

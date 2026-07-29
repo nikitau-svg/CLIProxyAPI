@@ -312,11 +312,86 @@ func TestHostRollupDoesNotDisableModelsWithHealthyOwnState(t *testing.T) {
 		t.Fatalf("suffixed model health = %q, want %q", got, bravoAuthCooldown)
 	}
 
-	// A model with no state of its own has only the roll-up to go on, and the
-	// roll-up says the credential is in trouble.
+	// The native selector treats an absent state as available whenever the
+	// request names a model. The aggregate deadline was derived from the known
+	// failed model and must not poison a previously unused sibling.
 	unknown := candidate{Provider: "claude", Model: "claude-haiku-4-5-20251001"}
-	if got := classifyBravoAuthHealthForModel("claude", auth, unknown.Model, now); got == bravoAuthReady {
-		t.Fatal("a model with no per-model state ignored the credential-wide roll-up")
+	if got := classifyBravoAuthHealthForModel("claude", auth, unknown.Model, now); got != bravoAuthReady {
+		t.Fatalf("unknown sibling model health = %q, want %q", got, bravoAuthReady)
+	}
+	if eligible := eligibleAuths(unknown, []pluginapi.HostAuthFileEntry{auth}, now); len(eligible) != 1 {
+		t.Fatal("aggregate state from one failed model disabled an unseen sibling")
+	}
+}
+
+// Bravo keeps its immediate provider cooldown in memory, while Core persists
+// the actual execution model. Automatic effort therefore restores keys such as
+// "claude-fable-5(xhigh)" after a process restart. The base Bravo candidate
+// must still see that state, without turning it into a credential-wide block.
+func TestPersistedEffortQualifiedModelStateBlocksOnlyItsPhysicalModelAfterRestart(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	affected := pluginapi.HostAuthFileEntry{
+		ID:             "palantir",
+		Provider:       "claude",
+		Status:         "error",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(30 * time.Minute),
+		ModelStates: map[string]pluginapi.HostAuthModelState{
+			// A clean state for another effort must never win map iteration and
+			// hide the active restriction on the same physical model.
+			"claude-fable-5(max)": {
+				Status: "active",
+			},
+			"claude-fable-5(medium)": {
+				Status:         "error",
+				Unavailable:    true,
+				NextRetryAfter: now.Add(-time.Minute),
+			},
+			"claude-fable-5(xhigh)": {
+				Status:                   "error",
+				StatusMessage:            "Fable 5: monthly spend limit reached",
+				ErrorCode:                "credits_required",
+				ProviderModel:            "claude-fable-5",
+				ProviderModelDisplayName: "Fable 5",
+				Scope:                    "model",
+				Unavailable:              true,
+				NextRetryAfter:           now.Add(30 * time.Minute),
+			},
+		},
+	}
+	otherClaude := pluginapi.HostAuthFileEntry{
+		ID:       "other-claude",
+		Provider: "claude",
+	}
+	codex := pluginapi.HostAuthFileEntry{
+		ID:       "codex-x20",
+		Provider: "codex",
+	}
+
+	if cooldownActive("claude", affected.ID, "claude-fable-5", now) {
+		t.Fatal("test must model a restart with no Bravo in-memory cooldown")
+	}
+
+	fable := candidate{Provider: "claude", Model: "claude-fable-5"}
+	for iteration := 0; iteration < 64; iteration++ {
+		if got := classifyBravoAuthHealthForModel("claude", affected, fable.Model, now); got != bravoAuthCooldown {
+			t.Fatalf("base Fable health on iteration %d = %q, want cooldown from persisted xhigh state", iteration, got)
+		}
+	}
+	fableEligible := eligibleAuths(fable, []pluginapi.HostAuthFileEntry{affected, otherClaude}, now)
+	if len(fableEligible) != 1 || fableEligible[0].ID != otherClaude.ID {
+		t.Fatalf("Fable eligible auths = %#v, want only the unaffected Claude auth", fableEligible)
+	}
+
+	sonnet := candidate{Provider: "claude", Model: "claude-sonnet-5"}
+	if eligible := eligibleAuths(sonnet, []pluginapi.HostAuthFileEntry{affected}, now); len(eligible) != 1 {
+		t.Fatal("persisted Fable state disabled Sonnet on the same Claude auth")
+	}
+
+	sol := candidate{Provider: "codex", Model: "gpt-5.6-sol"}
+	if eligible := eligibleAuths(sol, []pluginapi.HostAuthFileEntry{codex}, now); len(eligible) != 1 {
+		t.Fatal("persisted Claude state removed the Codex fallback")
 	}
 }
 
@@ -517,6 +592,41 @@ func TestSummarizeBravoProvidersFiltersUnusedProvidersAndClassifiesHealth(t *tes
 	if codex.Provider != "codex" || codex.Accounts != 1 || codex.Healthy != 0 ||
 		codex.Unavailable != 1 || codex.Cooldown != 1 {
 		t.Fatalf("codex summary = %#v", codex)
+	}
+}
+
+func TestProviderSummaryIgnoresSingleModelAggregatePoison(t *testing.T) {
+	isolateBravoCooldowns(t)
+	now := time.Now()
+	cfg := pluginConfig{Models: map[string]logicalModel{
+		"test": {Candidates: []candidate{{Provider: "claude", Model: "claude-sonnet-5"}}},
+	}}
+	auth := pluginapi.HostAuthFileEntry{
+		ID:             "palantir",
+		Provider:       "claude",
+		Status:         "error",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Hour),
+		ModelStates: map[string]pluginapi.HostAuthModelState{
+			"claude-fable-5": {
+				Status:         "error",
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Hour),
+				ErrorCode:      "credits_required",
+				Scope:          "model",
+			},
+		},
+	}
+
+	summaries := summarizeBravoProviders(cfg, []pluginapi.HostAuthFileEntry{auth}, now)
+	if len(summaries) != 1 || summaries[0].Healthy != 1 || summaries[0].Unavailable != 0 {
+		t.Fatalf("model-scoped provider summary = %#v, want one healthy account", summaries)
+	}
+
+	setCooldown("claude", auth.ID, "", "account-wide", now.Add(time.Hour))
+	summaries = summarizeBravoProviders(cfg, []pluginapi.HostAuthFileEntry{auth}, now)
+	if len(summaries) != 1 || summaries[0].Cooldown != 1 || summaries[0].Unavailable != 1 {
+		t.Fatalf("account-wide provider summary = %#v, want one cooling account", summaries)
 	}
 }
 

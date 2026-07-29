@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
@@ -383,13 +384,22 @@ func TestHostModelExecuteCallbackPreservesTypedErrorMetadata(t *testing.T) {
 }
 
 func TestHostModelCallbackErrorPreservesRetryAfterWithoutHeader(t *testing.T) {
+	providerDetail := providererror.Detail{
+		Type:             "rate_limit_error",
+		Code:             "credits_required",
+		Model:            "claude-fable-5",
+		ModelDisplayName: "Fable 5",
+		Scope:            "model",
+		Reason:           "monthly_spend_limit",
+	}
 	errCall := newHostModelCallbackError(&interfaces.ErrorMessage{
 		Error: rpcPluginError{
-			code:       "rate_limited",
-			message:    "try later",
-			statusCode: http.StatusTooManyRequests,
-			retryable:  true,
-			retryAfter: "23",
+			code:          "rate_limited",
+			message:       "try later",
+			statusCode:    http.StatusTooManyRequests,
+			retryable:     true,
+			retryAfter:    "23",
+			providerError: &providerDetail,
 		},
 	})
 	rawEnvelope := marshalHostCallbackError(errCall)
@@ -401,7 +411,10 @@ func TestHostModelCallbackErrorPreservesRetryAfterWithoutHeader(t *testing.T) {
 		envelope.Error.Code != "rate_limited" ||
 		envelope.Error.HTTPStatus != http.StatusTooManyRequests ||
 		!envelope.Error.Retryable ||
-		envelope.Error.RetryAfter != "23" {
+		envelope.Error.RetryAfter != "23" ||
+		envelope.Error.ProviderError == nil ||
+		envelope.Error.ProviderError.Code != "credits_required" ||
+		envelope.Error.ProviderError.Model != "claude-fable-5" {
 		t.Fatalf("callback error = %#v", envelope.Error)
 	}
 }
@@ -748,15 +761,24 @@ func TestHostModelStreamReadAndCloseValidateStreamID(t *testing.T) {
 
 func TestHostModelStreamReadReturnsPayloadAndTerminalError(t *testing.T) {
 	host := New()
+	providerDetail := providererror.Detail{
+		Type:             "rate_limit_error",
+		Code:             "credits_required",
+		Model:            "claude-fable-5",
+		ModelDisplayName: "Fable 5",
+		Scope:            "model",
+		Reason:           "monthly_spend_limit",
+	}
 	chunks := make(chan handlers.ModelExecutionChunk, 2)
 	chunks <- handlers.ModelExecutionChunk{Payload: []byte("first")}
 	chunks <- handlers.ModelExecutionChunk{Err: &handlers.ModelExecutionStreamError{
-		Code:       "upstream_unavailable",
-		StatusCode: http.StatusBadGateway,
-		Message:    "terminal boom",
-		Retryable:  true,
-		Headers:    http.Header{"Retry-After": []string{"3"}},
-		RetryAfter: "3",
+		Code:          "upstream_unavailable",
+		StatusCode:    http.StatusBadGateway,
+		Message:       "terminal boom",
+		Retryable:     true,
+		Headers:       http.Header{"Retry-After": []string{"3"}},
+		RetryAfter:    "3",
+		ProviderError: &providerDetail,
 	}}
 	host.SetModelExecutor(&fakeHostModelExecutor{
 		executeModelStream: func(ctx context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage) {
@@ -801,7 +823,10 @@ func TestHostModelStreamReadReturnsPayloadAndTerminalError(t *testing.T) {
 		terminal.ErrorDetail.HTTPStatus != http.StatusBadGateway ||
 		!terminal.ErrorDetail.Retryable ||
 		terminal.ErrorDetail.Headers.Get("Retry-After") != "3" ||
-		terminal.ErrorDetail.RetryAfter != "3" {
+		terminal.ErrorDetail.RetryAfter != "3" ||
+		terminal.ErrorDetail.ProviderError == nil ||
+		terminal.ErrorDetail.ProviderError.Code != "credits_required" ||
+		terminal.ErrorDetail.ProviderError.Model != "claude-fable-5" {
 		t.Fatalf("terminal error detail = %#v", terminal.ErrorDetail)
 	}
 }

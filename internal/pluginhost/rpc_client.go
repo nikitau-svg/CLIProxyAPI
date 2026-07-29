@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -36,12 +37,13 @@ type rpcThinkingApplier struct {
 }
 
 type rpcPluginError struct {
-	code       string
-	message    string
-	statusCode int
-	retryable  bool
-	headers    http.Header
-	retryAfter string
+	code          string
+	message       string
+	statusCode    int
+	retryable     bool
+	headers       http.Header
+	retryAfter    string
+	providerError *providererror.Detail
 }
 
 func (e rpcPluginError) Error() string {
@@ -66,6 +68,17 @@ func (e rpcPluginError) Headers() http.Header {
 
 func (e rpcPluginError) RetryAfterValue() string {
 	return e.retryAfter
+}
+
+func (e rpcPluginError) ProviderErrorDetail() (providererror.Detail, bool) {
+	if e.providerError == nil {
+		return providererror.Detail{}, false
+	}
+	detail := providererror.Sanitize(*e.providerError)
+	if detail.Code == "" && detail.Type == "" && detail.Message == "" {
+		return providererror.Detail{}, false
+	}
+	return detail, true
 }
 
 type rpcResponseNormalizer struct {
@@ -312,7 +325,7 @@ func decodeEnvelopeResult[T any](envelope pluginabi.Envelope) (T, error) {
 			if message == "" {
 				message = "plugin call failed"
 			}
-			return zero, rpcPluginError{
+			pluginErr := rpcPluginError{
 				code:       strings.TrimSpace(envelope.Error.Code),
 				message:    message,
 				statusCode: envelope.Error.HTTPStatus,
@@ -320,6 +333,11 @@ func decodeEnvelopeResult[T any](envelope pluginabi.Envelope) (T, error) {
 				headers:    cloneHeader(envelope.Error.Headers),
 				retryAfter: strings.TrimSpace(envelope.Error.RetryAfter),
 			}
+			if envelope.Error.ProviderError != nil {
+				detail := providererror.Sanitize(*envelope.Error.ProviderError)
+				pluginErr.providerError = &detail
+			}
+			return zero, pluginErr
 		}
 		return zero, fmt.Errorf("plugin call failed")
 	}

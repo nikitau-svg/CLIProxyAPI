@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
 
@@ -20,15 +21,24 @@ func (c staticEnvelopePluginClient) Call(context.Context, string, []byte) ([]byt
 func (c staticEnvelopePluginClient) Shutdown() {}
 
 func TestDecodeEnvelopeResultPreservesPluginHTTPStatus(t *testing.T) {
+	providerDetail := providererror.Detail{
+		Type:             "rate_limit_error",
+		Code:             "credits_required",
+		Model:            "claude-fable-5",
+		ModelDisplayName: "Fable 5",
+		Scope:            "model",
+		Reason:           "monthly_spend_limit",
+	}
 	_, errDecode := decodeEnvelopeResult[rpcEmptyResponse](pluginabi.Envelope{
 		OK: false,
 		Error: &pluginabi.Error{
-			Code:       "plugin_error",
-			Message:    "license required",
-			Retryable:  true,
-			HTTPStatus: http.StatusForbidden,
-			Headers:    http.Header{"Retry-After": []string{"7"}},
-			RetryAfter: "7",
+			Code:          "plugin_error",
+			Message:       "license required",
+			Retryable:     true,
+			HTTPStatus:    http.StatusForbidden,
+			Headers:       http.Header{"Retry-After": []string{"7"}},
+			RetryAfter:    "7",
+			ProviderError: &providerDetail,
 		},
 	})
 	if errDecode == nil {
@@ -59,6 +69,16 @@ func TestDecodeEnvelopeResultPreservesPluginHTTPStatus(t *testing.T) {
 	retryAfterProvider, ok := errDecode.(interface{ RetryAfterValue() string })
 	if !ok || retryAfterProvider.RetryAfterValue() != "7" {
 		t.Fatalf("retry-after provider = %#v", errDecode)
+	}
+	provider, ok := errDecode.(interface {
+		ProviderErrorDetail() (providererror.Detail, bool)
+	})
+	if !ok {
+		t.Fatalf("provider detail carrier = %#v", errDecode)
+	}
+	detail, ok := provider.ProviderErrorDetail()
+	if !ok || detail.Code != "credits_required" || detail.Model != "claude-fable-5" {
+		t.Fatalf("provider detail = %#v, ok=%t", detail, ok)
 	}
 }
 

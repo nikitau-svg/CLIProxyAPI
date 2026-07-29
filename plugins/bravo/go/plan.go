@@ -12,13 +12,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 type cooldownEntry struct {
-	Until  time.Time
-	Reason string
+	Until         time.Time
+	ObservedAt    time.Time
+	Reason        string
+	Provider      string
+	AuthID        string
+	Model         string
+	ProviderError providererror.Detail
 }
 
 var runtimeState = struct {
@@ -449,7 +455,7 @@ func pinnedAuthID(auth pluginapi.HostAuthFileEntry) string {
 // (401/403) still require.
 func cooldownKey(provider, authID, model string) string {
 	key := normalizeProvider(provider) + "\x00" + strings.TrimSpace(authID)
-	if scoped := strings.TrimSpace(model); scoped != "" {
+	if scoped := baseModelKey(strings.TrimSpace(model)); scoped != "" {
 		key += "\x00" + scoped
 	}
 	return key
@@ -479,19 +485,124 @@ func cooldownEntryActive(key string, now time.Time) bool {
 	if entry.Until.After(now) {
 		return true
 	}
+	return removeExpiredCooldownIfCurrent(key, entry, now)
+}
+
+func removeExpiredCooldownIfCurrent(key string, observed cooldownEntry, now time.Time) bool {
 	runtimeState.Lock()
+	current, ok := runtimeState.Cooldowns[key]
+	if !ok {
+		runtimeState.Unlock()
+		return false
+	}
+	if current.Until.After(now) {
+		runtimeState.Unlock()
+		return true
+	}
+	if !sameCooldownInstance(current, observed) {
+		runtimeState.Unlock()
+		return false
+	}
 	delete(runtimeState.Cooldowns, key)
 	runtimeState.Unlock()
+	removePersistedCooldown(observed)
 	return false
 }
 
+func removeRuntimeCooldownIfCurrent(key string, observed cooldownEntry) {
+	runtimeState.Lock()
+	current, ok := runtimeState.Cooldowns[key]
+	if ok && sameCooldownInstance(current, observed) {
+		delete(runtimeState.Cooldowns, key)
+	}
+	runtimeState.Unlock()
+}
+
+func sameCooldownInstance(left, right cooldownEntry) bool {
+	return left.Until.Equal(right.Until) &&
+		left.ObservedAt.Equal(right.ObservedAt) &&
+		left.Reason == right.Reason &&
+		left.Provider == right.Provider &&
+		left.AuthID == right.AuthID &&
+		left.Model == right.Model &&
+		left.ProviderError == right.ProviderError
+}
+
 func setCooldown(provider, authID, model, reason string, until time.Time) {
-	if until.IsZero() || !until.After(time.Now()) {
+	setCooldownWithProviderError(provider, authID, model, reason, until, nil)
+}
+
+func setCooldownWithProviderError(
+	provider, authID, model, reason string,
+	until time.Time,
+	detail *providererror.Detail,
+) {
+	now := time.Now()
+	if until.IsZero() || !until.After(now) {
 		return
 	}
+	stateGeneration := bravoUsageState.generation.Load()
+	provider = normalizeProvider(provider)
+	authID = strings.TrimSpace(authID)
+	model = baseModelKey(strings.TrimSpace(model))
+	entry := cooldownEntry{
+		Until:      until,
+		ObservedAt: now.UTC(),
+		Reason:     providererror.Sanitize(providererror.Detail{Reason: reason}).Reason,
+		Provider:   provider,
+		AuthID:     authID,
+		Model:      model,
+	}
+	if detail != nil {
+		entry.ProviderError = providererror.Sanitize(*detail)
+		if model != "" {
+			entry.ProviderError.Model = providererror.Sanitize(providererror.Detail{Model: model}).Model
+		}
+		if entry.ProviderError.Scope == "" && model != "" {
+			entry.ProviderError.Scope = "model"
+		}
+	}
 	runtimeState.Lock()
-	runtimeState.Cooldowns[cooldownKey(provider, authID, model)] = cooldownEntry{Until: until, Reason: reason}
+	runtimeState.Cooldowns[cooldownKey(provider, authID, model)] = entry
 	runtimeState.Unlock()
+	persistRuntimeCooldown(entry, stateGeneration)
+}
+
+func activeProviderModelCooldowns(provider, authID string, now time.Time) []cooldownEntry {
+	provider = normalizeProvider(provider)
+	authID = strings.TrimSpace(authID)
+	if provider == "" || authID == "" {
+		return nil
+	}
+
+	runtimeState.Lock()
+	entries := make([]cooldownEntry, 0)
+	expired := make([]cooldownEntry, 0)
+	for key, entry := range runtimeState.Cooldowns {
+		if !entry.Until.After(now) {
+			delete(runtimeState.Cooldowns, key)
+			expired = append(expired, entry)
+			continue
+		}
+		if entry.Provider != provider ||
+			entry.AuthID != authID ||
+			strings.TrimSpace(entry.Model) == "" {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	runtimeState.Unlock()
+	for _, entry := range expired {
+		removePersistedCooldown(entry)
+	}
+
+	sort.Slice(entries, func(left, right int) bool {
+		if entries[left].Model == entries[right].Model {
+			return entries[left].Until.Before(entries[right].Until)
+		}
+		return entries[left].Model < entries[right].Model
+	})
+	return entries
 }
 
 // accountWideCooldownStatus lists HTTP statuses that invalidate the whole

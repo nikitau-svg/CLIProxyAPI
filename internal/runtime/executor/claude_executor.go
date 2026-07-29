@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -409,7 +410,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = claudeHTTPStatusError(httpResp.StatusCode, b)
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
@@ -463,6 +464,146 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
+}
+
+type claudeStructuredStreamError struct {
+	status        int
+	code          string
+	message       string
+	retryable     bool
+	providerError *providererror.Detail
+}
+
+func (e *claudeStructuredStreamError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func (e *claudeStructuredStreamError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.status
+}
+
+func (e *claudeStructuredStreamError) ErrorCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.code
+}
+
+func (e *claudeStructuredStreamError) Retryable() bool {
+	return e != nil && e.retryable
+}
+
+func (e *claudeStructuredStreamError) ProviderErrorDetail() (providererror.Detail, bool) {
+	if e == nil || e.providerError == nil {
+		return providererror.Detail{}, false
+	}
+	detail := providererror.Sanitize(*e.providerError)
+	if detail.Code == "" && detail.Type == "" && detail.Message == "" {
+		return providererror.Detail{}, false
+	}
+	return detail, true
+}
+
+func claudeProviderStreamError(line []byte) error {
+	line = bytes.TrimSpace(line)
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return nil
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return nil
+	}
+	root := gjson.ParseBytes(payload)
+	if !strings.EqualFold(strings.TrimSpace(root.Get("type").String()), "error") {
+		return nil
+	}
+
+	if detail, ok := providererror.Parse(string(payload)); ok {
+		detail = providererror.Sanitize(detail)
+		message := strings.TrimSpace(detail.Summary())
+		if message == "" {
+			message = "The provider model has reached its spending limit."
+		}
+		return &claudeStructuredStreamError{
+			status:        http.StatusTooManyRequests,
+			code:          detail.Code,
+			message:       message,
+			retryable:     true,
+			providerError: &detail,
+		}
+	}
+
+	errorType := strings.TrimSpace(root.Get("error.type").String())
+	rawMessage := strings.TrimSpace(root.Get("error.message").String())
+	if claudeContextWindowSignal(errorType, rawMessage) {
+		message := providererror.Sanitize(providererror.Detail{Message: rawMessage}).Message
+		if message == "" {
+			message = "Input exceeds the provider model's context window."
+		}
+		code := errorType
+		if code == "" {
+			code = "context_window_exceeded"
+		}
+		return &claudeStructuredStreamError{
+			status:    http.StatusBadRequest,
+			code:      code,
+			message:   message,
+			retryable: false,
+		}
+	}
+
+	return &claudeStructuredStreamError{
+		status:    http.StatusBadGateway,
+		code:      "provider_stream_error",
+		message:   "The provider returned an unrecognized structured stream error.",
+		retryable: false,
+	}
+}
+
+func claudeProviderStreamEventType(line []byte) string {
+	line = bytes.TrimSpace(line)
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return ""
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "type").String()))
+}
+
+func claudeIncompleteStreamError() error {
+	return &claudeStructuredStreamError{
+		status:    http.StatusBadGateway,
+		code:      "provider_stream_incomplete",
+		message:   "The provider returned an incomplete stream before message completion.",
+		retryable: true,
+	}
+}
+
+func claudeContextWindowSignal(values ...string) bool {
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		for _, signal := range []string{
+			"context_length_exceeded",
+			"context_window_exceeded",
+			"context_too_large",
+			"input exceeds the context window",
+			"exceeds the context window of this model",
+			"maximum context length",
+		} {
+			if strings.Contains(value, signal) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
@@ -608,7 +749,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = claudeHTTPStatusError(httpResp.StatusCode, b)
 		return nil, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -634,6 +775,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			var event bytes.Buffer
+			sawMessageStart := false
+			sawMessageStop := false
 			flushEvent := func() bool {
 				if event.Len() == 0 {
 					return true
@@ -651,6 +794,21 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				line := scanner.Bytes()
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				streamUsage.ObserveClaudeStream(line)
+				switch claudeProviderStreamEventType(line) {
+				case "message_start":
+					sawMessageStart = true
+				case "message_stop":
+					sawMessageStop = true
+				}
+				if streamErr := claudeProviderStreamError(line); streamErr != nil {
+					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.PublishFailure(ctx, streamErr)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				line = e.restoreResponseModel(line, req.Model)
 				event.Write(line)
@@ -671,6 +829,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				return
 			}
+			if !sawMessageStart || !sawMessageStop {
+				streamErr := claudeIncompleteStreamError()
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
 			streamUsage.Publish(ctx, reporter)
 			return
 		}
@@ -679,10 +847,27 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		sawMessageStart := false
+		sawMessageStop := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			streamUsage.ObserveClaudeStream(line)
+			switch claudeProviderStreamEventType(line) {
+			case "message_start":
+				sawMessageStart = true
+			case "message_stop":
+				sawMessageStop = true
+			}
+			if streamErr := claudeProviderStreamError(line); streamErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
 			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			line = e.restoreResponseModel(line, req.Model)
 			chunks := sdktranslator.TranslateStream(
@@ -712,6 +897,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			return
 		}
+		if !sawMessageStart || !sawMessageStop {
+			streamErr := claudeIncompleteStreamError()
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case <-ctx.Done():
+			}
+			return
+		}
 		streamUsage.Publish(ctx, reporter)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -723,7 +918,7 @@ func validateClaudeStreamingResponse(data []byte) error {
 
 	hasData := false
 	hasMessageStart := false
-	hasMessageDelta := false
+	hasMessageStop := false
 
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
@@ -738,39 +933,27 @@ func validateClaudeStreamingResponse(data []byte) error {
 		if !gjson.ValidBytes(payload) {
 			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned malformed stream data"}
 		}
+		if streamErr := claudeProviderStreamError(line); streamErr != nil {
+			return streamErr
+		}
 
 		root := gjson.ParseBytes(payload)
 		switch root.Get("type").String() {
-		case "error":
-			message := strings.TrimSpace(root.Get("error.message").String())
-			if message == "" {
-				message = strings.TrimSpace(root.Get("error.type").String())
-			}
-			if message == "" {
-				message = "unknown upstream error"
-			}
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned error event: " + message}
 		case "message_start":
 			message := root.Get("message")
 			if strings.TrimSpace(message.Get("id").String()) == "" || strings.TrimSpace(message.Get("model").String()) == "" {
 				return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream message_start is missing id or model"}
 			}
 			hasMessageStart = true
-		case "message_delta":
-			hasMessageDelta = true
+		case "message_stop":
+			hasMessageStop = true
 		}
 	}
 	if errScan := scanner.Err(); errScan != nil {
 		return errScan
 	}
-	if !hasData {
-		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned empty stream response"}
-	}
-	if !hasMessageStart {
-		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream response is missing message_start"}
-	}
-	if !hasMessageDelta {
-		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream stream response ended before message completion"}
+	if !hasData || !hasMessageStart || !hasMessageStop {
+		return claudeIncompleteStreamError()
 	}
 	return nil
 }
@@ -867,7 +1050,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
+		return cliproxyexecutor.Response{}, claudeHTTPStatusError(resp.StatusCode, b)
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
 	if err != nil {
@@ -891,6 +1074,46 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	count := gjson.GetBytes(data, "input_tokens").Int()
 	out := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, data)
 	return cliproxyexecutor.Response{Payload: out, Headers: resp.Header.Clone()}, nil
+}
+
+func claudeHTTPStatusError(status int, body []byte) statusErr {
+	raw := strings.TrimSpace(string(body))
+	if detail, ok := providererror.Parse(raw); ok {
+		detail = providererror.Sanitize(detail)
+		message := strings.TrimSpace(detail.Summary())
+		if message == "" {
+			message = "The provider model has reached its spending limit."
+		}
+		return statusErr{
+			code:          status,
+			msg:           message,
+			providerError: &detail,
+		}
+	}
+
+	message := providererror.Sanitize(providererror.Detail{Message: raw}).Message
+	structured := gjson.Valid(raw)
+	structuredPayload := raw
+	if !structured {
+		if objectStart := strings.IndexByte(raw, '{'); objectStart >= 0 {
+			structuredPayload = raw[objectStart:]
+			structured = gjson.Valid(structuredPayload)
+		}
+	}
+	if structured {
+		root := gjson.Parse(structuredPayload)
+		if strings.EqualFold(strings.TrimSpace(root.Get("type").String()), "error") {
+			message = providererror.Sanitize(providererror.Detail{
+				Message: root.Get("error.message").String(),
+			}).Message
+		} else {
+			message = ""
+		}
+	}
+	if message == "" {
+		message = fmt.Sprintf("Claude upstream request failed with status %d.", status)
+	}
+	return statusErr{code: status, msg: message}
 }
 
 func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {

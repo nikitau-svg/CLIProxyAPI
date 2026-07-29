@@ -56,6 +56,17 @@ shared Docker prune commands are forbidden.
   as HTTP 400 `invalid_request_error`; that account-level condition must retry
   the next subscription/provider while ordinary malformed-request 400s remain
   terminal.
+- A provider-confirmed spend restriction for one named physical model is not
+  account-wide exhaustion. It must cool only that provider/auth/model tuple,
+  keep sibling models eligible, and continue through allowed subscriptions and
+  mapped providers.
+- Context-window overflow is request-scoped, never an availability cooldown,
+  and must retain the ordered failure that caused the fallback rather than
+  hiding it behind the terminal secondary error.
+- Operator surfaces may expose only reviewed, sanitized provider detail.
+  Request IDs, payment/CTA fields, credentials, raw provider JSON, and other
+  unreviewed fields stay out of API responses, UI, analytics, logs, and
+  persistent state.
 - The integrated admin UI must expose a model compatibility/update center.
   Newly discovered provider models are never silently promoted into Bravo:
   the operator sees whether the current host, plugin, contract matrix, and
@@ -108,6 +119,31 @@ shared Docker prune commands are forbidden.
   invalid-request 400s remain terminal. The reviewed quota failure cools the
   exhausted credential across Claude models, while 429 and upstream faults
   retain their physical-model scope.
+- Reviewed structured provider errors are parsed and sanitized at the executor
+  boundary, carried as typed safe detail through Core, host callbacks, and
+  Bravo, and never persisted as their original response body.
+- Anthropic `credits_required` with a named physical model becomes
+  `bravo_subscription_model_credits_exhausted`. Bravo tries another eligible
+  credential for that model and then the next mapped provider while keeping
+  sibling Claude models on the original credential eligible.
+- Exact model-credits exhaustion without a valid `Retry-After` uses a
+  15-minute minimum probe barrier. Generic retryable 429 retains the configured
+  cooldown, and any valid explicit provider `Retry-After` remains
+  authoritative.
+- Active provider/auth/base-model cooldowns are stored as an optional
+  sanitized schema-v2 field in `bravo-state.json`, restored across plugin and
+  container restarts, pruned by exact-instance expiry, and isolated across
+  `state_path` generations. Existing schema-v1 migrations and schema-v2 files
+  without the field continue to load.
+- Context overflow terminates the current route without cooling any account or
+  blindly retrying another unverified context size. Ordered attempt
+  diagnostics retain both the primary credits failure and the secondary
+  context mismatch.
+- Recognized provider preludes are buffered before client-visible content for
+  both Claude and Codex physical providers. Anthropic Messages, OpenAI Chat
+  Completions, and OpenAI Responses may therefore all fall back across
+  providers before visible content, while incomplete, unknown, or post-content
+  streams fail closed without provider splicing.
 - No stream fallback after the first client-visible payload.
 - OpenAI Chat, OpenAI Responses, and Anthropic Messages request-contract
   detection.
@@ -132,7 +168,9 @@ shared Docker prune commands are forbidden.
   rendezvous selection instead of walking a fixed credential list.
 - Persistent project/auth usage ledger for requests, failures, latency, and
   input/output/reasoning/cache/total tokens. Atomic state is mode 0600 and
-  stored outside auth discovery.
+  stored outside auth discovery. The same snapshot retains only sanitized
+  active model cooldowns; raw provider bodies and request identifiers are
+  excluded.
 - Analytics schema v2 migrates historical totals without fabricating old
   project/subscription joins. It retains hourly buckets for 31 days and daily
   buckets for 400 days, and exposes authenticated redacted breakdowns for
@@ -449,6 +487,59 @@ shared Docker prune commands are forbidden.
   BuildKit cache was not broadly pruned because it also serves 28 running
   containers and individual layer ownership cannot be proven; host free space
   after cleanup was 12 GiB.
+
+## Bravo 0.7.9 pre-publish credits/context evidence
+
+- The release follows
+  `plugins/bravo/CREDITS_CONTEXT_TEST_PLAN.md`. RED phases reproduced loss of
+  Anthropic's structured `credits_required`, unsafe raw-body persistence,
+  credential-wide presentation of a model-only restriction, hidden ordered
+  diagnostics, cross-protocol stream-prelude commits, restart loss for config
+  credentials, stale-expiry deletion, and a setter crossing a `state_path`
+  generation.
+- The exact Management Center source archive is
+  `sha256:990a3160303fcddd5b03a2006f4bbc47e8f5acc626079bb2f87e6505da6bb972`.
+  Its release build produced `dist/index.html`
+  `sha256:74da7ec03778a29b284a9fe7729c611707f5d098cbe6cd828763b018dd40171e`.
+  All 102 frontend tests passed, together with lint, production build, and
+  changed-file Prettier checks.
+- The tested backend code snapshot, before these evidence-only documentation
+  edits, is
+  `sha256:82f7560d24167373c6a80aedd61f9f53f0b60f6395e963a951c8465dee947804`.
+  Full root tests/build and the nested Bravo test, race, vet, and build gates
+  passed. The exact Linux/arm64 artifacts are:
+  `CLIProxyAPI`
+  `sha256:244b235e1873766c03bbcedff2f9f905680d9cbf3379b811b1145a0463effe51`,
+  `cliproxy-healthcheck`
+  `sha256:45a95656a1cbd8949aa50fa35696ef0fa57e10ce8156009b6cd034310e7b6fea`,
+  and `bravo.so`
+  `sha256:09ace309dd75c386c5f5a06d17497ae4b49c8533290e6d9439dfda5176e2bc0a`.
+- The first isolated synthetic-provider canary passed 8/8. It proved the composite
+  Fable 5 monthly-spend plus Codex context failure, persisted model barrier
+  across an actual canary-container restart, immediate fallback without
+  re-probing the exhausted tuple, same-auth Claude sibling availability,
+  redacted management presentation, coherent Anthropic/Chat/Responses
+  pre-content fallback, and event-aware Responses output/order.
+- A targeted scan of canary state and logs found zero forbidden raw provider
+  fields. The snapshot retained only the reviewed code, safe summary,
+  provider/auth/base-model scope, and expiry; no request ID, payment/CTA data,
+  credentials, or original provider JSON was present.
+- Production was not restarted or modified during these gates. It remained
+  healthy on the existing Bravo 0.7.8 image.
+- A follow-up candidate added provider-neutral prelude buffering and passed the
+  focused nine-case protocol matrix plus the complete nested/root gates. Its
+  isolated synthetic-provider canary passed 9/9, including the
+  production-shaped Codex `response.created` followed by
+  `model_execution_failed/server_error` and a coherent Claude fallback.
+- Google Chrome controlled through Playwright verified the exact embedded
+  Management UI at desktop width. The project form opens with model access
+  collapsed; after expansion, model rows, search, independent scrolling,
+  prompt-cache disclosure, and subscription cards render without overlap.
+  The UI interaction created no project and changed no canary configuration.
+- GitHub publication, the merged-commit rebuild and final-image canary, the
+  one-time production cutover, production smoke, and task-owned cleanup remain
+  pending. This pre-publish evidence does not authorize skipping any of those
+  release gates.
 
 ## Bravo 0.7.6 source and canary evidence
 

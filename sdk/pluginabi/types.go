@@ -3,6 +3,8 @@ package pluginabi
 import (
 	"encoding/json"
 	"net/http"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 )
 
 const (
@@ -99,10 +101,11 @@ type Envelope struct {
 }
 
 type Error struct {
-	Code       string      `json:"code"`
-	Message    string      `json:"message"`
-	Retryable  bool        `json:"retryable,omitempty"`
-	HTTPStatus int         `json:"http_status,omitempty"`
-	Headers    http.Header `json:"headers,omitempty"`
-	RetryAfter string      `json:"retry_after,omitempty"`
+	Code          string                `json:"code"`
+	Message       string                `json:"message"`
+	Retryable     bool                  `json:"retryable,omitempty"`
+	HTTPStatus    int                   `json:"http_status,omitempty"`
+	Headers       http.Header           `json:"headers,omitempty"`
+	RetryAfter    string                `json:"retry_after,omitempty"`
+	ProviderError *providererror.Detail `json:"provider_error,omitempty"`
 }
