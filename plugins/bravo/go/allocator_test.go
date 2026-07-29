@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +33,71 @@ func TestQuotaRefreshTTLPreventsPerRequestProviderPolling(t *testing.T) {
 	}
 	if !quotaNeedsRefresh(quota, time.Minute, now.Add(time.Minute)) {
 		t.Fatal("quota did not refresh after the configured TTL")
+	}
+}
+
+func TestQuotaRefreshIgnoresSingleModelAggregatePoison(t *testing.T) {
+	isolateBravoCooldowns(t)
+
+	const authIndex = "quota-model-scope-test"
+	bravoUsageState.mu.Lock()
+	if bravoUsageState.state.Quotas == nil {
+		bravoUsageState.state.Quotas = make(map[string]*credentialQuotaState)
+	}
+	previousQuota, hadPreviousQuota := bravoUsageState.state.Quotas[authIndex]
+	delete(bravoUsageState.state.Quotas, authIndex)
+	bravoUsageState.mu.Unlock()
+	t.Cleanup(func() {
+		bravoUsageState.mu.Lock()
+		if hadPreviousQuota {
+			bravoUsageState.state.Quotas[authIndex] = previousQuota
+		} else {
+			delete(bravoUsageState.state.Quotas, authIndex)
+		}
+		bravoUsageState.mu.Unlock()
+	})
+
+	previousFetch := fetchQuotaSnapshot
+	var calls atomic.Int64
+	fetchQuotaSnapshot = func(_ string, _ pluginapi.HostAuthFileEntry) (credentialQuotaState, error) {
+		calls.Add(1)
+		return credentialQuotaState{
+			Confidence:  "unknown",
+			RefreshedAt: time.Now().UTC(),
+		}, nil
+	}
+	t.Cleanup(func() {
+		fetchQuotaSnapshot = previousFetch
+	})
+
+	now := time.Now()
+	auth := pluginapi.HostAuthFileEntry{
+		ID:             "palantir",
+		AuthIndex:      authIndex,
+		Provider:       "claude",
+		Status:         "error",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(time.Hour),
+		ModelStates: map[string]pluginapi.HostAuthModelState{
+			"claude-fable-5": {
+				Status:         "error",
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Hour),
+				ErrorCode:      "credits_required",
+				Scope:          "model",
+			},
+		},
+	}
+
+	refreshQuotaSnapshots("quota-model-scope-callback", []pluginapi.HostAuthFileEntry{auth}, true)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("quota refresh calls = %d, want 1 for a credential with one model-scoped failure", got)
+	}
+
+	setCooldown("claude", auth.ID, "", "account-wide", now.Add(time.Hour))
+	refreshQuotaSnapshots("quota-account-scope-callback", []pluginapi.HostAuthFileEntry{auth}, true)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("quota refresh calls = %d after account-wide cooldown, want unchanged", got)
 	}
 }
 

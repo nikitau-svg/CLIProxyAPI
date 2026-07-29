@@ -134,6 +134,11 @@ For Bravo, use `Dockerfile.canary` and the files under `deploy/aws/`. The root
 Dockerfile and Compose file retain upstream-compatible behavior and do not
 produce the complete Bravo production image.
 
+The supported install channel is the moving `bravo/stable` branch together
+with its tracked `deploy/aws/release.env`. Fresh installs do not require a
+historical release tag; the manifest pins the compatible Bravo version, image
+name, build platform, and exact Management Center commit.
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)

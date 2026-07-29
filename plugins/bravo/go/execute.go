@@ -9,18 +9,27 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+// creditsRequiredMinimumProbeInterval prevents a provider-confirmed monthly
+// model-spend restriction from being probed every generic 30-second cooldown.
+// It is only a fallback when the upstream did not provide a valid Retry-After;
+// explicit provider guidance, including a shorter interval, remains authoritative.
+const creditsRequiredMinimumProbeInterval = 15 * time.Minute
+
 type executionFailure struct {
-	Code        string
-	Message     string
-	Status      int
-	Retryable   bool
-	AccountWide bool
-	Headers     http.Header
-	RetryAfter  string
+	Code          string
+	Message       string
+	Status        int
+	Retryable     bool
+	RouteFallback bool
+	AccountWide   bool
+	Headers       http.Header
+	RetryAfter    string
+	Provider      *providererror.Detail
 }
 
 func execute(raw []byte) ([]byte, error) {
@@ -61,8 +70,13 @@ func execute(raw []byte) ([]byte, error) {
 
 	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
 	var lastFailure executionFailure
+	var failureTraces []executionFailureTrace
+	blockedModels := make(map[string]bool)
 	providerCalls := 0
 	for _, attempt := range plan {
+		if blockedModels[executionFailureModelKey(attempt)] {
+			continue
+		}
 		if skipCoolingExecutionAttempt(attempt, &lastFailure) {
 			continue
 		}
@@ -99,10 +113,14 @@ func execute(raw []byte) ([]byte, error) {
 			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
-			if failure.Retryable {
+			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
+			if executionFailureBlocksPhysicalModel(failure) {
+				blockedModels[executionFailureModelKey(attempt)] = true
+			}
+			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelope(failure), nil
+			return failureEnvelope(finalExecutionFailure(failureTraces, failure)), nil
 		}
 		// A host response means the provider accepted the attempt. Keep the
 		// reservation until the next confirmed quota snapshot, even when the
@@ -119,6 +137,7 @@ func execute(raw []byte) ([]byte, error) {
 			}
 			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
 			lastFailure = failure
+			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
@@ -126,10 +145,14 @@ func execute(raw []byte) ([]byte, error) {
 			recordExecutionAttempt(attempt, started, response.StatusCode, false, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
-			if failure.Retryable {
+			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
+			if executionFailureBlocksPhysicalModel(failure) {
+				blockedModels[executionFailureModelKey(attempt)] = true
+			}
+			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelope(failure), nil
+			return failureEnvelope(finalExecutionFailure(failureTraces, failure)), nil
 		}
 
 		response.Headers.Del("Content-Length")
@@ -155,7 +178,7 @@ func execute(raw []byte) ([]byte, error) {
 			Status:  http.StatusUnprocessableEntity,
 		}
 	}
-	return failureEnvelope(lastFailure), nil
+	return failureEnvelope(finalExecutionFailure(failureTraces, lastFailure)), nil
 }
 
 func nestedHostModelRequest(req rpcExecutorRequest, attempt executionAttempt, protocol, physicalModel string, body []byte, stream bool) pluginapi.HostModelExecutionRequest {
@@ -247,6 +270,7 @@ func requestProtocol(req pluginapi.ExecutorRequest) string {
 }
 
 func failureEnvelope(failure executionFailure) []byte {
+	failure = sanitizeExecutionFailure(failure)
 	status := failure.Status
 	if status == 0 {
 		status = http.StatusBadGateway
@@ -308,6 +332,11 @@ func classifyExecutionError(err error) executionFailure {
 			Headers:    cloneHeader(hostErr.Headers),
 			RetryAfter: firstNonEmpty(hostErr.RetryAfter, hostErr.Headers.Get("Retry-After")),
 		}
+		if terminalProviderStreamErrorCode(hostErr.Code) {
+			failure.Code = "bravo_provider_stream_error"
+			failure.Message = "Provider returned an unrecognized structured error before completing the response."
+			failure.Retryable = false
+		}
 		if failure.Code == "request_canceled" {
 			// Cancellation belongs to the client request, not to a provider or
 			// subscription. Never retry it and never park an otherwise healthy
@@ -327,6 +356,9 @@ func classifyExecutionError(err error) executionFailure {
 			failure.RetryAfter = ""
 			return failure
 		}
+		if hostErr.ProviderError != nil {
+			return classifyProviderFailureDetail(failure, *hostErr.ProviderError)
+		}
 		return classifyProviderFailureSignal(failure, hostErr.Code, hostErr.Message)
 	}
 	return executionFailure{
@@ -334,6 +366,31 @@ func classifyExecutionError(err error) executionFailure {
 		Message: err.Error(),
 		Status:  http.StatusBadGateway,
 	}
+}
+
+func classifyProviderFailureDetail(failure executionFailure, detail providererror.Detail) executionFailure {
+	detail = providererror.Sanitize(detail)
+	if strings.EqualFold(strings.TrimSpace(detail.Code), "credits_required") &&
+		(strings.EqualFold(strings.TrimSpace(detail.Type), "rate_limit_error") ||
+			strings.TrimSpace(detail.Type) == "") {
+		failure.Code = "bravo_subscription_model_credits_exhausted"
+		failure.Message = detail.Summary()
+		failure.Retryable = true
+		failure.AccountWide = false
+		failure.Provider = &detail
+		return sanitizeExecutionFailure(failure)
+	}
+	return classifyProviderFailureSignal(
+		failure,
+		detail.Code,
+		detail.Message,
+		detail.Model,
+		detail.ModelDisplayName,
+		detail.NoticeTitle,
+		detail.NoticeText,
+		detail.DisabledReason,
+		detail.Reason,
+	)
 }
 
 func localHostFailureCode(code string) bool {
@@ -370,7 +427,32 @@ func classifyHTTPFailure(status int, headers http.Header, message string, respon
 // request-contract checks. A provider-side HTTP 400 or 422 remains terminal
 // unless it carries one of the reviewed quota or model-entitlement signals
 // below.
-func classifyProviderFailureSignal(failure executionFailure, values ...string) executionFailure {
+func classifyProviderFailureSignal(failure executionFailure, values ...string) (classified executionFailure) {
+	defer func() {
+		classified = sanitizeExecutionFailure(classified)
+	}()
+	if detail, ok := creditsRequiredProviderDetail(values...); ok {
+		failure.Code = "bravo_subscription_model_credits_exhausted"
+		failure.Message = detail.Summary()
+		failure.Retryable = true
+		failure.AccountWide = false
+		failure.Provider = &detail
+		return failure
+	}
+	if providerContextWindowSignal(values...) {
+		failure.Code = "bravo_context_window_exceeded"
+		failure.Message = "Input exceeds this model's context window."
+		failure.Retryable = false
+		// Context overflow is request-scoped, but a different credential cannot
+		// repair it. Candidate configuration does not yet carry a verified
+		// context-window size, so fail closed instead of blindly switching to an
+		// equal or smaller physical model.
+		failure.RouteFallback = false
+		failure.AccountWide = false
+		failure.Provider = nil
+		return failure
+	}
+
 	switch failure.Status {
 	case http.StatusUnauthorized:
 		failure.Code = "bravo_subscription_auth_unavailable"
@@ -392,6 +474,105 @@ func classifyProviderFailureSignal(failure executionFailure, values ...string) e
 		failure.Retryable = true
 	}
 	return failure
+}
+
+func sanitizeExecutionFailure(failure executionFailure) executionFailure {
+	if failure.Provider != nil {
+		detail := providererror.Sanitize(*failure.Provider)
+		failure.Provider = &detail
+		if summary := strings.TrimSpace(detail.Summary()); summary != "" {
+			failure.Message = summary
+		}
+	}
+	message := strings.TrimSpace(failure.Message)
+	safeMessage := providererror.Sanitize(providererror.Detail{Message: message}).Message
+	if safeMessage == "" || structuredExecutionDiagnostic(message) {
+		failure.Message = genericExecutionFailureMessage(failure.Code)
+		return failure
+	}
+	failure.Message = safeMessage
+	return failure
+}
+
+func structuredExecutionDiagnostic(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if strings.ContainsAny(value, "{}") || strings.HasPrefix(value, "[") {
+		return true
+	}
+	lower := strings.ToLower(value)
+	for _, marker := range []string{
+		"request_id",
+		"request-id",
+		"authorization",
+		"bearer ",
+		"api_key",
+		"api-key",
+		"access_token",
+		"refresh_token",
+		"payment_method",
+		"payment-method",
+		"cookie:",
+		"set-cookie",
+		"sk-",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func genericExecutionFailureMessage(code string) string {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "bravo_subscription_quota_exhausted":
+		return "The selected subscription has reached its provider usage limit."
+	case "bravo_subscription_model_unavailable":
+		return "The requested model is unavailable on the selected subscription."
+	case "bravo_subscription_model_credits_exhausted":
+		return "The selected model has reached its provider spending limit."
+	case "bravo_context_window_exceeded":
+		return "Input exceeds this model's context window."
+	default:
+		return "The provider returned a structured diagnostic that Bravo does not expose."
+	}
+}
+
+func providerContextWindowSignal(values ...string) bool {
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		for _, signal := range []string{
+			"context_length_exceeded",
+			"context_window_exceeded",
+			"context_too_large",
+			"input exceeds the context window",
+			"exceeds the context window of this model",
+			"maximum context length",
+		} {
+			if strings.Contains(value, signal) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func creditsRequiredProviderDetail(values ...string) (providererror.Detail, bool) {
+	for _, value := range values {
+		if detail, ok := providererror.Parse(value); ok {
+			if strings.EqualFold(strings.TrimSpace(detail.Code), "credits_required") &&
+				(strings.EqualFold(strings.TrimSpace(detail.Type), "rate_limit_error") ||
+					strings.TrimSpace(detail.Type) == "") {
+				return detail, true
+			}
+		}
+	}
+	return providererror.Detail{}, false
 }
 
 // Some subscription-backed providers report account exhaustion as a generic
@@ -499,18 +680,36 @@ func applyFailureCooldown(attempt executionAttempt, failure executionFailure) {
 	if !failure.Retryable {
 		return
 	}
-	until := retryAfterTime(failure.RetryAfter, time.Now())
-	if until.IsZero() {
-		until = time.Now().Add(time.Duration(loadedConfig().CooldownSeconds) * time.Second)
-	}
+	until := failureCooldownUntil(failure, time.Now())
 	// Credential-level rejections and reviewed account-quota exhaustion disable
 	// the account everywhere. A model rate limit or upstream fault only disables
 	// the physical model that hit it.
 	model := attempt.Candidate.Model
-	if failure.AccountWide || accountWideCooldownStatus(failure.Status) {
+	explicitModelScope := failure.Provider != nil &&
+		strings.EqualFold(strings.TrimSpace(failure.Provider.Scope), "model")
+	if !explicitModelScope && (failure.AccountWide || accountWideCooldownStatus(failure.Status)) {
 		model = ""
 	}
-	setCooldown(attempt.Candidate.Provider, pinnedAuthID(attempt.Auth), model, failure.Code, until)
+	setCooldownWithProviderError(
+		attempt.Candidate.Provider,
+		pinnedAuthID(attempt.Auth),
+		model,
+		failure.Code,
+		until,
+		failure.Provider,
+	)
+}
+
+func failureCooldownUntil(failure executionFailure, now time.Time) time.Time {
+	if explicit := retryAfterTime(failure.RetryAfter, now); !explicit.IsZero() {
+		return explicit
+	}
+	duration := time.Duration(loadedConfig().CooldownSeconds) * time.Second
+	if failure.Code == "bravo_subscription_model_credits_exhausted" &&
+		duration < creditsRequiredMinimumProbeInterval {
+		duration = creditsRequiredMinimumProbeInterval
+	}
+	return now.Add(duration)
 }
 
 func skipCoolingExecutionAttempt(attempt executionAttempt, lastFailure *executionFailure) bool {
@@ -552,7 +751,8 @@ func retryAfterTime(value string, now time.Time) time.Time {
 }
 
 func recordExecutionAttempt(attempt executionAttempt, started time.Time, status int, success bool, failure executionFailure) {
-	appendAttempt(attemptRecord{
+	failure = sanitizeExecutionFailure(failure)
+	record := attemptRecord{
 		At:              started.UTC(),
 		LogicalModel:    attempt.LogicalModel,
 		Provider:        normalizeProvider(attempt.Candidate.Provider),
@@ -568,7 +768,22 @@ func recordExecutionAttempt(attempt executionAttempt, started time.Time, status 
 		ErrorCode:       failure.Code,
 		Error:           failure.Message,
 		LatencyMS:       time.Since(started).Milliseconds(),
-	})
+	}
+	if failure.Provider != nil {
+		detail := *failure.Provider
+		if strings.TrimSpace(detail.Model) == "" {
+			detail.Model = strings.TrimSpace(attempt.Candidate.Model)
+		}
+		record.ProviderErrorCode = detail.Code
+		record.ProviderModel = detail.Model
+		record.ProviderModelDisplayName = detail.ModelDisplayName
+		record.ProviderNoticeTitle = detail.NoticeTitle
+		record.ProviderNoticeText = detail.NoticeText
+		record.ProviderDisabledReason = detail.DisabledReason
+		record.ProviderErrorReason = detail.Reason
+		record.Scope = detail.Scope
+	}
+	appendAttempt(record)
 }
 
 func firstNonEmpty(values ...string) string {

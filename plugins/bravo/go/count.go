@@ -46,8 +46,13 @@ func countTokens(raw []byte) ([]byte, error) {
 	}
 
 	var lastFailure executionFailure
+	var failureTraces []executionFailureTrace
+	blockedModels := make(map[string]bool)
 	providerCalls := 0
 	for _, attempt := range plan {
+		if blockedModels[executionFailureModelKey(attempt)] {
+			continue
+		}
 		if skipCoolingExecutionAttempt(attempt, &lastFailure) {
 			continue
 		}
@@ -78,10 +83,14 @@ func countTokens(raw []byte) ([]byte, error) {
 			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
-			if failure.Retryable {
+			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
+			if executionFailureBlocksPhysicalModel(failure) {
+				blockedModels[executionFailureModelKey(attempt)] = true
+			}
+			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelope(failure), nil
+			return failureEnvelope(finalExecutionFailure(failureTraces, failure)), nil
 		}
 		var response pluginapi.HostModelExecutionResponse
 		if errDecode := json.Unmarshal(responseRaw, &response); errDecode != nil {
@@ -92,6 +101,7 @@ func countTokens(raw []byte) ([]byte, error) {
 				Retryable: true,
 			}
 			recordExecutionAttempt(attempt, started, lastFailure.Status, false, lastFailure)
+			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, lastFailure)
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
@@ -99,10 +109,14 @@ func countTokens(raw []byte) ([]byte, error) {
 			recordExecutionAttempt(attempt, started, response.StatusCode, false, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
-			if failure.Retryable {
+			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
+			if executionFailureBlocksPhysicalModel(failure) {
+				blockedModels[executionFailureModelKey(attempt)] = true
+			}
+			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelope(failure), nil
+			return failureEnvelope(finalExecutionFailure(failureTraces, failure)), nil
 		}
 		response.Headers.Del("Content-Length")
 		recordExecutionAttempt(attempt, started, response.StatusCode, true, executionFailure{})
@@ -127,5 +141,5 @@ func countTokens(raw []byte) ([]byte, error) {
 			Status:  http.StatusUnprocessableEntity,
 		}
 	}
-	return failureEnvelope(lastFailure), nil
+	return failureEnvelope(finalExecutionFailure(failureTraces, lastFailure)), nil
 }

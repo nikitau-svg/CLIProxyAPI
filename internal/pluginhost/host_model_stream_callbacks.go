@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -114,6 +115,10 @@ func (h *Host) callHostModelStreamRead(ctx context.Context, request []byte) ([]b
 			Retryable:  chunk.Err.Retryable,
 			Headers:    cloneHeader(chunk.Err.Headers),
 			RetryAfter: chunk.Err.RetryAfter,
+		}
+		if chunk.Err.ProviderError != nil {
+			detail := providererror.Sanitize(*chunk.Err.ProviderError)
+			resp.ErrorDetail.ProviderError = &detail
 		}
 		resp.Done = true
 	}

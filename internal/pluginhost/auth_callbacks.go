@@ -13,6 +13,7 @@ import (
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -425,19 +426,189 @@ func hostAuthModelStates(auth *coreauth.Auth) map[string]pluginapi.HostAuthModel
 		if model == "" || state == nil {
 			continue
 		}
-		out[model] = pluginapi.HostAuthModelState{
+		view := pluginapi.HostAuthModelState{
 			Status:         string(state.Status),
-			StatusMessage:  state.StatusMessage,
 			Unavailable:    state.Unavailable,
 			NextRetryAfter: state.NextRetryAfter,
 			QuotaExceeded:  state.Quota.Exceeded,
 			QuotaRecoverAt: state.Quota.NextRecoverAt,
+			UpdatedAt:      state.UpdatedAt,
 		}
+		detail, parsed := hostAuthModelStateProviderError(state)
+		if parsed {
+			view.StatusMessage = detail.Summary()
+			view.ErrorCode = detail.Code
+			view.ErrorMessage = detail.Message
+			view.ProviderModel = detail.Model
+			view.ProviderModelDisplayName = detail.ModelDisplayName
+			view.ProviderNoticeTitle = detail.NoticeTitle
+			view.ProviderNoticeText = detail.NoticeText
+			view.ProviderDisabledReason = detail.DisabledReason
+			view.Scope = detail.Scope
+			view.Reason = detail.Reason
+			if view.ErrorCode == "" && state.LastError != nil {
+				view.ErrorCode = safeHostAuthModelStateCode(state.LastError.Code)
+			}
+		} else {
+			view.StatusMessage = safeHostAuthModelStateText(state.StatusMessage)
+			if state.LastError != nil {
+				view.ErrorCode = safeHostAuthModelStateCode(state.LastError.Code)
+				view.ErrorMessage = safeHostAuthModelStateText(state.LastError.Message)
+			}
+		}
+		if view.StatusMessage == "" {
+			view.StatusMessage = view.ErrorMessage
+		}
+		out[model] = view
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+func hostAuthModelStateProviderError(state *coreauth.ModelState) (providererror.Detail, bool) {
+	if state == nil {
+		return providererror.Detail{}, false
+	}
+	if state.LastError != nil {
+		if detail, ok := providererror.Parse(state.LastError.Message); ok {
+			return detail, true
+		}
+	}
+	return providererror.Parse(state.StatusMessage)
+}
+
+// safeHostAuthModelStateText keeps ordinary short diagnostics useful while
+// failing closed for provider envelopes and common credential/payment fields.
+// Structured provider failures must travel through providererror.Parse above;
+// the original response body stays in restricted logs, not plugin metadata or
+// management responses.
+func safeHostAuthModelStateText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if hostAuthDiagnosticContainsCredentialMarker(value) {
+		return ""
+	}
+	lower := strings.ToLower(value)
+	for _, forbidden := range []string{
+		`"request_id"`,
+		"request_id=",
+		"request-id",
+		"request id",
+		`"authorization"`,
+		"authorization:",
+		"bearer ",
+		`"api_key"`,
+		"api_key=",
+		"api-key",
+		"api key",
+		`"access_token"`,
+		"access_token=",
+		"access-token",
+		`"refresh_token"`,
+		"refresh_token=",
+		"refresh-token",
+		`"has_chargeable_saved_payment_method"`,
+		`"can_user_purchase_credits"`,
+		`"payment_method"`,
+		"payment-method",
+		"cookie:",
+		"set-cookie",
+		"sk-",
+	} {
+		if strings.Contains(lower, forbidden) {
+			return ""
+		}
+	}
+	if json.Valid([]byte(value)) {
+		return ""
+	}
+	if start := strings.IndexByte(value, '{'); start >= 0 && json.Valid([]byte(value[start:])) {
+		return ""
+	}
+	const maxRunes = 512
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		value = string(runes[:maxRunes]) + "…"
+	}
+	return value
+}
+
+func hostAuthDiagnosticContainsCredentialMarker(value string) bool {
+	words := strings.FieldsFunc(strings.ToLower(value), func(char rune) bool {
+		return !((char >= 'a' && char <= 'z') || (char >= '0' && char <= '9'))
+	})
+	for index, word := range words {
+		switch word {
+		case "password",
+			"passphrase",
+			"requestid",
+			"apikey",
+			"accesstoken",
+			"refreshtoken",
+			"authorization",
+			"paymentmethod",
+			"sessionkey",
+			"sessiontoken",
+			"clientsecret",
+			"idtoken",
+			"privatekey",
+			"secretkey",
+			"secretaccesskey":
+			return true
+		}
+		if index+1 < len(words) {
+			switch word + words[index+1] {
+			case "password",
+				"requestid",
+				"apikey",
+				"accesstoken",
+				"refreshtoken",
+				"paymentmethod",
+				"sessionkey",
+				"sessiontoken",
+				"clientsecret",
+				"idtoken",
+				"privatekey",
+				"secretkey":
+				return true
+			}
+		}
+		if index+2 < len(words) && word+words[index+1]+words[index+2] == "secretaccesskey" {
+			return true
+		}
+	}
+	return false
+}
+
+func safeHostAuthStatusMessage(value string) string {
+	if detail, ok := providererror.Parse(value); ok {
+		return detail.Summary()
+	}
+	return safeHostAuthModelStateText(value)
+}
+
+func safeHostAuthModelStateCode(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z',
+			char >= 'A' && char <= 'Z',
+			char >= '0' && char <= '9',
+			char == '_',
+			char == '-',
+			char == '.':
+		default:
+			return ""
+		}
+	}
+	return value
 }
 
 func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFileEntry {
@@ -471,7 +642,7 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 		Provider:       strings.TrimSpace(auth.Provider),
 		Label:          hostAuthDisplayLabel(auth),
 		Status:         string(auth.Status),
-		StatusMessage:  auth.StatusMessage,
+		StatusMessage:  safeHostAuthStatusMessage(auth.StatusMessage),
 		Disabled:       auth.Disabled,
 		Unavailable:    auth.Unavailable,
 		RuntimeOnly:    runtimeOnly,

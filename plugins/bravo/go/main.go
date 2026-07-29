@@ -279,12 +279,13 @@ func callHostABI(method string, payload any) (json.RawMessage, error) {
 	if !env.OK {
 		if env.Error != nil {
 			return nil, &hostCallError{
-				Code:       env.Error.Code,
-				Message:    env.Error.Message,
-				Retryable:  env.Error.Retryable,
-				HTTPStatus: env.Error.HTTPStatus,
-				Headers:    cloneHeader(env.Error.Headers),
-				RetryAfter: strings.TrimSpace(env.Error.RetryAfter),
+				Code:          env.Error.Code,
+				Message:       env.Error.Message,
+				Retryable:     env.Error.Retryable,
+				HTTPStatus:    env.Error.HTTPStatus,
+				Headers:       cloneHeader(env.Error.Headers),
+				RetryAfter:    strings.TrimSpace(env.Error.RetryAfter),
+				ProviderError: sanitizedProviderErrorPointer(env.Error.ProviderError),
 			}
 		}
 		return nil, &hostCallError{Code: "host_callback_failed", Message: "host callback failed", HTTPStatus: http.StatusBadGateway}

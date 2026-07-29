@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -38,23 +39,38 @@ type subscriptionQuotaView struct {
 }
 
 type subscriptionView struct {
-	AuthIndex         string                `json:"auth_index"`
-	AnalyticsID       string                `json:"analytics_id"`
-	AuthID            string                `json:"auth_id,omitempty"`
-	Provider          string                `json:"provider,omitempty"`
-	Label             string                `json:"label,omitempty"`
-	DisplayName       string                `json:"display_name,omitempty"`
-	Note              string                `json:"note,omitempty"`
-	Email             string                `json:"email,omitempty"`
-	Workspace         string                `json:"workspace,omitempty"`
-	Plan              string                `json:"plan,omitempty"`
-	Tariff            string                `json:"tariff"`
-	EffectiveTariff   string                `json:"effective_tariff"`
-	Enabled           bool                  `json:"enabled"`
-	Health            string                `json:"health"`
-	PrimaryProjectIDs []string              `json:"primary_project_ids"`
-	Quota             subscriptionQuotaView `json:"quota"`
-	Usage             usageSummaryView      `json:"usage"`
+	AuthIndex         string                       `json:"auth_index"`
+	AnalyticsID       string                       `json:"analytics_id"`
+	AuthID            string                       `json:"auth_id,omitempty"`
+	Provider          string                       `json:"provider,omitempty"`
+	Label             string                       `json:"label,omitempty"`
+	DisplayName       string                       `json:"display_name,omitempty"`
+	Note              string                       `json:"note,omitempty"`
+	Email             string                       `json:"email,omitempty"`
+	Workspace         string                       `json:"workspace,omitempty"`
+	Plan              string                       `json:"plan,omitempty"`
+	Tariff            string                       `json:"tariff"`
+	EffectiveTariff   string                       `json:"effective_tariff"`
+	Enabled           bool                         `json:"enabled"`
+	Health            string                       `json:"health"`
+	ModelIssues       []subscriptionModelIssueView `json:"model_issues,omitempty"`
+	PrimaryProjectIDs []string                     `json:"primary_project_ids"`
+	Quota             subscriptionQuotaView        `json:"quota"`
+	Usage             usageSummaryView             `json:"usage"`
+}
+
+type subscriptionModelIssueView struct {
+	Model                    string     `json:"model"`
+	ProviderErrorCode        string     `json:"provider_error_code"`
+	ProviderModel            string     `json:"provider_model"`
+	ProviderModelDisplayName string     `json:"provider_model_display_name,omitempty"`
+	ProviderNoticeTitle      string     `json:"provider_notice_title,omitempty"`
+	ProviderNoticeText       string     `json:"provider_notice_text,omitempty"`
+	ProviderDisabledReason   string     `json:"provider_disabled_reason,omitempty"`
+	ProviderErrorReason      string     `json:"provider_error_reason,omitempty"`
+	Scope                    string     `json:"scope"`
+	RetryAt                  *time.Time `json:"retry_at,omitempty"`
+	ObservedAt               *time.Time `json:"observed_at,omitempty"`
 }
 
 type patchSubscriptionRequest struct {
@@ -168,6 +184,7 @@ func buildSubscriptionView(
 		tariffID = "auto"
 	}
 	presentation := subscriptionPresentationFor(auth, quota)
+	modelIssues := subscriptionModelIssues(auth)
 	return subscriptionView{
 		AuthIndex:   strings.TrimSpace(auth.AuthIndex),
 		AnalyticsID: analyticsSubscriptionID(auth.AuthIndex),
@@ -175,16 +192,21 @@ func buildSubscriptionView(
 		Provider:    normalizeProvider(firstNonEmpty(auth.Provider, auth.Type, quota.Provider)),
 		// Label stays as a compatibility alias for older Management Center builds.
 		// New clients use DisplayName and render Note as its own, operator-authored field.
-		Label:             presentation.DisplayName,
-		DisplayName:       presentation.DisplayName,
-		Note:              presentation.Note,
-		Email:             presentation.Email,
-		Workspace:         presentation.Workspace,
-		Plan:              strings.TrimSpace(quota.Plan),
-		Tariff:            tariffID,
-		EffectiveTariff:   tariff.ID,
-		Enabled:           enabled,
-		Health:            string(classifyBravoAuthHealth(firstNonEmpty(auth.Provider, auth.Type), auth, time.Now())),
+		Label:           presentation.DisplayName,
+		DisplayName:     presentation.DisplayName,
+		Note:            presentation.Note,
+		Email:           presentation.Email,
+		Workspace:       presentation.Workspace,
+		Plan:            strings.TrimSpace(quota.Plan),
+		Tariff:          tariffID,
+		EffectiveTariff: tariff.ID,
+		Enabled:         enabled,
+		// A credential-wide status is a lossy roll-up of per-model state. Present
+		// the account as unavailable only for an operator disable or a live
+		// account-wide deadline/cooldown; individual model restrictions are listed
+		// separately below.
+		Health:            string(classifyBravoSubscriptionHealth(firstNonEmpty(auth.Provider, auth.Type), auth, time.Now())),
+		ModelIssues:       modelIssues,
 		PrimaryProjectIDs: append([]string(nil), primaryProjects...),
 		Quota: subscriptionQuotaView{
 			Confidence:  confidence,
@@ -196,6 +218,191 @@ func buildSubscriptionView(
 		},
 		Usage: authUsageSummary(auth.AuthIndex, time.Now()),
 	}
+}
+
+func classifyBravoSubscriptionHealth(provider string, auth pluginapi.HostAuthFileEntry, now time.Time) bravoAuthHealth {
+	if len(auth.ModelStates) > 0 {
+		return classifyBravoAuthCredentialGate(provider, auth, now)
+	}
+	return classifyBravoAuthHealthDeadline(provider, auth, now)
+}
+
+func subscriptionModelIssues(auth pluginapi.HostAuthFileEntry) []subscriptionModelIssueView {
+	now := time.Now()
+	issuesByModel := make(map[string]subscriptionModelIssueView)
+
+	models := make([]string, 0, len(auth.ModelStates))
+	for model := range auth.ModelStates {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		state := auth.ModelStates[model]
+		if !subscriptionModelIssueActive(state, now) {
+			continue
+		}
+		detail := providererror.Detail{
+			Code:             state.ErrorCode,
+			Message:          state.ErrorMessage,
+			Model:            state.ProviderModel,
+			ModelDisplayName: state.ProviderModelDisplayName,
+			NoticeTitle:      state.ProviderNoticeTitle,
+			NoticeText:       state.ProviderNoticeText,
+			DisabledReason:   state.ProviderDisabledReason,
+			Scope:            state.Scope,
+			Reason:           state.Reason,
+		}
+		if strings.TrimSpace(detail.Code) == "" {
+			detail, _ = providererror.Parse(state.StatusMessage)
+		}
+		issue, ok := subscriptionModelIssueFromDetail(
+			model,
+			detail,
+			state.NextRetryAfter,
+			state.UpdatedAt,
+		)
+		if ok {
+			issuesByModel[issue.Model] = issue
+		}
+	}
+
+	provider := normalizeProvider(firstNonEmpty(auth.Provider, auth.Type))
+	for _, cooldown := range activeProviderModelCooldowns(provider, auth.ID, now) {
+		issue, ok := subscriptionModelIssueFromDetail(
+			cooldown.Model,
+			cooldown.ProviderError,
+			cooldown.Until,
+			cooldown.ObservedAt,
+		)
+		if ok {
+			// Bravo's cooldown is the execution source of truth and may outlive
+			// Core's transient ModelStates snapshot. Preserve richer safe host
+			// labels while taking the latest active retry barrier.
+			if hostIssue, exists := issuesByModel[issue.Model]; exists {
+				issue = mergeSubscriptionModelIssues(hostIssue, issue)
+			}
+			issuesByModel[issue.Model] = issue
+		}
+	}
+
+	models = models[:0]
+	for model := range issuesByModel {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	issues := make([]subscriptionModelIssueView, 0, len(models))
+	for _, model := range models {
+		issues = append(issues, issuesByModel[model])
+	}
+	return issues
+}
+
+func subscriptionModelIssueFromDetail(
+	model string,
+	detail providererror.Detail,
+	retryAt, observedAt time.Time,
+) (subscriptionModelIssueView, bool) {
+	detail = providererror.Sanitize(detail)
+	if !strings.EqualFold(strings.TrimSpace(detail.Code), "credits_required") {
+		return subscriptionModelIssueView{}, false
+	}
+	model = baseModelKey(strings.TrimSpace(model))
+	safeModel := providererror.Sanitize(providererror.Detail{Model: model}).Model
+	if safeModel == "" {
+		return subscriptionModelIssueView{}, false
+	}
+	if strings.TrimSpace(detail.Model) == "" {
+		detail.Model = safeModel
+	}
+	if strings.TrimSpace(detail.Scope) == "" {
+		detail.Scope = "model"
+	}
+	if !strings.EqualFold(strings.TrimSpace(detail.Scope), "model") {
+		return subscriptionModelIssueView{}, false
+	}
+	issue := subscriptionModelIssueView{
+		Model:                    safeModel,
+		ProviderErrorCode:        detail.Code,
+		ProviderModel:            detail.Model,
+		ProviderModelDisplayName: detail.ModelDisplayName,
+		ProviderNoticeTitle:      detail.NoticeTitle,
+		ProviderNoticeText:       detail.NoticeText,
+		ProviderDisabledReason:   detail.DisabledReason,
+		ProviderErrorReason:      detail.Reason,
+		Scope:                    detail.Scope,
+	}
+	if !retryAt.IsZero() {
+		retryAtCopy := retryAt
+		issue.RetryAt = &retryAtCopy
+	}
+	if !observedAt.IsZero() {
+		observedAtCopy := observedAt
+		issue.ObservedAt = &observedAtCopy
+	}
+	return issue, true
+}
+
+func mergeSubscriptionModelIssues(
+	hostIssue, runtimeIssue subscriptionModelIssueView,
+) subscriptionModelIssueView {
+	merged := hostIssue
+	if merged.Model == "" {
+		merged.Model = runtimeIssue.Model
+	}
+	if merged.ProviderErrorCode == "" {
+		merged.ProviderErrorCode = runtimeIssue.ProviderErrorCode
+	}
+	if merged.ProviderModel == "" {
+		merged.ProviderModel = runtimeIssue.ProviderModel
+	}
+	if merged.ProviderModelDisplayName == "" {
+		merged.ProviderModelDisplayName = runtimeIssue.ProviderModelDisplayName
+	}
+	if merged.ProviderNoticeTitle == "" {
+		merged.ProviderNoticeTitle = runtimeIssue.ProviderNoticeTitle
+	}
+	if merged.ProviderNoticeText == "" {
+		merged.ProviderNoticeText = runtimeIssue.ProviderNoticeText
+	}
+	if merged.ProviderDisabledReason == "" {
+		merged.ProviderDisabledReason = runtimeIssue.ProviderDisabledReason
+	}
+	if merged.ProviderErrorReason == "" {
+		merged.ProviderErrorReason = runtimeIssue.ProviderErrorReason
+	}
+	if merged.Scope == "" {
+		merged.Scope = runtimeIssue.Scope
+	}
+	merged.RetryAt = laterTimePointer(merged.RetryAt, runtimeIssue.RetryAt)
+	merged.ObservedAt = laterTimePointer(merged.ObservedAt, runtimeIssue.ObservedAt)
+	return merged
+}
+
+func laterTimePointer(left, right *time.Time) *time.Time {
+	switch {
+	case left == nil:
+		return right
+	case right == nil:
+		return left
+	case right.After(*left):
+		return right
+	default:
+		return left
+	}
+}
+
+func subscriptionModelIssueActive(state pluginapi.HostAuthModelState, now time.Time) bool {
+	if state.Unavailable &&
+		!state.NextRetryAfter.IsZero() &&
+		state.NextRetryAfter.After(now) {
+		return true
+	}
+	if state.QuotaExceeded &&
+		!state.QuotaRecoverAt.IsZero() &&
+		state.QuotaRecoverAt.After(now) {
+		return true
+	}
+	return false
 }
 
 type subscriptionPresentation struct {

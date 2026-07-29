@@ -245,6 +245,7 @@ func shouldCommitBravoCoreAccounting(failure executionFailure) bool {
 	switch code {
 	case "bravo_subscription_auth_unavailable",
 		"bravo_subscription_access_denied",
+		"bravo_subscription_model_credits_exhausted",
 		"bravo_subscription_quota_exhausted",
 		"bravo_subscription_model_unavailable":
 		// These reviewed Bravo codes are normalized from real provider/Core

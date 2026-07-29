@@ -12,21 +12,28 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
 
 type hostModelCallbackError struct {
-	cause      error
-	code       string
-	statusCode int
-	retryable  bool
-	headers    http.Header
-	retryAfter string
+	cause         error
+	code          string
+	statusCode    int
+	retryable     bool
+	headers       http.Header
+	retryAfter    string
+	providerError *providererror.Detail
 }
 
 func (e *hostModelCallbackError) Error() string {
 	if e == nil {
 		return ""
+	}
+	if detail, ok := e.ProviderErrorDetail(); ok {
+		if summary := strings.TrimSpace(detail.Summary()); summary != "" {
+			return summary
+		}
 	}
 	if e.cause != nil {
 		return e.cause.Error()
@@ -74,6 +81,17 @@ func (e *hostModelCallbackError) RetryAfterValue() string {
 		return ""
 	}
 	return e.retryAfter
+}
+
+func (e *hostModelCallbackError) ProviderErrorDetail() (providererror.Detail, bool) {
+	if e == nil || e.providerError == nil {
+		return providererror.Detail{}, false
+	}
+	detail := providererror.Sanitize(*e.providerError)
+	if detail.Code == "" && detail.Type == "" && detail.Message == "" {
+		return providererror.Detail{}, false
+	}
+	return detail, true
 }
 
 func newHostModelCallbackError(errMsg *interfaces.ErrorMessage) error {
@@ -139,14 +157,29 @@ func newHostModelCallbackError(errMsg *interfaces.ErrorMessage) error {
 	if code == "" {
 		code = "model_execution_failed"
 	}
-	return &hostModelCallbackError{
-		cause:      cause,
-		code:       code,
-		statusCode: statusCode,
-		retryable:  retryable,
-		headers:    headers,
-		retryAfter: retryAfter,
+	var providerDetail *providererror.Detail
+	if detail, ok := safeHostCallbackProviderError(cause); ok {
+		providerDetail = &detail
 	}
+	return &hostModelCallbackError{
+		cause:         cause,
+		code:          code,
+		statusCode:    statusCode,
+		retryable:     retryable,
+		headers:       headers,
+		retryAfter:    retryAfter,
+		providerError: providerDetail,
+	}
+}
+
+func safeHostCallbackProviderError(err error) (providererror.Detail, bool) {
+	if detail, ok := providererror.FromError(err); ok {
+		return detail, true
+	}
+	if err == nil {
+		return providererror.Detail{}, false
+	}
+	return providererror.Parse(err.Error())
 }
 
 func mergeHostErrorHeaders(base, extra http.Header) http.Header {
@@ -183,9 +216,16 @@ func marshalHostCallbackError(err error) []byte {
 	if err == nil {
 		return marshalRPCError("host_call_failed", "host callback failed")
 	}
+	providerDetail, hasProviderDetail := safeHostCallbackProviderError(err)
+	message := err.Error()
+	if hasProviderDetail {
+		if summary := strings.TrimSpace(providerDetail.Summary()); summary != "" {
+			message = summary
+		}
+	}
 	detail := &pluginabi.Error{
 		Code:    "host_call_failed",
-		Message: err.Error(),
+		Message: message,
 	}
 	var coded interface{ ErrorCode() string }
 	if errors.As(err, &coded) && coded != nil {
@@ -211,6 +251,9 @@ func marshalHostCallbackError(err error) []byte {
 	}
 	if detail.RetryAfter == "" {
 		detail.RetryAfter = strings.TrimSpace(detail.Headers.Get("Retry-After"))
+	}
+	if hasProviderDetail {
+		detail.ProviderError = &providerDetail
 	}
 	raw, _ := json.Marshal(pluginabi.Envelope{OK: false, Error: detail})
 	return raw

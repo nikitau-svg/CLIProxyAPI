@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -4280,6 +4281,14 @@ func resultErrorFromError(err error) *Error {
 	}
 	if resultErr.HTTPStatus == 0 {
 		resultErr.HTTPStatus = statusCodeFromError(err)
+	}
+	if detail, ok := providererror.FromError(err); ok {
+		if code := strings.TrimSpace(detail.Code); code != "" {
+			resultErr.Code = code
+		}
+		if summary := strings.TrimSpace(detail.Summary()); summary != "" {
+			resultErr.Message = summary
+		}
 	}
 	explicitlyRequestScoped := isRequestScopedError(err)
 	if explicitlyRequestScoped && !isRequestScopedResultError(resultErr) {

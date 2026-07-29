@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -86,6 +88,19 @@ type credentialQuotaState struct {
 	Dirty          bool                    `json:"dirty,omitempty"`
 }
 
+// persistedCooldownEntry is the restart-safe subset of Bravo's routing
+// barrier. ProviderError is already reviewed and sanitized; raw provider
+// response bodies never enter this type.
+type persistedCooldownEntry struct {
+	Until         time.Time             `json:"until"`
+	ObservedAt    time.Time             `json:"observed_at,omitempty"`
+	Reason        string                `json:"reason,omitempty"`
+	Provider      string                `json:"provider"`
+	AuthID        string                `json:"auth_id"`
+	Model         string                `json:"model,omitempty"`
+	ProviderError *providererror.Detail `json:"provider_error,omitempty"`
+}
+
 type persistedUsageState struct {
 	SchemaVersion                  int                                                `json:"schema_version"`
 	GlobalTotal                    usageAggregate                                     `json:"global_total"`
@@ -95,15 +110,17 @@ type persistedUsageState struct {
 	ModelTotals                    map[string]*modelUsageAggregate                    `json:"model_totals"`
 	ProjectSubscriptionModelTotals map[string]*projectSubscriptionModelUsageAggregate `json:"project_subscription_model_totals"`
 	Quotas                         map[string]*credentialQuotaState                   `json:"quotas"`
+	Cooldowns                      map[string]*persistedCooldownEntry                 `json:"cooldowns,omitempty"`
 	DimensionalStartedAt           time.Time                                          `json:"dimensional_started_at,omitempty"`
 	UpdatedAt                      time.Time                                          `json:"updated_at,omitempty"`
 }
 
 type usageStateStore struct {
-	mu        sync.RWMutex
-	path      string
-	state     persistedUsageState
-	saveTimer *time.Timer
+	mu         sync.RWMutex
+	path       string
+	state      persistedUsageState
+	saveTimer  *time.Timer
+	generation atomic.Uint64
 }
 
 var bravoUsageState = &usageStateStore{}
@@ -118,6 +135,7 @@ func newPersistedUsageState() persistedUsageState {
 		ModelTotals:                    make(map[string]*modelUsageAggregate),
 		ProjectSubscriptionModelTotals: make(map[string]*projectSubscriptionModelUsageAggregate),
 		Quotas:                         make(map[string]*credentialQuotaState),
+		Cooldowns:                      make(map[string]*persistedCooldownEntry),
 	}
 }
 
@@ -148,6 +166,7 @@ func (store *usageStateStore) configure(path string) error {
 			return errFlush
 		}
 		if store.path == path {
+			restoreRuntimeCooldowns(store.state.Cooldowns, time.Now().UTC(), false)
 			return nil
 		}
 	}
@@ -157,6 +176,8 @@ func (store *usageStateStore) configure(path string) error {
 	}
 	store.path = path
 	store.state = state
+	store.generation.Add(1)
+	restoreRuntimeCooldowns(state.Cooldowns, time.Now().UTC(), true)
 	return nil
 }
 
@@ -232,6 +253,15 @@ func normalizePersistedUsageState(state *persistedUsageState) {
 	if state.Quotas == nil {
 		state.Quotas = make(map[string]*credentialQuotaState)
 	}
+	normalizedCooldowns := make(map[string]*persistedCooldownEntry, len(state.Cooldowns))
+	for _, persisted := range state.Cooldowns {
+		entry, ok := runtimeCooldownFromPersisted(persisted)
+		if !ok {
+			continue
+		}
+		normalizedCooldowns[cooldownKey(entry.Provider, entry.AuthID, entry.Model)] = persistedCooldownFromRuntime(entry)
+	}
+	state.Cooldowns = normalizedCooldowns
 	for _, values := range []map[string]*usageAggregate{
 		state.AuthTotals,
 		state.ProjectTotals,
@@ -317,6 +347,11 @@ func prunePersistedUsageState(state *persistedUsageState, reference time.Time) {
 			pruneUsageAggregate(&aggregate.Usage, reference)
 		}
 	}
+	for key, entry := range state.Cooldowns {
+		if entry == nil || !entry.Until.After(reference) {
+			delete(state.Cooldowns, key)
+		}
+	}
 }
 
 func usageCountersEmpty(value usageCounters) bool {
@@ -349,7 +384,10 @@ func (store *usageStateStore) saveLocked() error {
 	if store.path == "" {
 		return nil
 	}
-	store.state.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	normalizePersistedUsageState(&store.state)
+	prunePersistedUsageState(&store.state, now)
+	store.state.UpdatedAt = now
 	raw, errMarshal := json.MarshalIndent(store.state, "", "  ")
 	if errMarshal != nil {
 		return fmt.Errorf("encode state snapshot: %w", errMarshal)
@@ -390,6 +428,167 @@ func (store *usageStateStore) saveLocked() error {
 
 func flushUsageState() {
 	_ = bravoUsageState.flush()
+}
+
+func persistRuntimeCooldown(entry cooldownEntry, generation uint64) {
+	persisted := persistedCooldownFromRuntime(entry)
+	if persisted == nil {
+		return
+	}
+	key := cooldownKey(entry.Provider, entry.AuthID, entry.Model)
+	bravoUsageState.mu.Lock()
+	// The plugin is configured before routing. Keeping tests and an
+	// unconfigured process memory-only avoids manufacturing a snapshot at an
+	// implicit path.
+	if bravoUsageState.path == "" {
+		bravoUsageState.mu.Unlock()
+		return
+	}
+	if bravoUsageState.generation.Load() != generation {
+		bravoUsageState.mu.Unlock()
+		removeRuntimeCooldownIfCurrent(key, entry)
+		return
+	}
+	if bravoUsageState.state.Cooldowns == nil {
+		bravoUsageState.state.Cooldowns = make(map[string]*persistedCooldownEntry)
+	}
+	if bravoUsageState.state.SchemaVersion == 0 {
+		bravoUsageState.state.SchemaVersion = usageStateSchemaVersion
+	}
+	bravoUsageState.state.Cooldowns[key] = persisted
+	// Cooldowns are a routing safety barrier, not eventually-consistent
+	// analytics. A container may restart as soon as the fallback response
+	// completes, so finish the existing atomic temp+fsync+rename write before
+	// returning to the request.
+	if errSave := bravoUsageState.saveLocked(); errSave != nil {
+		// Keep the in-memory barrier and retry on the ordinary debounce rather
+		// than deleting it after a transient filesystem error.
+		bravoUsageState.scheduleSaveLocked()
+	}
+	// Reassert while holding store.mu. A path switch therefore either happens
+	// before the generation check above (and rejects this setter) or after this
+	// merge (and replaces it); it cannot land between the check and reassert.
+	restoreRuntimeCooldowns(
+		map[string]*persistedCooldownEntry{key: persisted},
+		time.Now().UTC(),
+		false,
+	)
+	bravoUsageState.mu.Unlock()
+}
+
+func removePersistedCooldown(entry cooldownEntry) {
+	key := cooldownKey(entry.Provider, entry.AuthID, entry.Model)
+	expected := persistedCooldownFromRuntime(entry)
+	if expected == nil {
+		return
+	}
+	expectedRuntime, okExpected := runtimeCooldownFromPersisted(expected)
+	if !okExpected {
+		return
+	}
+	bravoUsageState.mu.Lock()
+	defer bravoUsageState.mu.Unlock()
+	if bravoUsageState.path == "" || bravoUsageState.state.Cooldowns == nil {
+		return
+	}
+	currentPersisted, ok := bravoUsageState.state.Cooldowns[key]
+	if !ok {
+		return
+	}
+	currentRuntime, okCurrent := runtimeCooldownFromPersisted(currentPersisted)
+	if !okCurrent || !sameCooldownInstance(currentRuntime, expectedRuntime) {
+		return
+	}
+	delete(bravoUsageState.state.Cooldowns, key)
+	bravoUsageState.scheduleSaveLocked()
+}
+
+func persistedCooldownFromRuntime(entry cooldownEntry) *persistedCooldownEntry {
+	entry, ok := sanitizeCooldownEntry(entry)
+	if !ok {
+		return nil
+	}
+	persisted := &persistedCooldownEntry{
+		Until:      entry.Until.UTC(),
+		ObservedAt: entry.ObservedAt.UTC(),
+		Reason:     entry.Reason,
+		Provider:   entry.Provider,
+		AuthID:     entry.AuthID,
+		Model:      entry.Model,
+	}
+	if entry.ProviderError != (providererror.Detail{}) {
+		detail := entry.ProviderError
+		persisted.ProviderError = &detail
+	}
+	return persisted
+}
+
+func runtimeCooldownFromPersisted(persisted *persistedCooldownEntry) (cooldownEntry, bool) {
+	if persisted == nil {
+		return cooldownEntry{}, false
+	}
+	entry := cooldownEntry{
+		Until:      persisted.Until,
+		ObservedAt: persisted.ObservedAt,
+		Reason:     persisted.Reason,
+		Provider:   persisted.Provider,
+		AuthID:     persisted.AuthID,
+		Model:      persisted.Model,
+	}
+	if persisted.ProviderError != nil {
+		entry.ProviderError = *persisted.ProviderError
+	}
+	return sanitizeCooldownEntry(entry)
+}
+
+func sanitizeCooldownEntry(entry cooldownEntry) (cooldownEntry, bool) {
+	entry.Provider = normalizeProvider(entry.Provider)
+	entry.AuthID = strings.TrimSpace(entry.AuthID)
+	entry.Model = baseModelKey(strings.TrimSpace(entry.Model))
+	entry.Reason = providererror.Sanitize(providererror.Detail{Reason: entry.Reason}).Reason
+	entry.ProviderError = providererror.Sanitize(entry.ProviderError)
+	if entry.ProviderError != (providererror.Detail{}) && entry.Model != "" {
+		entry.ProviderError.Model = entry.Model
+		if entry.ProviderError.Scope == "" {
+			entry.ProviderError.Scope = "model"
+		}
+	} else if entry.ProviderError != (providererror.Detail{}) &&
+		strings.EqualFold(entry.ProviderError.Scope, "model") {
+		entry.ProviderError.Scope = ""
+	}
+	if entry.Provider == "" || entry.AuthID == "" || entry.Until.IsZero() {
+		return cooldownEntry{}, false
+	}
+	return entry, true
+}
+
+func restoreRuntimeCooldowns(values map[string]*persistedCooldownEntry, now time.Time, replace bool) {
+	restored := make(map[string]cooldownEntry, len(values))
+	for _, persisted := range values {
+		entry, ok := runtimeCooldownFromPersisted(persisted)
+		if !ok || !entry.Until.After(now) {
+			continue
+		}
+		restored[cooldownKey(entry.Provider, entry.AuthID, entry.Model)] = entry
+	}
+	runtimeState.Lock()
+	if replace || runtimeState.Cooldowns == nil {
+		runtimeState.Cooldowns = restored
+		runtimeState.Unlock()
+		return
+	}
+	for key, current := range runtimeState.Cooldowns {
+		if !current.Until.After(now) {
+			delete(runtimeState.Cooldowns, key)
+		}
+	}
+	for key, entry := range restored {
+		current, exists := runtimeState.Cooldowns[key]
+		if !exists || entry.Until.After(current.Until) {
+			runtimeState.Cooldowns[key] = entry
+		}
+	}
+	runtimeState.Unlock()
 }
 
 func handleUsageRecord(raw []byte) ([]byte, error) {

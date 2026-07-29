@@ -11,6 +11,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"golang.org/x/net/context"
 )
 
@@ -125,12 +126,13 @@ type ModelExecutionChunk struct {
 
 // ModelExecutionStreamError carries a JSON-friendly terminal stream error.
 type ModelExecutionStreamError struct {
-	Code       string      `json:"code,omitempty"`
-	StatusCode int         `json:"status_code"`
-	Message    string      `json:"message"`
-	Retryable  bool        `json:"retryable,omitempty"`
-	Headers    http.Header `json:"headers"`
-	RetryAfter string      `json:"retry_after,omitempty"`
+	Code          string                `json:"code,omitempty"`
+	StatusCode    int                   `json:"status_code"`
+	Message       string                `json:"message"`
+	Retryable     bool                  `json:"retryable,omitempty"`
+	Headers       http.Header           `json:"headers"`
+	RetryAfter    string                `json:"retry_after,omitempty"`
+	ProviderError *providererror.Detail `json:"provider_error,omitempty"`
 }
 
 // Error returns the stream error message or the HTTP status text.
@@ -142,6 +144,19 @@ func (e *ModelExecutionStreamError) Error() string {
 		return e.Message
 	}
 	return http.StatusText(e.StatusCode)
+}
+
+// ProviderErrorDetail preserves the reviewed provider diagnostic across the
+// internal streaming bridge without retaining raw upstream JSON.
+func (e *ModelExecutionStreamError) ProviderErrorDetail() (providererror.Detail, bool) {
+	if e == nil || e.ProviderError == nil {
+		return providererror.Detail{}, false
+	}
+	detail := providererror.Sanitize(*e.ProviderError)
+	if detail.Code == "" && detail.Type == "" && detail.Message == "" {
+		return providererror.Detail{}, false
+	}
+	return detail, true
 }
 
 // ExecuteModel executes an internal non-streaming model request.
@@ -507,7 +522,7 @@ func modelExecutionStreamErrorFromMessage(errMsg *interfaces.ErrorMessage) *Mode
 	if code == "" {
 		code = "model_execution_failed"
 	}
-	return &ModelExecutionStreamError{
+	streamErr := &ModelExecutionStreamError{
 		Code:       code,
 		StatusCode: statusCode,
 		Message:    message,
@@ -515,6 +530,10 @@ func modelExecutionStreamErrorFromMessage(errMsg *interfaces.ErrorMessage) *Mode
 		Headers:    headers,
 		RetryAfter: retryAfter,
 	}
+	if detail, ok := providererror.FromError(errMsg.Error); ok {
+		streamErr.ProviderError = &detail
+	}
+	return streamErr
 }
 
 func mergeModelExecutionErrorHeaders(base, extra http.Header) http.Header {

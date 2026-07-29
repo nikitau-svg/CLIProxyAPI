@@ -544,7 +544,8 @@ binding только ради быстрого теста.
 - `config.yaml` — bcrypt management secret, project key digests, routes, pools;
 - `secrets.env` — operator copy management и ordinary break-glass keys;
 - `auths/` — OAuth access/refresh tokens;
-- `bravo-data/bravo-state.json` — analytics, quotas и allocator ledger.
+- `bravo-data/bravo-state.json` — analytics, quotas, allocator ledger и
+  санитизированные активные model-scoped cooldowns.
 
 Включите encrypted EBS snapshots или AWS Backup. EBS snapshots являются
 point-in-time backup и после первого снимка сохраняют изменённые блоки
@@ -817,9 +818,24 @@ ssh -N \
 этой команды, иначе SSH не сможет занять `1455`, `54545` и `51121`.
 
 Откройте `http://127.0.0.1:18319/management.html`, введите management key из
-canary `secrets.env` и подключите отдельные canary-подписки. Проверьте оба
-протокола, streaming, fallback до первого payload, project model gate,
-аналитику и использованную подписку. Не продолжайте, если canary не зелёная.
+canary `secrets.env` и подключите отдельные canary-подписки. Проверьте OpenAI
+Chat, OpenAI Responses и Anthropic Messages, streaming, fallback только до
+первого видимого payload, project model gate, аналитику и использованную
+подписку.
+
+Для release, который меняет обработку ошибок или cooldown, canary обязана
+отдельно доказать:
+
+- структурированный `credits_required` для одной физической модели переводит
+  запрос на другую разрешённую подписку или сопоставленный provider, но не
+  блокирует sibling-модели того же аккаунта;
+- context-window overflow остаётся ошибкой только текущего запроса и сохраняет
+  упорядоченную причину предшествующего fallback;
+- модельный cooldown переживает перезапуск только canary-контейнера;
+- Management API, UI, state и логи не содержат raw provider JSON, request ID,
+  payment/CTA fields или credential material.
+
+Не продолжайте, если хотя бы одна canary-проверка не зелёная.
 
 ### 12.2. Короткое production-переключение
 
@@ -882,7 +898,10 @@ sudo docker compose up \
 Остановка перед копированием нужна, чтобы Bravo штатно сбросил ledger, а
 backup `config.yaml` и `bravo-data` описывали одно состояние. Сразу повторите
 проверки из шага 7, protocol smoke обоих контрактов и сравните количество
-проектов, подписок и маршрутов.
+проектов, подписок и маршрутов. Для release обработки ошибок также проверьте
+model-specific issue, упорядоченные попытки fallback и отсутствие raw provider
+полей в Management API, UI, state и логах. Не создавайте дополнительный
+production restart только ради проверки уже доказанной в canary persistence.
 
 ### 12.3. Воспроизводимый rollback
 
@@ -929,10 +948,17 @@ sudo docker compose up \
   cli-proxy-api
 ```
 
-Для будущего schema-changing release одного отката image недостаточно. С
-остановленным контейнером переместите новый `config.yaml` и `bravo-data` в
-отдельный failed-release каталог, восстановите оба объекта из одного
-pre-cutover backup, затем верните старый `.env` и запустите старый image.
+Bravo 0.7.9 добавляет в schema v2 опциональное поле активных cooldowns. Это
+additive-изменение не требует миграции: существующие schema-v2 snapshots
+продолжают загружаться, а старый runtime игнорирует неизвестное опциональное
+поле. Поэтому обычный image rollback не требует восстановления state, если нет
+отдельного доказательства его повреждения.
+
+Для будущего несовместимого schema-changing release одного отката image
+недостаточно. С остановленным контейнером переместите новый `config.yaml` и
+`bravo-data` в отдельный failed-release каталог, восстановите оба объекта из
+одного pre-cutover backup, затем верните старый `.env` и запустите старый
+image.
 Release без явно документированной стратегии миграции/rollback в production не
 выпускается.
 

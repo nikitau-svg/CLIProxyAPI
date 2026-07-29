@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -31,9 +32,10 @@ type modelExecutionCaptureExecutor struct {
 }
 
 type modelExecutionStatusHeaderError struct {
-	statusCode int
-	message    string
-	headers    http.Header
+	statusCode    int
+	message       string
+	headers       http.Header
+	providerError *providererror.Detail
 }
 
 type modelExecutionSkipHost struct {
@@ -101,6 +103,13 @@ func (e modelExecutionStatusHeaderError) StatusCode() int {
 
 func (e modelExecutionStatusHeaderError) Headers() http.Header {
 	return e.headers
+}
+
+func (e modelExecutionStatusHeaderError) ProviderErrorDetail() (providererror.Detail, bool) {
+	if e.providerError == nil {
+		return providererror.Detail{}, false
+	}
+	return providererror.Sanitize(*e.providerError), true
 }
 
 func (e *modelExecutionCaptureExecutor) Identifier() string {
@@ -506,14 +515,23 @@ func TestExecuteModelStreamTerminalError(t *testing.T) {
 		"X-Stream-Error": []string{"terminal"},
 		"Retry-After":    []string{"12"},
 	}
+	providerDetail := providererror.Detail{
+		Type:             "rate_limit_error",
+		Code:             "credits_required",
+		Model:            "claude-fable-5",
+		ModelDisplayName: "Fable 5",
+		Scope:            "model",
+		Reason:           "monthly_spend_limit",
+	}
 	executor := &modelExecutionCaptureExecutor{
 		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 			chunks := make(chan coreexecutor.StreamChunk, 2)
 			chunks <- coreexecutor.StreamChunk{Payload: []byte("stream-before-error")}
 			chunks <- coreexecutor.StreamChunk{Err: modelExecutionStatusHeaderError{
-				statusCode: http.StatusTooManyRequests,
-				message:    "rate limited",
-				headers:    errorHeaders,
+				statusCode:    http.StatusTooManyRequests,
+				message:       "rate limited",
+				headers:       errorHeaders,
+				providerError: &providerDetail,
 			}}
 			close(chunks)
 			return &coreexecutor.StreamResult{Chunks: chunks}, nil
@@ -568,8 +586,60 @@ func TestExecuteModelStreamTerminalError(t *testing.T) {
 	if chunk.Err.Code != "model_execution_failed" || !chunk.Err.Retryable || chunk.Err.RetryAfter != "12" {
 		t.Fatalf("terminal structured error = %#v", chunk.Err)
 	}
+	if chunk.Err.ProviderError == nil ||
+		chunk.Err.ProviderError.Code != "credits_required" ||
+		chunk.Err.ProviderError.Model != "claude-fable-5" {
+		t.Fatalf("terminal provider detail = %#v", chunk.Err.ProviderError)
+	}
 	if chunk, ok = <-stream.Chunks; ok {
 		t.Fatalf("unexpected extra stream chunk: %+v", chunk)
+	}
+}
+
+func TestExecuteModelStreamStartupProviderErrorPreservesSafeDetail(t *testing.T) {
+	model := "model-execution-stream-startup-provider-error-model"
+	requestBody := []byte(fmt.Sprintf(`{"model":%q,"stream":true}`, model))
+	providerDetail := providererror.Detail{
+		Type:             "rate_limit_error",
+		Code:             "credits_required",
+		Model:            "claude-fable-5",
+		ModelDisplayName: "Fable 5",
+		Scope:            "model",
+		Reason:           "monthly_spend_limit",
+	}
+	executor := &modelExecutionCaptureExecutor{
+		stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 1)
+			chunks <- coreexecutor.StreamChunk{Err: modelExecutionStatusHeaderError{
+				statusCode:    http.StatusTooManyRequests,
+				message:       "Fable 5: monthly spend limit reached",
+				providerError: &providerDetail,
+			}}
+			close(chunks)
+			return &coreexecutor.StreamResult{Chunks: chunks}, nil
+		},
+	}
+	handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{})
+
+	stream, errMsg := handler.ExecuteModelStream(context.Background(), ModelExecutionRequest{
+		EntryProtocol: "openai",
+		ExitProtocol:  "openai",
+		Model:         model,
+		Stream:        true,
+		Body:          requestBody,
+	})
+	if errMsg == nil || errMsg.Error == nil {
+		t.Fatal("ExecuteModelStream() startup error = nil")
+	}
+	if stream.Chunks != nil {
+		t.Fatal("startup provider error unexpectedly created a client stream")
+	}
+	detail, ok := providererror.FromError(errMsg.Error)
+	if !ok ||
+		detail.Code != "credits_required" ||
+		detail.Model != "claude-fable-5" ||
+		detail.ModelDisplayName != "Fable 5" {
+		t.Fatalf("startup provider detail = %#v, ok=%t", detail, ok)
 	}
 }
 
