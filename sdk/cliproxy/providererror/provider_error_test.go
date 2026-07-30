@@ -64,6 +64,170 @@ func TestParseAcceptsStatusCodePrefix(t *testing.T) {
 	}
 }
 
+func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		errorType     string
+		wantStatus    int
+		wantRetryable bool
+		wantScope     string
+		wantMessage   string
+	}{
+		{
+			name:          "invalid request",
+			errorType:     "invalid_request_error",
+			wantStatus:    400,
+			wantRetryable: false,
+			wantScope:     "request",
+			wantMessage:   "The provider rejected the request.",
+		},
+		{
+			name:          "authentication",
+			errorType:     "authentication_error",
+			wantStatus:    401,
+			wantRetryable: true,
+			wantScope:     "account",
+			wantMessage:   "The provider rejected the subscription credentials.",
+		},
+		{
+			name:          "billing",
+			errorType:     "billing_error",
+			wantStatus:    402,
+			wantRetryable: true,
+			wantScope:     "account",
+			wantMessage:   "The provider reported a billing restriction.",
+		},
+		{
+			name:          "permission",
+			errorType:     "permission_error",
+			wantStatus:    403,
+			wantRetryable: true,
+			wantScope:     "account",
+			wantMessage:   "The provider denied this subscription access.",
+		},
+		{
+			name:          "not found",
+			errorType:     "not_found_error",
+			wantStatus:    404,
+			wantRetryable: false,
+			wantScope:     "request",
+			wantMessage:   "The provider could not find the requested resource.",
+		},
+		{
+			name:          "conflict",
+			errorType:     "conflict_error",
+			wantStatus:    409,
+			wantRetryable: false,
+			wantScope:     "request",
+			wantMessage:   "The request conflicts with provider state.",
+		},
+		{
+			name:          "request too large",
+			errorType:     "request_too_large",
+			wantStatus:    413,
+			wantRetryable: false,
+			wantScope:     "request",
+			wantMessage:   "The request exceeds the provider size limit.",
+		},
+		{
+			name:          "rate limit",
+			errorType:     "rate_limit_error",
+			wantStatus:    429,
+			wantRetryable: true,
+			wantScope:     "model",
+			wantMessage:   "The provider rate limit was reached.",
+		},
+		{
+			name:          "api error",
+			errorType:     "api_error",
+			wantStatus:    500,
+			wantRetryable: true,
+			wantScope:     "model",
+			wantMessage:   "The provider encountered an internal error.",
+		},
+		{
+			name:          "timeout",
+			errorType:     "timeout_error",
+			wantStatus:    504,
+			wantRetryable: true,
+			wantScope:     "model",
+			wantMessage:   "The provider timed out while processing the request.",
+		},
+		{
+			name:          "overloaded",
+			errorType:     "overloaded_error",
+			wantStatus:    529,
+			wantRetryable: true,
+			wantScope:     "model",
+			wantMessage:   "The provider is temporarily overloaded.",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			payload := `{"type":"error","error":{"type":"` + test.errorType + `","message":"private diagnostic payment_method=pm_private","details":{"access_token":"private"}},"request_id":"req_private"}`
+			classification, ok := ParseAnthropicStandard(payload)
+			if !ok {
+				t.Fatal("ParseAnthropicStandard() did not recognize the documented error type")
+			}
+			if classification.Status != test.wantStatus ||
+				classification.Retryable != test.wantRetryable {
+				t.Fatalf("classification = %#v, want status=%d retryable=%t",
+					classification, test.wantStatus, test.wantRetryable)
+			}
+			wantDetail := Detail{
+				Type:    test.errorType,
+				Code:    test.errorType,
+				Message: test.wantMessage,
+				Scope:   test.wantScope,
+			}
+			if classification.Detail != wantDetail {
+				t.Fatalf("detail = %#v, want %#v", classification.Detail, wantDetail)
+			}
+
+			serialized, errMarshal := json.Marshal(classification)
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			for _, forbidden := range []string{
+				"req_private",
+				"request_id",
+				"private diagnostic",
+				"payment_method",
+				"pm_private",
+				"access_token",
+			} {
+				if strings.Contains(string(serialized), forbidden) {
+					t.Fatalf("classification leaks %q: %s", forbidden, serialized)
+				}
+			}
+		})
+	}
+}
+
+func TestParseAnthropicStandardRejectsUnknownOrUnsafeEnvelopes(t *testing.T) {
+	t.Parallel()
+
+	for _, payload := range []string{
+		``,
+		`{"type":"error"`,
+		`{"error":{"type":"api_error"}}`,
+		`{"type":"message","error":{"type":"api_error"}}`,
+		`{"type":"error","error":{"type":"future_provider_error"}}`,
+		`{"type":"error","error":{"type":"bravo_no_eligible_account"}}`,
+		strings.Repeat("x", maxProviderErrorPayloadBytes+1),
+	} {
+		if classification, ok := ParseAnthropicStandard(payload); ok {
+			t.Fatalf("ParseAnthropicStandard(%q) = %#v, true; want false", payload, classification)
+		}
+	}
+}
+
 func TestParseDoesNotInferUnknownScopeOrReason(t *testing.T) {
 	t.Parallel()
 

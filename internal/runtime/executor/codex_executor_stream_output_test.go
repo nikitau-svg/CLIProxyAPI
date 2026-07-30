@@ -14,6 +14,7 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
@@ -460,9 +461,11 @@ func TestCodexTerminalStreamErrIgnoresRateLimitTerminalErrors(t *testing.T) {
 
 func TestCodexTerminalFailureErrClassifiesStatus(t *testing.T) {
 	tests := []struct {
-		name       string
-		event      string
-		wantStatus int
+		name             string
+		event            string
+		wantStatus       int
+		wantProviderType string
+		wantProviderCode string
 	}{
 		{
 			name:       "invalid request",
@@ -480,6 +483,13 @@ func TestCodexTerminalFailureErrClassifiesStatus(t *testing.T) {
 			wantStatus: http.StatusTooManyRequests,
 		},
 		{
+			name:             "server error",
+			event:            `{"type":"response.failed","response":{"error":{"type":"server_error","code":"server_error","message":"private diagnostic request_id=req_private"}}}`,
+			wantStatus:       http.StatusBadGateway,
+			wantProviderType: "server_error",
+			wantProviderCode: "server_error",
+		},
+		{
 			name:       "unknown upstream failure",
 			event:      `{"type":"response.failed","response":{"error":{"type":"upstream_error","code":"unknown","message":"Upstream failed."}}}`,
 			wantStatus: http.StatusBadGateway,
@@ -494,6 +504,24 @@ func TestCodexTerminalFailureErrClassifiesStatus(t *testing.T) {
 			}
 			if got := streamErr.StatusCode(); got != tc.wantStatus {
 				t.Fatalf("status code = %d, want %d; err=%v", got, tc.wantStatus, streamErr)
+			}
+			if tc.wantProviderType == "" {
+				return
+			}
+			detail, okDetail := providererror.FromError(streamErr)
+			if !okDetail {
+				t.Fatalf("ProviderErrorDetail missing for %s: %v", tc.wantProviderType, streamErr)
+			}
+			if detail.Type != tc.wantProviderType ||
+				detail.Code != tc.wantProviderCode ||
+				detail.Scope != "model" {
+				t.Fatalf("ProviderErrorDetail = %#v, want type=%s code=%s model scope",
+					detail, tc.wantProviderType, tc.wantProviderCode)
+			}
+			for _, forbidden := range []string{"req_private", "request_id", "private diagnostic"} {
+				if strings.Contains(strings.ToLower(streamErr.Error()), forbidden) {
+					t.Fatalf("terminal error leaks %q: %v", forbidden, streamErr)
+				}
 			}
 		})
 	}

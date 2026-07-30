@@ -131,7 +131,7 @@ func TestBravoStreamUnknownStructuredErrorAfterPreludeFailsSafely(t *testing.T) 
 		},
 	})
 
-	const unknownError = `{"type":"error","error":{"type":"billing_error","message":"private diagnostic","details":{"payment_method":"pm_private"}},"request_id":"req_private"}`
+	const unknownError = `{"type":"error","error":{"type":"future_provider_error","message":"private diagnostic","details":{"payment_method":"pm_private"}},"request_id":"req_private"}`
 	auths := []pluginapi.HostAuthFileEntry{
 		{ID: "palantir", Name: "palantir.json", Provider: "claude", Note: "Palantir"},
 	}

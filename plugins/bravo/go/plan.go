@@ -612,7 +612,7 @@ func activeProviderModelCooldowns(provider, authID string, now time.Time) []cool
 // the physical model that failed.
 func accountWideCooldownStatus(status int) bool {
 	switch status {
-	case http.StatusUnauthorized, http.StatusForbidden:
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
 		return true
 	default:
 		return false

@@ -558,6 +558,17 @@ func claudeProviderStreamError(line []byte) error {
 		}
 	}
 
+	if classification, ok := providererror.ParseAnthropicStandard(string(payload)); ok {
+		detail := providererror.Sanitize(classification.Detail)
+		return &claudeStructuredStreamError{
+			status:        classification.Status,
+			code:          detail.Code,
+			message:       detail.Message,
+			retryable:     classification.Retryable,
+			providerError: &detail,
+		}
+	}
+
 	return &claudeStructuredStreamError{
 		status:    http.StatusBadGateway,
 		code:      "provider_stream_error",
@@ -1087,6 +1098,14 @@ func claudeHTTPStatusError(status int, body []byte) statusErr {
 		return statusErr{
 			code:          status,
 			msg:           message,
+			providerError: &detail,
+		}
+	}
+	if classification, ok := providererror.ParseAnthropicStandard(raw); ok && classification.Retryable {
+		detail := providererror.Sanitize(classification.Detail)
+		return statusErr{
+			code:          classification.Status,
+			msg:           detail.Message,
 			providerError: &detail,
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -710,14 +711,33 @@ func claudeStreamPayloadFailure(payload []byte) *executionFailure {
 		}, raw)
 		return &failure
 	}
-
 	var envelope struct {
-		Type  string          `json:"type"`
-		Error json.RawMessage `json:"error"`
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 	if errUnmarshal := json.Unmarshal([]byte(raw), &envelope); errUnmarshal != nil ||
 		!strings.EqualFold(strings.TrimSpace(envelope.Type), "error") {
 		return nil
+	}
+	if providerContextWindowSignal(envelope.Error.Type, envelope.Error.Message) {
+		failure := classifyProviderFailureSignal(executionFailure{
+			Code:    firstNonEmpty(envelope.Error.Type, "invalid_request_error"),
+			Message: "Input exceeds this model's context window.",
+			Status:  http.StatusBadRequest,
+		}, envelope.Error.Type, envelope.Error.Message)
+		return &failure
+	}
+	if classification, reviewed := providererror.ParseAnthropicStandard(raw); reviewed {
+		failure := classifyProviderFailureDetail(executionFailure{
+			Code:      classification.Detail.Code,
+			Message:   classification.Detail.Message,
+			Status:    classification.Status,
+			Retryable: classification.Retryable,
+		}, classification.Detail)
+		return &failure
 	}
 	return &executionFailure{
 		Code:    "bravo_provider_stream_error",
@@ -843,13 +863,13 @@ func streamChunkFailure(chunk pluginapi.HostModelStreamReadResponse) executionFa
 			Headers:    cloneHeader(detail.Headers),
 			RetryAfter: firstNonEmpty(detail.RetryAfter, detail.Headers.Get("Retry-After")),
 		}
+		if detail.ProviderError != nil {
+			return classifyProviderFailureDetail(failure, *detail.ProviderError)
+		}
 		if terminalProviderStreamErrorCode(detail.Code) {
 			failure.Code = "bravo_provider_stream_error"
 			failure.Message = "Provider returned an unrecognized structured error before completing the response."
 			failure.Retryable = false
-		}
-		if detail.ProviderError != nil {
-			return classifyProviderFailureDetail(failure, *detail.ProviderError)
 		}
 		return classifyProviderFailureSignal(failure, detail.Code, detail.Message, chunk.Error)
 	}

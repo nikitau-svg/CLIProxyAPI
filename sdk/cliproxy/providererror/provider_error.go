@@ -5,6 +5,7 @@ package providererror
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 )
 
@@ -34,6 +35,15 @@ type Detail struct {
 // forcing callers to retain or reparse the raw upstream response.
 type DetailProvider interface {
 	ProviderErrorDetail() (Detail, bool)
+}
+
+// Classification contains the reviewed routing semantics of a documented
+// provider error. Detail is safe to cross executor, plugin, analytics, and
+// persistence boundaries; it never retains the raw provider response.
+type Classification struct {
+	Detail    Detail `json:"detail"`
+	Status    int    `json:"status"`
+	Retryable bool   `json:"retryable"`
 }
 
 // FromError extracts and sanitizes a provider diagnostic carried by an error.
@@ -127,6 +137,77 @@ func Parse(value string) (Detail, bool) {
 		detail.Reason = "monthly_spend_limit"
 	}
 	return detail, true
+}
+
+// ParseAnthropicStandard recognizes the documented top-level Anthropic error
+// envelope without retaining provider-authored diagnostics. The special
+// credits_required contract remains handled by Parse so existing persisted
+// quota behavior is unchanged.
+func ParseAnthropicStandard(value string) (Classification, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) == 0 || len(value) > maxProviderErrorPayloadBytes {
+		return Classification{}, false
+	}
+
+	var envelope providerErrorEnvelope
+	if err := json.Unmarshal([]byte(value), &envelope); err != nil {
+		return Classification{}, false
+	}
+	if strings.TrimSpace(envelope.Type) != "error" {
+		return Classification{}, false
+	}
+
+	errorType := strings.TrimSpace(envelope.Error.Type)
+	status, retryable, scope, message, ok := anthropicStandardClassification(errorType)
+	if !ok {
+		return Classification{}, false
+	}
+	detail := Sanitize(Detail{
+		Type:    errorType,
+		Code:    errorType,
+		Message: message,
+		Scope:   scope,
+	})
+	return Classification{
+		Detail:    detail,
+		Status:    status,
+		Retryable: retryable,
+	}, true
+}
+
+func anthropicStandardClassification(errorType string) (
+	status int,
+	retryable bool,
+	scope string,
+	message string,
+	ok bool,
+) {
+	switch errorType {
+	case "invalid_request_error":
+		return http.StatusBadRequest, false, "request", "The provider rejected the request.", true
+	case "authentication_error":
+		return http.StatusUnauthorized, true, "account", "The provider rejected the subscription credentials.", true
+	case "billing_error":
+		return http.StatusPaymentRequired, true, "account", "The provider reported a billing restriction.", true
+	case "permission_error":
+		return http.StatusForbidden, true, "account", "The provider denied this subscription access.", true
+	case "not_found_error":
+		return http.StatusNotFound, false, "request", "The provider could not find the requested resource.", true
+	case "conflict_error":
+		return http.StatusConflict, false, "request", "The request conflicts with provider state.", true
+	case "request_too_large":
+		return http.StatusRequestEntityTooLarge, false, "request", "The request exceeds the provider size limit.", true
+	case "rate_limit_error":
+		return http.StatusTooManyRequests, true, "model", "The provider rate limit was reached.", true
+	case "api_error":
+		return http.StatusInternalServerError, true, "model", "The provider encountered an internal error.", true
+	case "timeout_error":
+		return http.StatusGatewayTimeout, true, "model", "The provider timed out while processing the request.", true
+	case "overloaded_error":
+		return 529, true, "model", "The provider is temporarily overloaded.", true
+	default:
+		return 0, false, "", "", false
+	}
 }
 
 // Sanitize bounds and redacts every provider-authored field in a Detail. It is

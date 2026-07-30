@@ -332,11 +332,6 @@ func classifyExecutionError(err error) executionFailure {
 			Headers:    cloneHeader(hostErr.Headers),
 			RetryAfter: firstNonEmpty(hostErr.RetryAfter, hostErr.Headers.Get("Retry-After")),
 		}
-		if terminalProviderStreamErrorCode(hostErr.Code) {
-			failure.Code = "bravo_provider_stream_error"
-			failure.Message = "Provider returned an unrecognized structured error before completing the response."
-			failure.Retryable = false
-		}
 		if failure.Code == "request_canceled" {
 			// Cancellation belongs to the client request, not to a provider or
 			// subscription. Never retry it and never park an otherwise healthy
@@ -359,6 +354,11 @@ func classifyExecutionError(err error) executionFailure {
 		if hostErr.ProviderError != nil {
 			return classifyProviderFailureDetail(failure, *hostErr.ProviderError)
 		}
+		if terminalProviderStreamErrorCode(hostErr.Code) {
+			failure.Code = "bravo_provider_stream_error"
+			failure.Message = "Provider returned an unrecognized structured error before completing the response."
+			failure.Retryable = false
+		}
 		return classifyProviderFailureSignal(failure, hostErr.Code, hostErr.Message)
 	}
 	return executionFailure{
@@ -380,8 +380,27 @@ func classifyProviderFailureDetail(failure executionFailure, detail providererro
 		failure.Provider = &detail
 		return sanitizeExecutionFailure(failure)
 	}
+
+	values := []string{
+		detail.Type,
+		detail.Code,
+		detail.Message,
+		detail.Model,
+		detail.ModelDisplayName,
+		detail.NoticeTitle,
+		detail.NoticeText,
+		detail.DisabledReason,
+		detail.Reason,
+	}
+	if providerContextWindowSignal(values...) {
+		return classifyProviderFailureSignal(failure, values...)
+	}
+	if classified, ok := classifyReviewedProviderFailureDetail(failure, detail); ok {
+		return sanitizeExecutionFailure(classified)
+	}
 	return classifyProviderFailureSignal(
 		failure,
+		detail.Type,
 		detail.Code,
 		detail.Message,
 		detail.Model,
@@ -391,6 +410,58 @@ func classifyProviderFailureDetail(failure executionFailure, detail providererro
 		detail.DisabledReason,
 		detail.Reason,
 	)
+}
+
+func classifyReviewedProviderFailureDetail(
+	failure executionFailure,
+	detail providererror.Detail,
+) (executionFailure, bool) {
+	errorType := strings.ToLower(strings.TrimSpace(detail.Type))
+	if errorType == "" {
+		errorType = strings.ToLower(strings.TrimSpace(detail.Code))
+	}
+
+	switch errorType {
+	case "authentication_error":
+		detail.Scope = "account"
+		failure.Status = firstPositive(failure.Status, http.StatusUnauthorized)
+		failure.Retryable = true
+		failure.AccountWide = true
+	case "billing_error":
+		detail.Scope = "account"
+		failure.Status = firstPositive(failure.Status, http.StatusPaymentRequired)
+		failure.Retryable = true
+		failure.AccountWide = true
+	case "permission_error":
+		detail.Scope = "account"
+		failure.Status = firstPositive(failure.Status, http.StatusForbidden)
+		failure.Retryable = true
+		failure.AccountWide = true
+	case "usage_limit_reached":
+		detail.Scope = "account"
+		failure.Status = firstPositive(failure.Status, http.StatusTooManyRequests)
+		failure.Retryable = true
+		failure.AccountWide = true
+	case "rate_limit_error", "api_error", "server_error", "upstream_error",
+		"timeout_error", "overloaded_error":
+		detail.Scope = "model"
+		failure.Retryable = true
+		failure.AccountWide = false
+	case "invalid_request_error", "bad_request_error", "not_found_error",
+		"conflict_error", "request_too_large":
+		detail.Scope = "request"
+		failure.Retryable = false
+		failure.RouteFallback = false
+		failure.AccountWide = false
+		failure.RetryAfter = ""
+	default:
+		return failure, false
+	}
+
+	failure.Code = firstNonEmpty(detail.Code, detail.Type, failure.Code)
+	failure.Message = firstNonEmpty(detail.Message, failure.Message)
+	failure.Provider = &detail
+	return failure, true
 }
 
 func localHostFailureCode(code string) bool {
@@ -774,6 +845,7 @@ func recordExecutionAttempt(attempt executionAttempt, started time.Time, status 
 		if strings.TrimSpace(detail.Model) == "" {
 			detail.Model = strings.TrimSpace(attempt.Candidate.Model)
 		}
+		record.ProviderErrorType = detail.Type
 		record.ProviderErrorCode = detail.Code
 		record.ProviderModel = detail.Model
 		record.ProviderModelDisplayName = detail.ModelDisplayName
