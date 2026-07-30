@@ -81,6 +81,91 @@ func TestStatusErrCreditsRequiredIsSafeStructuredProviderError(t *testing.T) {
 	}
 }
 
+func TestStatusErrCarriesSafeCodexServerError(t *testing.T) {
+	errStatus := newCodexStatusErr(
+		http.StatusBadGateway,
+		[]byte(`{"error":{"type":"server_error","code":"server_error","message":"private diagnostic request_id=req_private","param":null}}`),
+	)
+
+	if got := errStatus.ErrorCode(); got != "server_error" {
+		t.Fatalf("ErrorCode() = %q, want server_error", got)
+	}
+	detail, ok := providererror.FromError(errStatus)
+	if !ok {
+		t.Fatal("statusErr does not expose safe Codex server detail")
+	}
+	if detail.Type != "server_error" ||
+		detail.Code != "server_error" ||
+		detail.Scope != "model" ||
+		detail.Message != "The provider encountered an internal error." {
+		t.Fatalf("ProviderErrorDetail = %#v, want safe model-scoped server_error", detail)
+	}
+	for _, forbidden := range []string{
+		"private diagnostic",
+		"request_id",
+		"req_private",
+		`{"error"`,
+	} {
+		if strings.Contains(strings.ToLower(errStatus.Error()), forbidden) {
+			t.Fatalf("Error() leaks %q: %s", forbidden, errStatus.Error())
+		}
+	}
+}
+
+func TestClaudeHTTPStatusCarriesSafeRetryableStandardErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		errorType  string
+		httpStatus int
+		wantScope  string
+	}{
+		{
+			name:       "billing",
+			errorType:  "billing_error",
+			httpStatus: http.StatusPaymentRequired,
+			wantScope:  "account",
+		},
+		{
+			name:       "overloaded",
+			errorType:  "overloaded_error",
+			httpStatus: 529,
+			wantScope:  "model",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"type":"error","error":{"type":"` + test.errorType +
+				`","message":"private diagnostic payment_method=pm_private"},"request_id":"req_private"}`)
+			errStatus := claudeHTTPStatusError(test.httpStatus, body)
+			if errStatus.StatusCode() != test.httpStatus ||
+				errStatus.ErrorCode() != test.errorType {
+				t.Fatalf("status error = %#v, want status=%d code=%s",
+					errStatus, test.httpStatus, test.errorType)
+			}
+			detail, ok := providererror.FromError(errStatus)
+			if !ok ||
+				detail.Type != test.errorType ||
+				detail.Code != test.errorType ||
+				detail.Scope != test.wantScope {
+				t.Fatalf("ProviderErrorDetail = %#v, %t; want %s/%s",
+					detail, ok, test.errorType, test.wantScope)
+			}
+			for _, forbidden := range []string{
+				"private diagnostic",
+				"payment_method",
+				"pm_private",
+				"request_id",
+				"req_private",
+			} {
+				if strings.Contains(strings.ToLower(errStatus.Error()), forbidden) {
+					t.Fatalf("Error() leaks %q: %s", forbidden, errStatus.Error())
+				}
+			}
+		})
+	}
+}
+
 func TestClaudeHTTPStatusCreditsRequiredIsSafeAcrossEntryPoints(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

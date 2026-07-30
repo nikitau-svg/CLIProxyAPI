@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -1466,10 +1467,17 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsClaudeErrorEvent(t *testing
 	}
 	typed, ok := err.(claudeStreamTypedTerminalError)
 	if !ok ||
-		typed.StatusCode() != http.StatusBadGateway ||
-		typed.ErrorCode() != "provider_stream_error" ||
-		typed.Retryable() {
-		t.Fatalf("Execute error = %T %v, want terminal provider_stream_error/502", err, err)
+		typed.StatusCode() != http.StatusPaymentRequired ||
+		typed.ErrorCode() != "billing_error" ||
+		!typed.Retryable() {
+		t.Fatalf("Execute error = %T %v, want fallback-eligible billing_error/402", err, err)
+	}
+	detail, okDetail := providererror.FromError(err)
+	if !okDetail ||
+		detail.Type != "billing_error" ||
+		detail.Code != "billing_error" ||
+		detail.Scope != "account" {
+		t.Fatalf("ProviderErrorDetail = %#v, %t; want safe account-scoped billing_error", detail, okDetail)
 	}
 	for _, forbidden := range []string{
 		"private diagnostic",

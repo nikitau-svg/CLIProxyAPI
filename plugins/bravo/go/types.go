@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.7.9"
+	pluginVersion    = "0.7.10"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -201,6 +201,7 @@ type attemptRecord struct {
 	Retryable                bool      `json:"retryable,omitempty"`
 	ErrorCode                string    `json:"error_code,omitempty"`
 	Error                    string    `json:"error,omitempty"`
+	ProviderErrorType        string    `json:"provider_error_type,omitempty"`
 	ProviderErrorCode        string    `json:"provider_error_code,omitempty"`
 	ProviderModel            string    `json:"provider_model,omitempty"`
 	ProviderModelDisplayName string    `json:"provider_model_display_name,omitempty"`

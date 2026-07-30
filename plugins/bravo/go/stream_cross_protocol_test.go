@@ -126,6 +126,92 @@ func TestBravoStreamPostContentCreditsNeverSplicesAcrossClientProtocols(t *testi
 	}
 }
 
+func TestBravoStreamPreContentBillingErrorFallsBackAcrossClientProtocols(t *testing.T) {
+	billingDetail := providererror.Detail{
+		Type:    "billing_error",
+		Code:    "billing_error",
+		Message: "The provider reported a billing restriction.",
+		Scope:   "account",
+	}
+	for _, fixture := range crossProtocolStreamFixtures() {
+		t.Run(fixture.name, func(t *testing.T) {
+			observation := runCrossProtocolStreamScenario(
+				t,
+				fixture,
+				[]pluginapi.HostModelStreamReadResponse{
+					{Payload: fixture.failedPrelude},
+					{
+						ErrorDetail: &pluginapi.HostModelExecutionError{
+							Code:          "billing_error",
+							Message:       "The provider reported a billing restriction.",
+							HTTPStatus:    http.StatusPaymentRequired,
+							Retryable:     true,
+							ProviderError: &billingDetail,
+						},
+						Done: true,
+					},
+				},
+				fixture.fallbackChunks,
+			)
+
+			assertCrossProtocolProviderOrder(t, observation.calls, "claude", "codex")
+			if observation.pluginClose.Error != "" {
+				t.Fatalf("plugin stream close = %#v, want successful fallback", observation.pluginClose)
+			}
+			visible := joinCrossProtocolPayloads(observation.emitted)
+			if strings.Contains(visible, "failed-prelude") ||
+				!strings.Contains(visible, "fallback-visible") {
+				t.Fatalf("billing prelude leaked or fallback disappeared: %q", visible)
+			}
+			assertCrossProtocolSafeDiagnostics(t, observation)
+			assertCrossProtocolAccountCooldown(t, "billing_error")
+		})
+	}
+}
+
+func TestBravoStreamPreContentOverloadedErrorFallsBackAcrossClientProtocols(t *testing.T) {
+	overloadedDetail := providererror.Detail{
+		Type:    "overloaded_error",
+		Code:    "overloaded_error",
+		Message: "The provider is temporarily overloaded.",
+		Scope:   "model",
+	}
+	for _, fixture := range crossProtocolStreamFixtures() {
+		t.Run(fixture.name, func(t *testing.T) {
+			observation := runCrossProtocolStreamScenario(
+				t,
+				fixture,
+				[]pluginapi.HostModelStreamReadResponse{
+					{Payload: fixture.failedPrelude},
+					{
+						ErrorDetail: &pluginapi.HostModelExecutionError{
+							Code:          "overloaded_error",
+							Message:       "The provider is temporarily overloaded.",
+							HTTPStatus:    529,
+							Retryable:     true,
+							ProviderError: &overloadedDetail,
+						},
+						Done: true,
+					},
+				},
+				fixture.fallbackChunks,
+			)
+
+			assertCrossProtocolProviderOrder(t, observation.calls, "claude", "codex")
+			if observation.pluginClose.Error != "" {
+				t.Fatalf("plugin stream close = %#v, want successful fallback", observation.pluginClose)
+			}
+			visible := joinCrossProtocolPayloads(observation.emitted)
+			if strings.Contains(visible, "failed-prelude") ||
+				!strings.Contains(visible, "fallback-visible") {
+				t.Fatalf("overload prelude leaked or fallback disappeared: %q", visible)
+			}
+			assertCrossProtocolSafeDiagnostics(t, observation)
+			assertCrossProtocolModelCooldown(t, "overloaded_error")
+		})
+	}
+}
+
 func TestBravoStreamPreContentUnknownStructuredErrorFailsClosedAcrossClientProtocols(t *testing.T) {
 	for _, fixture := range crossProtocolStreamFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -652,6 +738,47 @@ func assertCrossProtocolCreditsCooldown(t *testing.T) {
 	}
 	if cooldownActive("codex", "codex-x20", "gpt-5.6-sol", now) {
 		t.Fatal("successful fallback received a cooldown")
+	}
+}
+
+func assertCrossProtocolAccountCooldown(t *testing.T, wantProviderCode string) {
+	t.Helper()
+	now := time.Now()
+	if !cooldownActive("claude", "palantir", "", now) {
+		t.Fatal("account-scoped provider failure did not create an account-wide cooldown")
+	}
+	runtimeState.RLock()
+	defer runtimeState.RUnlock()
+	entry, ok := runtimeState.Cooldowns[cooldownKey("claude", "palantir", "")]
+	if !ok {
+		t.Fatal("account-scoped cooldown entry is missing")
+	}
+	if entry.ProviderError.Type != wantProviderCode ||
+		entry.ProviderError.Code != wantProviderCode ||
+		entry.ProviderError.Scope != "account" {
+		t.Fatalf("account-scoped cooldown provider detail = %#v, want %s", entry.ProviderError, wantProviderCode)
+	}
+}
+
+func assertCrossProtocolModelCooldown(t *testing.T, wantProviderCode string) {
+	t.Helper()
+	now := time.Now()
+	if !cooldownActive("claude", "palantir", "claude-fable-5", now) {
+		t.Fatal("model-scoped provider failure did not create a model cooldown")
+	}
+	if cooldownActive("claude", "palantir", "", now) {
+		t.Fatal("model-scoped provider failure created an account-wide cooldown")
+	}
+	runtimeState.RLock()
+	defer runtimeState.RUnlock()
+	entry, ok := runtimeState.Cooldowns[cooldownKey("claude", "palantir", "claude-fable-5")]
+	if !ok {
+		t.Fatal("model-scoped cooldown entry is missing")
+	}
+	if entry.ProviderError.Type != wantProviderCode ||
+		entry.ProviderError.Code != wantProviderCode ||
+		entry.ProviderError.Scope != "model" {
+		t.Fatalf("model-scoped cooldown provider detail = %#v, want %s", entry.ProviderError, wantProviderCode)
 	}
 }
 

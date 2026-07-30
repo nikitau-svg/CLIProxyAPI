@@ -45,13 +45,10 @@ func finalExecutionFailure(
 	}
 	if len(traces) == 1 {
 		trace := traces[0]
-		if executionFailureBlocksPhysicalModel(trace.Failure) &&
-			strings.TrimSpace(trace.Model) != "" {
-			if summary := strings.TrimSpace(safeExecutionFailureSummary(trace)); summary != "" {
-				fallback.Message = strings.TrimSuffix(summary, ".") + "."
-			}
+		if summary := strings.TrimSpace(safeExecutionFailureSummary(trace)); summary != "" {
+			fallback.Message = strings.TrimSuffix(summary, ".") + "."
 		}
-		return fallback
+		return normalizeExhaustedRouteFailure(traces, fallback)
 	}
 	parts := make([]string, 0, len(traces))
 	seen := make(map[string]bool, len(traces))
@@ -67,10 +64,32 @@ func finalExecutionFailure(
 		}
 	}
 	if len(parts) < 2 {
-		return fallback
+		return normalizeExhaustedRouteFailure(traces, fallback)
 	}
 	fallback.Message = "Bravo exhausted the route: " + strings.Join(parts, "; ") + "."
-	return fallback
+	return normalizeExhaustedRouteFailure(traces, fallback)
+}
+
+func normalizeExhaustedRouteFailure(
+	traces []executionFailureTrace,
+	failure executionFailure,
+) executionFailure {
+	for _, trace := range traces {
+		if !executionFailureCanContinueRoute(trace.Failure) {
+			return failure
+		}
+	}
+
+	// Every provider attempt failed for a reviewed transient reason. Report the
+	// exhausted pool as temporarily unavailable so SDKs honor Retry-After
+	// instead of immediately replaying the entire route.
+	failure.Code = "bravo_route_temporarily_unavailable"
+	failure.Status = 503
+	failure.Retryable = true
+	failure.RouteFallback = false
+	failure.AccountWide = false
+	failure.Provider = nil
+	return failure
 }
 
 func safeExecutionFailureSummary(trace executionFailureTrace) string {

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -70,7 +71,7 @@ func TestBravoStreamCodexServerErrorAfterContentNeverSplicesButCoolsModel(t *tes
 			if strings.Contains(visible, "fallback-visible") {
 				t.Fatalf("Claude fallback was spliced into committed Codex output: %q", visible)
 			}
-			if !strings.Contains(observation.pluginClose.Error, "model_execution_failed") {
+			if !strings.Contains(observation.pluginClose.Error, "server_error") {
 				t.Fatalf("plugin stream close = %#v, want terminal provider failure", observation.pluginClose)
 			}
 			assertReverseProviderCooldown(t)
@@ -111,12 +112,19 @@ func TestBravoStreamCodexPreludeThenContextOverflowFailsClosed(t *testing.T) {
 }
 
 func reverseProviderServerErrorChunk() pluginapi.HostModelStreamReadResponse {
+	detail := providererror.Detail{
+		Type:    "server_error",
+		Code:    "server_error",
+		Message: "The provider encountered an internal error.",
+		Scope:   "model",
+	}
 	return pluginapi.HostModelStreamReadResponse{
 		ErrorDetail: &pluginapi.HostModelExecutionError{
-			Code:       "model_execution_failed",
-			Message:    "An error occurred while processing the provider request.",
-			HTTPStatus: http.StatusBadGateway,
-			Retryable:  true,
+			Code:          "server_error",
+			Message:       "The provider encountered an internal error.",
+			HTTPStatus:    http.StatusBadGateway,
+			Retryable:     true,
+			ProviderError: &detail,
 		},
 		Done: true,
 	}
@@ -340,6 +348,15 @@ func assertReverseProviderCooldown(t *testing.T) {
 	}
 	if cooldownActive("claude", "palantir", "claude-fable-5", now) {
 		t.Fatal("successful Claude fallback received a cooldown")
+	}
+	runtimeState.RLock()
+	defer runtimeState.RUnlock()
+	entry, ok := runtimeState.Cooldowns[cooldownKey("codex", "codex-x20", "gpt-5.6-sol")]
+	if !ok ||
+		entry.ProviderError.Type != "server_error" ||
+		entry.ProviderError.Code != "server_error" ||
+		entry.ProviderError.Scope != "model" {
+		t.Fatalf("Codex cooldown provider detail = %#v, %t; want safe server_error", entry.ProviderError, ok)
 	}
 }
 

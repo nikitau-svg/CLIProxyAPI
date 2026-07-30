@@ -75,6 +75,18 @@ func TestClaudeExecutorStreamProviderErrorsAreTerminalAcrossProtocols(t *testing
 		Scope:            "model",
 		Reason:           "monthly_spend_limit",
 	}
+	billingDetail := providererror.Detail{
+		Type:    "billing_error",
+		Code:    "billing_error",
+		Message: "The provider reported a billing restriction.",
+		Scope:   "account",
+	}
+	overloadedDetail := providererror.Detail{
+		Type:    "overloaded_error",
+		Code:    "overloaded_error",
+		Message: "The provider is temporarily overloaded.",
+		Scope:   "model",
+	}
 	signals := []struct {
 		name                    string
 		event                   string
@@ -130,21 +142,66 @@ func TestClaudeExecutorStreamProviderErrorsAreTerminalAcrossProtocols(t *testing
 			},
 		},
 		{
+			name:                    "billing_error",
+			event:                   `{"type":"error","error":{"type":"billing_error","message":"private diagnostic","details":{"payment_method":"pm_private"}},"request_id":"req_stream_billing_private"}`,
+			wantStatus:              http.StatusPaymentRequired,
+			wantRetryable:           true,
+			wantCode:                "billing_error",
+			wantErrorContains:       "billing restriction",
+			wantProviderErrorDetail: &billingDetail,
+			forbiddenPayload: []string{
+				"event: error",
+				"billing_error",
+				"private diagnostic",
+				"pm_private",
+				"req_stream_billing_private",
+			},
+			forbiddenError: []string{
+				`{"type"`,
+				"private diagnostic",
+				"pm_private",
+				"req_stream_billing_private",
+				"request_id",
+				"payment_method",
+			},
+		},
+		{
+			name:                    "overloaded_error",
+			event:                   `{"type":"error","error":{"type":"overloaded_error","message":"private diagnostic"},"request_id":"req_stream_overloaded_private"}`,
+			wantStatus:              529,
+			wantRetryable:           true,
+			wantCode:                "overloaded_error",
+			wantErrorContains:       "temporarily overloaded",
+			wantProviderErrorDetail: &overloadedDetail,
+			forbiddenPayload: []string{
+				"event: error",
+				"overloaded_error",
+				"private diagnostic",
+				"req_stream_overloaded_private",
+			},
+			forbiddenError: []string{
+				`{"type"`,
+				"private diagnostic",
+				"req_stream_overloaded_private",
+				"request_id",
+			},
+		},
+		{
 			name:             "unknown_structured_error",
-			event:            `{"type":"error","error":{"type":"billing_error","message":"private diagnostic","details":{"payment_method":"pm_private"}},"request_id":"req_stream_unknown_private"}`,
+			event:            `{"type":"error","error":{"type":"future_provider_error","message":"private diagnostic","details":{"payment_method":"pm_private"}},"request_id":"req_stream_unknown_private"}`,
 			wantStatus:       http.StatusBadGateway,
 			wantRetryable:    false,
 			wantGenericError: true,
 			forbiddenPayload: []string{
 				"event: error",
-				"billing_error",
+				"future_provider_error",
 				"private diagnostic",
 				"pm_private",
 				"req_stream_unknown_private",
 			},
 			forbiddenError: []string{
 				`{"type"`,
-				"billing_error",
+				"future_provider_error",
 				"private diagnostic",
 				"pm_private",
 				"req_stream_unknown_private",
@@ -263,6 +320,13 @@ func TestClaudeExecutorNonStreamProviderErrorsAreTypedAndSafeAcrossTranslatedPro
 	if !ok {
 		t.Fatal("credits fixture is not a reviewed provider error")
 	}
+	billingClassification, ok := providererror.ParseAnthropicStandard(
+		`{"type":"error","error":{"type":"billing_error","message":"private diagnostic"}}`,
+	)
+	if !ok {
+		t.Fatal("billing fixture is not a documented provider error")
+	}
+	billingDetail := billingClassification.Detail
 	signals := []struct {
 		name                    string
 		event                   string
@@ -305,13 +369,31 @@ func TestClaudeExecutorNonStreamProviderErrorsAreTypedAndSafeAcrossTranslatedPro
 			},
 		},
 		{
+			name:                    "billing_error",
+			event:                   `{"type":"error","error":{"type":"billing_error","message":"private diagnostic","details":{"payment_method":"pm_private"}},"request_id":"req_nonstream_billing_private"}`,
+			wantStatus:              http.StatusPaymentRequired,
+			wantRetryable:           true,
+			wantCode:                "billing_error",
+			wantErrorContains:       "billing restriction",
+			wantProviderErrorDetail: &billingDetail,
+			forbiddenError: []string{
+				`{"type"`,
+				"private diagnostic",
+				"payment_method",
+				"pm_private",
+				"req_nonstream_billing_private",
+				"request_id",
+			},
+		},
+		{
 			name:          "unknown_structured_error",
-			event:         `{"type":"error","error":{"type":"billing_error","message":"private diagnostic","details":{"payment_method":"pm_private"}},"request_id":"req_nonstream_unknown_private"}`,
+			event:         `{"type":"error","error":{"type":"future_provider_error","message":"private diagnostic","details":{"payment_method":"pm_private"}},"request_id":"req_nonstream_unknown_private"}`,
 			wantStatus:    http.StatusBadGateway,
 			wantRetryable: false,
 			wantCode:      "provider_stream_error",
 			forbiddenError: []string{
 				`{"type"`,
+				"future_provider_error",
 				"private diagnostic",
 				"payment_method",
 				"pm_private",

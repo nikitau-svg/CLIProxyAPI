@@ -83,3 +83,57 @@ func TestFailureEnvelopeOmitsRetryAfterForNonRetryableStatus(t *testing.T) {
 		t.Fatalf("retry_after = %q, want empty for a contract rejection", env.Error.RetryAfter)
 	}
 }
+
+func TestFinalExecutionFailureNormalizesTransientRouteExhaustion(t *testing.T) {
+	installBravoTestConfig(t, logicalModel{Candidates: []candidate{{
+		Provider:     "claude",
+		Model:        "claude-opus-5",
+		Capabilities: []string{capabilityText},
+	}}})
+
+	failure := finalExecutionFailure([]executionFailureTrace{
+		{
+			Provider: "claude",
+			Model:    "claude-opus-5",
+			Failure: executionFailure{
+				Code:      "billing_error",
+				Message:   "The provider reported a billing restriction.",
+				Status:    http.StatusPaymentRequired,
+				Retryable: true,
+			},
+		},
+		{
+			Provider: "codex",
+			Model:    "gpt-5.6-sol",
+			Failure: executionFailure{
+				Code:      "server_error",
+				Message:   "The provider encountered an internal error.",
+				Status:    http.StatusBadGateway,
+				Retryable: true,
+			},
+		},
+	}, executionFailure{
+		Code:      "server_error",
+		Message:   "The provider encountered an internal error.",
+		Status:    http.StatusBadGateway,
+		Retryable: true,
+	})
+
+	if failure.Status != http.StatusServiceUnavailable ||
+		failure.Code != "bravo_route_temporarily_unavailable" ||
+		!failure.Retryable ||
+		failure.Provider != nil {
+		t.Fatalf("final transient route failure = %#v, want safe retryable 503 aggregate", failure)
+	}
+	if failure.Message == "" {
+		t.Fatal("final transient route failure lost its safe route summary")
+	}
+
+	var env envelope
+	if errUnmarshal := json.Unmarshal(failureEnvelope(failure), &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if env.Error == nil || env.Error.RetryAfter == "" {
+		t.Fatalf("transient route envelope = %#v, want Retry-After", env)
+	}
+}

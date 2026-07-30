@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -1420,6 +1421,34 @@ func TestParseCodexWebsocketErrorPreservesWrappedBodyAndHeaders(t *testing.T) {
 	withHeaders, ok := err.(interface{ Headers() http.Header })
 	if !ok || withHeaders.Headers().Get("x-request-id") != "req-1" {
 		t.Fatalf("headers = %#v, want x-request-id", err)
+	}
+}
+
+func TestParseCodexWebsocketErrorCarriesSafeProviderDetail(t *testing.T) {
+	err, ok := parseCodexWebsocketError([]byte(`{"type":"error","status":502,"error":{"type":"server_error","code":"server_error","message":"private diagnostic request_id=req_private"}}`))
+	if !ok {
+		t.Fatalf("expected websocket error")
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("status = %#v, want 502", err)
+	}
+	coded, ok := err.(interface{ ErrorCode() string })
+	if !ok || coded.ErrorCode() != "server_error" {
+		t.Fatalf("error code = %#v, want server_error", err)
+	}
+	detail, ok := providererror.FromError(err)
+	if !ok {
+		t.Fatalf("expected safe provider detail: %#v", err)
+	}
+	if detail.Type != "server_error" || detail.Code != "server_error" || detail.Scope != "model" {
+		t.Fatalf("provider detail = %#v, want safe model-scoped server_error", detail)
+	}
+	if detail.Message != "The provider encountered an internal error." {
+		t.Fatalf("provider message = %q, want safe diagnostic", detail.Message)
+	}
+	if got := err.Error(); strings.Contains(got, "private") || strings.Contains(got, "req_private") || strings.Contains(got, `"error"`) {
+		t.Fatalf("unsafe provider diagnostic escaped: %q", got)
 	}
 }
 

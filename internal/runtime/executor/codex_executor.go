@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -166,12 +167,22 @@ func codexTerminalFailureStatus(body []byte) int {
 		return http.StatusBadRequest
 	case errorType == "authentication_error", errorCode == "invalid_api_key", errorCode == "unauthorized":
 		return http.StatusUnauthorized
+	case errorType == "billing_error":
+		return http.StatusPaymentRequired
 	case errorType == "permission_error", errorCode == "forbidden", errorCode == "permission_denied":
 		return http.StatusForbidden
 	case errorType == "not_found_error", errorCode == "not_found", errorCode == "model_not_found":
 		return http.StatusNotFound
+	case errorType == "conflict_error":
+		return http.StatusConflict
+	case errorType == "request_too_large":
+		return http.StatusRequestEntityTooLarge
 	case errorType == "rate_limit_error", errorCode == "rate_limit_exceeded":
 		return http.StatusTooManyRequests
+	case errorType == "timeout_error":
+		return http.StatusGatewayTimeout
+	case errorType == "overloaded_error":
+		return 529
 	default:
 		return http.StatusBadGateway
 	}
@@ -2362,10 +2373,59 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	}
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
+	if detail, ok := codexSafeProviderErrorDetail(body); ok {
+		err.providerError = &detail
+	}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func codexSafeProviderErrorDetail(body []byte) (providererror.Detail, bool) {
+	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
+	code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+
+	message := ""
+	switch errorType {
+	case "server_error", "api_error", "upstream_error":
+		message = "The provider encountered an internal error."
+	case "timeout_error":
+		message = "The provider timed out while processing the request."
+	case "overloaded_error":
+		message = "The provider is temporarily overloaded."
+	default:
+		return providererror.Detail{}, false
+	}
+
+	if code == "" {
+		code = errorType
+	} else if !safeCodexTransientProviderErrorCode(code) {
+		return providererror.Detail{}, false
+	}
+	detail := providererror.Sanitize(providererror.Detail{
+		Type:    errorType,
+		Code:    code,
+		Message: message,
+		Scope:   "model",
+	})
+	if detail.Type == "" || detail.Code == "" {
+		return providererror.Detail{}, false
+	}
+	return detail, true
+}
+
+func safeCodexTransientProviderErrorCode(code string) bool {
+	switch code {
+	case "server_error",
+		"api_error",
+		"upstream_error",
+		"timeout_error",
+		"overloaded_error":
+		return true
+	default:
+		return false
+	}
 }
 
 func newCodexStatusErrForClient(statusCode int, internalBody []byte, state codexIdentityConfuseState) statusErr {
