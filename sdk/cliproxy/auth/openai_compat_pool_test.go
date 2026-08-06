@@ -326,7 +326,7 @@ func TestManagerExecute_OpenAICompatAliasPoolForceMappingRotatesAndRewritesRespo
 
 func TestManagerExecute_OpenAICompatAliasPoolStopsOnBadRequest(t *testing.T) {
 	alias := "claude-opus-4.66"
-	invalidErr := &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: malformed payload"}
+	invalidErr := &Error{Code: "invalid_request_error", HTTPStatus: http.StatusBadRequest, Message: "malformed payload"}
 	executor := &openAICompatPoolExecutor{
 		id:            openAICompatPoolProviderKey,
 		executeErrors: map[string]error{"deepseek-v3.1": invalidErr},
@@ -349,8 +349,9 @@ func TestManagerExecute_OpenAICompatAliasPoolStopsOnBadRequest(t *testing.T) {
 func TestManagerExecute_OpenAICompatAliasPoolFallsBackOnModelSupportBadRequest(t *testing.T) {
 	alias := "claude-opus-4.66"
 	modelSupportErr := &Error{
+		Code:       "model_not_supported",
 		HTTPStatus: http.StatusBadRequest,
-		Message:    "invalid_request_error: The requested model is not supported.",
+		Message:    "The requested model is not supported.",
 	}
 	executor := &openAICompatPoolExecutor{
 		id:            openAICompatPoolProviderKey,
@@ -551,8 +552,9 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolStopsOnInvalidRequest(t *test
 func TestManagerExecute_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLaterRequests(t *testing.T) {
 	alias := "claude-opus-4.66"
 	modelSupportErr := &Error{
+		Code:       "model_not_supported",
 		HTTPStatus: http.StatusBadRequest,
-		Message:    "invalid_request_error: The requested model is not supported.",
+		Message:    "The requested model is not supported.",
 	}
 	executor := &openAICompatPoolExecutor{
 		id:            openAICompatPoolProviderKey,
@@ -655,8 +657,9 @@ func TestManagerExecuteCount_OpenAICompatAliasPoolRotatesWithinAuth(t *testing.T
 func TestManagerExecuteCount_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLaterRequests(t *testing.T) {
 	alias := "claude-opus-4.66"
 	modelSupportErr := &Error{
+		Code:       "model_not_supported",
 		HTTPStatus: http.StatusBadRequest,
-		Message:    "invalid_request_error: The requested model is unsupported.",
+		Message:    "The requested model is unsupported.",
 	}
 	executor := &openAICompatPoolExecutor{
 		id:          openAICompatPoolProviderKey,
@@ -743,8 +746,9 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 	})
 
 	modelSupportErr := &Error{
+		Code:       "model_not_supported",
 		HTTPStatus: http.StatusBadRequest,
-		Message:    "invalid_request_error: The requested model is not supported.",
+		Message:    "The requested model is not supported.",
 	}
 	for _, upstreamModel := range []string{"deepseek-v3.1", "glm-5"} {
 		m.MarkResult(context.Background(), Result{
@@ -775,7 +779,7 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 
 func TestManagerExecuteStream_OpenAICompatAliasPoolStopsOnInvalidBootstrap(t *testing.T) {
 	alias := "claude-opus-4.66"
-	invalidErr := &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: malformed payload"}
+	invalidErr := &Error{Code: "invalid_request_error", HTTPStatus: http.StatusBadRequest, Message: "malformed payload"}
 	executor := &openAICompatPoolExecutor{
 		id:                openAICompatPoolProviderKey,
 		streamFirstErrors: map[string]error{"deepseek-v3.1": invalidErr},

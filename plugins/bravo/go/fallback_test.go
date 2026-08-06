@@ -445,10 +445,9 @@ func installBravoTestConfig(t *testing.T, model logicalModel) {
 
 func installBravoHostCall(t *testing.T, callback hostCallFunc) {
 	t.Helper()
-	previous := hostCall
-	hostCall = callback
+	previous := swapHostCall(callback)
 	t.Cleanup(func() {
-		hostCall = previous
+		swapHostCall(previous)
 	})
 }
 

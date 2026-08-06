@@ -38,13 +38,12 @@ func TestExecuteStreamRejectsUnverifiedImageContractSynchronously(t *testing.T) 
 	})
 
 	hostCalls := 0
-	previousHostCall := hostCall
-	hostCall = func(method string, payload any) (json.RawMessage, error) {
+	previousHostCall := swapHostCall(func(method string, payload any) (json.RawMessage, error) {
 		hostCalls++
 		return nil, nil
-	}
+	})
 	t.Cleanup(func() {
-		hostCall = previousHostCall
+		swapHostCall(previousHostCall)
 	})
 
 	request, errMarshal := json.Marshal(rpcExecutorRequest{

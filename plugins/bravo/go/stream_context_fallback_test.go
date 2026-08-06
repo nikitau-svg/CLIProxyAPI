@@ -99,7 +99,7 @@ func TestBravoStreamPreservesCreditsThenContextFailureChain(t *testing.T) {
 	if len(emitted) != 0 {
 		t.Fatalf("provider error SSE was emitted to the client: %q", emitted)
 	}
-	for _, want := range []string{"Fable 5", "monthly spend", "gpt-5.6-sol", "context window"} {
+	for _, want := range []string{"Fable 5", "лимит расходов", "gpt-5.6-sol", "контекст переписки"} {
 		if !strings.Contains(pluginClose.Error, want) {
 			t.Errorf("stream terminal error = %q, missing %q", pluginClose.Error, want)
 		}
@@ -357,7 +357,7 @@ func TestBravoStreamContextOverflowDoesNotBlindlyFallback(t *testing.T) {
 		t.Fatalf("stream model = %#v, want Sol with unverified Terra left untouched", calls)
 	}
 	if pluginClose.StreamID != "context-fail-closed-client-stream" ||
-		!strings.Contains(pluginClose.Error, "context window") {
+		!strings.Contains(pluginClose.Error, "контекст переписки") {
 		t.Fatalf("plugin stream close = %#v, want a safe context-window terminal error", pluginClose)
 	}
 	for _, authID := range []string{"codex-one", "codex-two"} {

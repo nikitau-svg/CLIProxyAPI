@@ -70,8 +70,9 @@ class BravoCreditsContextSmoke
         )
         raise CreditsContextSmokeFailure, "context scenario unexpectedly succeeded" if status.between?(200, 299)
         assert_includes(body, "Fable 5")
-        assert_includes(body.downcase, "monthly spend")
-        assert_includes(body.downcase, "context window")
+        assert_includes(body, "лимит расходов")
+        assert_includes(body, "контекст")
+        assert_includes(body, "bravo_context_window_exceeded")
         assert_redacted(body)
 
         attempts = recent_attempts(started)
@@ -457,13 +458,18 @@ class BravoCreditsContextSmoke
     response = Net::HTTP.start(uri.host, uri.port, open_timeout: 5, read_timeout: 60) do |http|
       http.request(req)
     end
+    response_body = response.body.to_s.dup.force_encoding(Encoding::UTF_8)
+    unless response_body.valid_encoding?
+      raise CreditsContextSmokeFailure,
+            "HTTP response for #{method.to_s.upcase} #{uri.path} is not valid UTF-8"
+    end
     if expected && !Array(expected).map(&:to_i).include?(response.code.to_i)
-      detail = safe_response_summary(response.body)
+      detail = safe_response_summary(response_body)
       suffix = detail.empty? ? "" : ": #{detail}"
       raise CreditsContextSmokeFailure,
             "HTTP #{response.code} for #{method.to_s.upcase} #{uri.path}#{suffix}"
     end
-    [response.code.to_i, response.body.to_s, response["Content-Type"].to_s]
+    [response.code.to_i, response_body, response["Content-Type"].to_s]
   end
 
   def safe_response_summary(value)
@@ -744,7 +750,7 @@ class BravoCreditsContextSmoke
            relevant[0]["auth_id"] == codex.fetch("auth_id") &&
            relevant[0]["model"] == "gpt-5.6-terra" &&
            relevant[0]["success"] == false &&
-           relevant[0]["error_code"] == "model_execution_failed" &&
+           relevant[0]["error_code"] == "api_error" &&
            relevant[1]["auth_id"] == claude.fetch("auth_id") &&
            relevant[1]["model"] == "claude-sonnet-5" &&
            relevant[1]["success"] == true

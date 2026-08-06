@@ -190,6 +190,37 @@ func TestUnknownHostAuthQuotaResponseNeverIncludesWindows(t *testing.T) {
 	}
 }
 
+func TestQuota429PreservesRetryAfterMetadata(t *testing.T) {
+	now := time.Date(2026, 8, 7, 11, 0, 0, 0, time.UTC)
+	client := &quotaCallbackTestDoer{responses: map[string]pluginapi.HTTPResponse{
+		claudeQuotaUsageURL: {
+			StatusCode: http.StatusTooManyRequests,
+			Headers:    http.Header{"Retry-After": []string{"120"}},
+			Body:       []byte(`{"type":"error"}`),
+		},
+	}}
+	_, failure := fetchAuthQuotaEndpointAt(context.Background(), client, claudeQuotaUsageURL, nil, now)
+	if failure == nil || failure.code != "rate_limited" || failure.statusCode != http.StatusTooManyRequests ||
+		!failure.retryable || failure.retryAfter != "120" || !failure.retryAt.Equal(now.Add(2*time.Minute)) {
+		t.Fatalf("429 failure = %#v", failure)
+	}
+}
+
+func TestQuotaRetryAfterHTTPDateIsParsed(t *testing.T) {
+	now := time.Date(2026, 8, 7, 11, 0, 0, 0, time.UTC)
+	retryAt := now.Add(3 * time.Minute)
+	client := &quotaCallbackTestDoer{responses: map[string]pluginapi.HTTPResponse{
+		codexQuotaUsageURL: {
+			StatusCode: http.StatusTooManyRequests,
+			Headers:    http.Header{"Retry-After": []string{retryAt.Format(http.TimeFormat)}},
+		},
+	}}
+	_, failure := fetchAuthQuotaEndpointAt(context.Background(), client, codexQuotaUsageURL, nil, now)
+	if failure == nil || !failure.retryAt.Equal(retryAt) {
+		t.Fatalf("HTTP-date Retry-After failure = %#v, want %v", failure, retryAt)
+	}
+}
+
 func TestClaudeTeamWorkspaceOverridesPersonalProFlag(t *testing.T) {
 	hasPro := true
 	profile := claudeQuotaProfilePayload{

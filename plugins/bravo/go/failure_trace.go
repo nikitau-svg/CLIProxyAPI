@@ -11,6 +11,27 @@ type executionFailureTrace struct {
 	Failure  executionFailure
 }
 
+func initialExecutionFailureTraces(plan []executionAttempt) []executionFailureTrace {
+	if len(plan) == 0 || len(plan[0].PreflightRejections) == 0 {
+		return nil
+	}
+	traces := make([]executionFailureTrace, 0, len(plan[0].PreflightRejections))
+	for _, rejection := range plan[0].PreflightRejections {
+		traces = append(traces, executionFailureTrace{
+			Provider: normalizeProvider(rejection.Provider),
+			Model:    strings.TrimSpace(rejection.Model),
+			Failure: executionFailure{
+				Code:          rejection.Code,
+				Message:       rejection.Reason,
+				Status:        503,
+				Retryable:     true,
+				RouteFallback: true,
+			},
+		})
+	}
+	return traces
+}
+
 func appendExecutionFailureTrace(
 	traces []executionFailureTrace,
 	attempt executionAttempt,
@@ -50,6 +71,10 @@ func finalExecutionFailure(
 		}
 		return normalizeExhaustedRouteFailure(traces, fallback)
 	}
+	if summary := russianActionableRouteSummary(traces); summary != "" {
+		fallback.Message = summary
+		return normalizeExhaustedRouteFailure(traces, fallback)
+	}
 	parts := make([]string, 0, len(traces))
 	seen := make(map[string]bool, len(traces))
 	for _, trace := range traces {
@@ -66,7 +91,7 @@ func finalExecutionFailure(
 	if len(parts) < 2 {
 		return normalizeExhaustedRouteFailure(traces, fallback)
 	}
-	fallback.Message = "Bravo exhausted the route: " + strings.Join(parts, "; ") + "."
+	fallback.Message = "Bravo исчерпал доступный маршрут: " + strings.Join(parts, "; ") + "."
 	return normalizeExhaustedRouteFailure(traces, fallback)
 }
 
@@ -101,24 +126,85 @@ func safeExecutionFailureSummary(trace executionFailureTrace) string {
 		} else if strings.TrimSpace(detail.Model) != "" {
 			model = strings.TrimSpace(detail.Model)
 		}
-		if summary := strings.TrimSpace(detail.Summary()); summary != "" {
-			if model != "" && strings.Contains(strings.ToLower(summary), strings.ToLower(model)) {
-				return summary
-			}
-			return failureModelSummary(model, summary)
-		}
 	}
 	switch trace.Failure.Code {
+	case "bravo_allocator_reserve_floor":
+		return failureModelSummary(model, "Claude не вызван: подписка достигла внутреннего резервного порога CLIProxyAPI")
+	case "bravo_allocator_withheld":
+		return failureModelSummary(model, "внутренний распределитель CLIProxyAPI не выпустил подписку")
+	case "bravo_compact_bypass_cooldown":
+		return failureModelSummary(model, strings.TrimSuffix(strings.TrimSpace(trace.Failure.Message), "."))
 	case "bravo_context_window_exceeded":
-		return failureModelSummary(model, "input exceeds the context window")
+		if trace.Failure.Provider != nil && trace.Failure.Provider.RequiredTokens > 0 &&
+			trace.Failure.Provider.LimitTokens > 0 {
+			return failureModelSummary(model, fmt.Sprintf(
+				"контекст содержит %s токенов при лимите %s токенов",
+				formatContextTokenCount(trace.Failure.Provider.RequiredTokens),
+				formatContextTokenCount(trace.Failure.Provider.LimitTokens),
+			))
+		}
+		return failureModelSummary(model, "контекст переписки не помещается в окно модели")
 	case "bravo_subscription_model_credits_exhausted":
-		return failureModelSummary(model, "model credits are exhausted")
+		return failureModelSummary(model, "исчерпан отдельный лимит расходов этой модели у провайдера")
+	case "bravo_subscription_quota_exhausted", "rate_limit_error", "rate_limited":
+		return failureModelSummary(model, "подписка достигла лимита провайдера")
+	case "bravo_subscription_auth_unavailable", "authentication_error":
+		return failureModelSummary(model, "авторизация подписки недоступна")
+	case "bravo_subscription_access_denied", "permission_error":
+		return failureModelSummary(model, "подписка не имеет доступа к запросу")
+	case "bravo_subscription_model_unavailable":
+		return failureModelSummary(model, "модель недоступна на этой подписке")
+	case "overloaded_error":
+		return failureModelSummary(model, "провайдер временно перегружен")
+	case "server_error":
+		return failureModelSummary(model, "внутренняя ошибка провайдера")
 	}
 	code := strings.TrimSpace(trace.Failure.Code)
 	if code == "" {
 		return ""
 	}
 	return failureModelSummary(model, code)
+}
+
+func russianActionableRouteSummary(traces []executionFailureTrace) string {
+	var allocator *executionFailureTrace
+	var compactCooldown *executionFailureTrace
+	var contextFailure *executionFailureTrace
+	for index := range traces {
+		trace := &traces[index]
+		switch trace.Failure.Code {
+		case "bravo_allocator_reserve_floor":
+			if normalizeProvider(trace.Provider) == "claude" && allocator == nil {
+				allocator = trace
+			}
+		case "bravo_compact_bypass_cooldown":
+			if compactCooldown == nil {
+				compactCooldown = trace
+			}
+		case "bravo_context_window_exceeded":
+			contextFailure = trace
+		}
+	}
+	if contextFailure == nil {
+		return ""
+	}
+	fallbackModel := friendlyModelName(contextFailure.Model)
+	if allocator != nil {
+		claudeModel := friendlyModelName(allocator.Model)
+		return fmt.Sprintf(
+			"Подписки Claude для модели %s не исчерпаны у провайдера, но достигли внутренних резервных порогов CLIProxyAPI, поэтому запрос был перенаправлен в %s. Модель %s не может вместить весь контекст этой переписки. Поднимите внутренние лимиты Claude в Bravo, выполните /compact или начните новую сессию.",
+			claudeModel,
+			fallbackModel,
+			fallbackModel,
+		)
+	}
+	if compactCooldown != nil {
+		return fmt.Sprintf(
+			"Команда /compact не смогла повторно использовать резерв Claude: действует внутренний cooldown. Запрос был перенаправлен в %s, но модель не может вместить весь контекст переписки. Подождите время из Retry-After и повторите /compact либо начните новую сессию.",
+			fallbackModel,
+		)
+	}
+	return ""
 }
 
 func failureModelSummary(model, summary string) string {

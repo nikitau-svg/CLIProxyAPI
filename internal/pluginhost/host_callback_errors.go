@@ -160,6 +160,9 @@ func newHostModelCallbackError(errMsg *interfaces.ErrorMessage) error {
 	var providerDetail *providererror.Detail
 	if detail, ok := safeHostCallbackProviderError(cause); ok {
 		providerDetail = &detail
+		if providerCode := strings.TrimSpace(detail.Code); providerCode != "" {
+			code = providerCode
+		}
 	}
 	return &hostModelCallbackError{
 		cause:         cause,

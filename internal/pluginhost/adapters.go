@@ -473,7 +473,10 @@ func (h *Host) callModelRegistrar(ctx context.Context, record capabilityRecord, 
 			err = fmt.Errorf("model registrar panic: %v", recovered)
 		}
 	}()
-	return registrar.RegisterModels(ctx, pluginapi.ModelRegistrationRequest{Plugin: record.meta})
+	return registrar.RegisterModels(ctx, pluginapi.ModelRegistrationRequest{
+		Plugin:     record.meta,
+		HostModels: h.hostModelListSnapshot(record.id),
+	})
 }
 
 func (h *Host) callModelProviderStaticModels(ctx context.Context, record capabilityRecord, provider pluginapi.ModelProvider) (resp pluginapi.ModelResponse, err error) {

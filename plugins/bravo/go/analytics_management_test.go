@@ -50,8 +50,8 @@ func TestUsageStateV1MigrationPreservesTotalsQuotasAndBuildsDailyBuckets(t *test
 	if errLoad != nil {
 		t.Fatal(errLoad)
 	}
-	if state.SchemaVersion != 2 {
-		t.Fatalf("schema version = %d, want 2", state.SchemaVersion)
+	if state.SchemaVersion != 3 {
+		t.Fatalf("schema version = %d, want 3", state.SchemaVersion)
 	}
 	if state.AuthTotals["private-auth-index"].Total.TotalTokens != 18 ||
 		state.ProjectTotals["prj_alpha"].Total.TotalTokens != 11 ||

@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	usageStateSchemaVersion  = 2
+	usageStateSchemaVersion  = 3
 	usageSaveDebounce        = 250 * time.Millisecond
 	sessionUsageWindow       = 5 * time.Hour
 	weeklyUsageWindow        = 7 * 24 * time.Hour
@@ -37,6 +37,8 @@ type usageCounters struct {
 	TotalTokens         int64 `json:"total_tokens"`
 	Failures            int64 `json:"failures"`
 	LatencyMS           int64 `json:"latency_ms"`
+	TTFTMS              int64 `json:"ttft_ms,omitempty"`
+	TTFTSamples         int64 `json:"ttft_samples,omitempty"`
 }
 
 type usageAggregate struct {
@@ -73,19 +75,41 @@ type modelQuotaWindowState struct {
 	quotaWindowState
 }
 
+type quotaRefreshErrorState struct {
+	Code       string    `json:"code"`
+	Message    string    `json:"message,omitempty"`
+	StatusCode int       `json:"status_code,omitempty"`
+	Retryable  bool      `json:"retryable,omitempty"`
+	RetryAfter string    `json:"retry_after,omitempty"`
+	RetryAt    time.Time `json:"retry_at,omitempty"`
+}
+
+type quotaRefreshState struct {
+	LastAttemptAt      time.Time               `json:"last_attempt_at,omitempty"`
+	LastSuccessAt      time.Time               `json:"last_success_at,omitempty"`
+	LastFailureAt      time.Time               `json:"last_failure_at,omitempty"`
+	ConsecutiveFailure int                     `json:"consecutive_failures,omitempty"`
+	NextAttemptAt      time.Time               `json:"next_attempt_at,omitempty"`
+	Error              *quotaRefreshErrorState `json:"error,omitempty"`
+}
+
 type credentialQuotaState struct {
-	Status         string                  `json:"status,omitempty"` // retained for v0.4 state compatibility
-	Confidence     string                  `json:"confidence"`       // confirmed, error, unknown
-	Provider       string                  `json:"provider,omitempty"`
-	Plan           string                  `json:"plan,omitempty"`
-	AccountLabel   string                  `json:"account_label,omitempty"`
-	WorkspaceLabel string                  `json:"workspace_label,omitempty"`
-	Session        quotaWindowState        `json:"session"`
-	Weekly         quotaWindowState        `json:"weekly"`
-	ModelWeekly    []modelQuotaWindowState `json:"model_weekly,omitempty"`
-	RefreshedAt    time.Time               `json:"refreshed_at,omitempty"`
-	Error          string                  `json:"error,omitempty"`
-	Dirty          bool                    `json:"dirty,omitempty"`
+	Status             string                  `json:"status,omitempty"` // retained for v0.4 state compatibility
+	Confidence         string                  `json:"confidence"`       // confirmed, error, unknown
+	Provider           string                  `json:"provider,omitempty"`
+	Plan               string                  `json:"plan,omitempty"`
+	AccountLabel       string                  `json:"account_label,omitempty"`
+	WorkspaceLabel     string                  `json:"workspace_label,omitempty"`
+	Session            quotaWindowState        `json:"session"`
+	Weekly             quotaWindowState        `json:"weekly"`
+	ModelWeekly        []modelQuotaWindowState `json:"model_weekly,omitempty"`
+	RefreshedAt        time.Time               `json:"refreshed_at,omitempty"`
+	Error              string                  `json:"error,omitempty"`
+	ConfirmedAt        time.Time               `json:"confirmed_at,omitempty"`
+	ProfileRefreshedAt time.Time               `json:"profile_refreshed_at,omitempty"`
+	UsageRefresh       quotaRefreshState       `json:"usage_refresh,omitempty"`
+	ProfileRefresh     quotaRefreshState       `json:"profile_refresh,omitempty"`
+	Dirty              bool                    `json:"dirty,omitempty"`
 }
 
 // persistedCooldownEntry is the restart-safe subset of Bravo's routing
@@ -196,6 +220,8 @@ func loadUsageStateFile(path string) (persistedUsageState, error) {
 	switch state.SchemaVersion {
 	case 1:
 		migrateUsageStateV1(&state, time.Now().UTC())
+	case 2:
+		migrateUsageStateV2(&state)
 	case usageStateSchemaVersion:
 		normalizePersistedUsageState(&state)
 		prunePersistedUsageState(&state, time.Now().UTC())
@@ -203,6 +229,42 @@ func loadUsageStateFile(path string) (persistedUsageState, error) {
 		return newPersistedUsageState(), fmt.Errorf("unsupported state schema version %d", state.SchemaVersion)
 	}
 	return state, nil
+}
+
+func migrateUsageStateV2(state *persistedUsageState) {
+	if state == nil {
+		return
+	}
+	normalizePersistedUsageState(state)
+	for _, quota := range state.Quotas {
+		if quota == nil {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(firstNonEmpty(quota.Confidence, quota.Status))) {
+		case "confirmed":
+			quota.ConfirmedAt = quota.RefreshedAt.UTC()
+			quota.Confidence = "confirmed"
+			quota.Status = "confirmed"
+			quota.Error = ""
+		case "error":
+			// v2 copied old windows forward but overwrote RefreshedAt with the
+			// failure time. Keep those values for display, but do not let the
+			// unprovable timestamp authorize a secondary.
+			quota.Confidence = "unknown"
+			quota.Status = "unknown"
+			quota.ConfirmedAt = time.Time{}
+			if strings.TrimSpace(quota.Error) != "" {
+				quota.UsageRefresh.Error = &quotaRefreshErrorState{
+					Code: "legacy_refresh_failed", Message: strings.TrimSpace(quota.Error), Retryable: true,
+				}
+				quota.UsageRefresh.LastFailureAt = quota.RefreshedAt.UTC()
+			}
+		default:
+			quota.Confidence = "unknown"
+			quota.Status = "unknown"
+		}
+	}
+	state.SchemaVersion = usageStateSchemaVersion
 }
 
 func migrateUsageStateV1(state *persistedUsageState, migratedAt time.Time) {
@@ -226,6 +288,11 @@ func migrateUsageStateV1(state *persistedUsageState, migratedAt time.Time) {
 		}
 	}
 	state.SchemaVersion = usageStateSchemaVersion
+	for _, quota := range state.Quotas {
+		if quota != nil && quotaConfidence(*quota) == "confirmed" {
+			quota.ConfirmedAt = quota.RefreshedAt.UTC()
+		}
+	}
 	state.DimensionalStartedAt = migratedAt.UTC()
 	prunePersistedUsageState(state, migratedAt.UTC())
 }
@@ -631,6 +698,10 @@ func (store *usageStateStore) record(record pluginapi.UsageRecord) {
 		TotalTokens:         maxInt64(tokens, 0),
 		LatencyMS:           maxInt64(record.Latency.Milliseconds(), 0),
 	}
+	if record.TTFT > 0 {
+		counter.TTFTMS = record.TTFT.Milliseconds()
+		counter.TTFTSamples = 1
+	}
 	if record.Failed {
 		counter.Failures = 1
 	}
@@ -779,6 +850,8 @@ func mergeUsageCounters(left, right usageCounters) usageCounters {
 	left.TotalTokens += right.TotalTokens
 	left.Failures += right.Failures
 	left.LatencyMS += right.LatencyMS
+	left.TTFTMS += right.TTFTMS
+	left.TTFTSamples += right.TTFTSamples
 	return left
 }
 
@@ -802,6 +875,7 @@ type usageSummaryView struct {
 	Session          usageCounters `json:"session"`
 	Weekly           usageCounters `json:"weekly"`
 	AverageLatencyMS float64       `json:"average_latency_ms"`
+	AverageTTFTMS    float64       `json:"average_ttft_ms,omitempty"`
 }
 
 func usageSummary(aggregate *usageAggregate, now time.Time) usageSummaryView {
@@ -814,6 +888,9 @@ func usageSummary(aggregate *usageAggregate, now time.Time) usageSummaryView {
 	view.Weekly = rollingUsage(aggregate, now, weeklyUsageWindow)
 	if view.Total.Requests > 0 {
 		view.AverageLatencyMS = float64(view.Total.LatencyMS) / float64(view.Total.Requests)
+	}
+	if view.Total.TTFTSamples > 0 {
+		view.AverageTTFTMS = float64(view.Total.TTFTMS) / float64(view.Total.TTFTSamples)
 	}
 	return view
 }
@@ -845,7 +922,6 @@ func storeQuotaSnapshot(authIndex string, quota credentialQuotaState) {
 	if authIndex == "" {
 		return
 	}
-	quota.Dirty = false
 	bravoUsageState.mu.Lock()
 	bravoUsageState.state.Quotas[authIndex] = &quota
 	bravoUsageState.scheduleSaveLocked()

@@ -356,3 +356,22 @@ func TestErrorResponseAddonCarriesOnlyUpstreamHeaders(t *testing.T) {
 		t.Fatalf("addon = %v, want nil for a nil error", addon)
 	}
 }
+
+func TestDownstreamBravoPluginTraceHeaderSurvivesPassthroughOff(t *testing.T) {
+	headers := http.Header{
+		"X-Bravo-Trace-Id": {"trc_0123456789abcdef01234567"},
+		"X-Upstream":       {"must-not-pass"},
+	}
+	got := downstreamPluginHeadersFromExecutor("bravo", headers, false)
+	if traceID := got.Get("X-Bravo-Trace-Id"); traceID != "trc_0123456789abcdef01234567" {
+		t.Fatalf("trace id = %q", traceID)
+	}
+	if upstream := got.Get("X-Upstream"); upstream != "" {
+		t.Fatalf("upstream header escaped passthrough gate: %q", upstream)
+	}
+	if invalid := downstreamPluginHeadersFromExecutor("bravo", http.Header{
+		"X-Bravo-Trace-Id": {"provider-controlled-value"},
+	}, false); invalid != nil {
+		t.Fatalf("invalid trace header escaped: %#v", invalid)
+	}
+}

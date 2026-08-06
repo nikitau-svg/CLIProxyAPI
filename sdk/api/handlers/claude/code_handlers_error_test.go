@@ -8,6 +8,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	basehandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/tidwall/gjson"
 )
 
@@ -18,6 +20,38 @@ type codedClaudeHandlerError struct {
 
 func (e codedClaudeHandlerError) Error() string     { return e.message }
 func (e codedClaudeHandlerError) ErrorCode() string { return e.code }
+
+type typedClaudeContextError struct {
+	detail providererror.Detail
+}
+
+func (e typedClaudeContextError) Error() string     { return e.detail.Message }
+func (e typedClaudeContextError) ErrorCode() string { return e.detail.Code }
+func (e typedClaudeContextError) ProviderErrorDetail() (providererror.Detail, bool) {
+	return e.detail, true
+}
+
+func TestClaudeErrorUsesTypedPromptTooLongDiagnostic(t *testing.T) {
+	detail := providererror.Detail{
+		Type:            "invalid_request_error",
+		Code:            "context_window_exceeded",
+		Message:         "Input requires 1003466 tokens and exceeds the model context limit of 1000000 tokens.",
+		Scope:           providererror.ScopeRequest,
+		Reason:          "prompt_too_long",
+		TaxonomyVersion: providererror.FailureTaxonomyV1,
+		Class:           providererror.ClassContextWindow,
+		RequiredTokens:  1003466,
+		LimitTokens:     1000000,
+	}
+	handler := &ClaudeCodeAPIHandler{BaseAPIHandler: &basehandlers.BaseAPIHandler{}}
+	got := handler.toClaudeError(&interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      typedClaudeContextError{detail: detail},
+	})
+	if got.Error.Type != "invalid_request_error" || got.Error.Code != detail.Code || got.Error.Message != detail.Message {
+		t.Fatalf("Claude error = %#v", got)
+	}
+}
 
 func TestClaudeErrorPreservesExecutorErrorCode(t *testing.T) {
 	handler := &ClaudeCodeAPIHandler{}
@@ -169,5 +203,27 @@ func TestClaudeWriteErrorResponseEmitsRetryAfter(t *testing.T) {
 	}
 	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.code").String(); got != "bravo_no_eligible_account" {
 		t.Fatalf("error.code = %q, want %q", got, "bravo_no_eligible_account")
+	}
+}
+
+func TestClaudeWriteErrorResponseEmitsBravoTraceID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	handler := &ClaudeCodeAPIHandler{BaseAPIHandler: &basehandlers.BaseAPIHandler{}}
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error: bravoStreamFailure{
+			message: "route unavailable",
+			status:  http.StatusServiceUnavailable,
+			code:    "bravo_route_temporarily_unavailable",
+		},
+		Addon: http.Header{"X-Bravo-Trace-Id": {"trc_0123456789abcdef01234567"}},
+	})
+
+	if got := recorder.Header().Get("X-Bravo-Trace-Id"); got != "trc_0123456789abcdef01234567" {
+		t.Fatalf("trace id = %q", got)
 	}
 }

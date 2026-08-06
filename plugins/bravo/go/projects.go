@@ -894,6 +894,7 @@ func projectNotFoundJSON() ([]byte, error) {
 }
 
 func projectFailureJSON(failure projectFailure) ([]byte, error) {
+	failure = clientProjectFailureRU(failure)
 	return managementJSON(failure.Status, map[string]any{
 		"error": map[string]any{
 			"code":    failure.Code,

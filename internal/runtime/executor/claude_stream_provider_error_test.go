@@ -27,6 +27,62 @@ type claudeStreamProviderErrorDetailCarrier interface {
 	ProviderErrorDetail() (providererror.Detail, bool)
 }
 
+func TestClaudePromptTooLongParityAcrossHTTPAndSSE(t *testing.T) {
+	const payload = `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1003466 tokens > 1000000 maximum"},"request_id":"req_context_private"}`
+	want := providererror.Detail{
+		Type:            "invalid_request_error",
+		Code:            "context_window_exceeded",
+		Message:         "Input requires 1003466 tokens and exceeds the model context limit of 1000000 tokens.",
+		Scope:           providererror.ScopeRequest,
+		Reason:          "prompt_too_long",
+		TaxonomyVersion: providererror.FailureTaxonomyV1,
+		Class:           providererror.ClassContextWindow,
+		RequiredTokens:  1003466,
+		LimitTokens:     1000000,
+	}
+
+	httpErr := claudeHTTPStatusError(http.StatusBadRequest, []byte(payload))
+	sseErr := claudeProviderStreamError([]byte("data: " + payload))
+	if sseErr == nil {
+		t.Fatal("claudeProviderStreamError() = nil")
+	}
+
+	for name, err := range map[string]error{"http": httpErr, "sse": sseErr} {
+		detail, ok := providererror.FromError(err)
+		if !ok || !reflect.DeepEqual(detail, want) {
+			t.Errorf("%s ProviderErrorDetail = %#v, %t; want %#v, true", name, detail, ok, want)
+		}
+		coded, ok := err.(interface{ ErrorCode() string })
+		if !ok {
+			t.Errorf("%s error %T has no ErrorCode", name, err)
+		} else if got := coded.ErrorCode(); got != "context_window_exceeded" {
+			t.Errorf("%s ErrorCode = %q, want context_window_exceeded", name, got)
+		}
+		status, ok := err.(interface{ StatusCode() int })
+		if !ok {
+			t.Errorf("%s error %T has no StatusCode", name, err)
+		} else if got := status.StatusCode(); got != http.StatusBadRequest {
+			t.Errorf("%s StatusCode = %d, want %d", name, got, http.StatusBadRequest)
+		}
+		if got := err.Error(); got != want.Message {
+			t.Errorf("%s Error() = %q, want %q", name, got, want.Message)
+		}
+		for _, forbidden := range []string{"req_context_private", "request_id", "prompt is too long"} {
+			if strings.Contains(err.Error(), forbidden) {
+				t.Errorf("%s error leaks %q: %v", name, forbidden, err)
+			}
+		}
+	}
+
+	typedSSE, ok := sseErr.(claudeStreamTypedTerminalError)
+	if !ok {
+		t.Fatalf("SSE error %T does not expose retryability", sseErr)
+	}
+	if typedSSE.Retryable() {
+		t.Fatal("SSE Retryable() = true, want false")
+	}
+}
+
 func TestClaudeExecutorStreamProviderErrorsAreTerminalAcrossProtocols(t *testing.T) {
 	protocols := []struct {
 		name    string
@@ -74,18 +130,33 @@ func TestClaudeExecutorStreamProviderErrorsAreTerminalAcrossProtocols(t *testing
 		DisabledReason:   "org_level_disabled_until",
 		Scope:            "model",
 		Reason:           "monthly_spend_limit",
+		TaxonomyVersion:  providererror.FailureTaxonomyV1,
+		Class:            providererror.ClassQuota,
 	}
 	billingDetail := providererror.Detail{
-		Type:    "billing_error",
-		Code:    "billing_error",
-		Message: "The provider reported a billing restriction.",
-		Scope:   "account",
+		Type:            "billing_error",
+		Code:            "billing_error",
+		Message:         "The provider reported a billing restriction.",
+		Scope:           "account",
+		TaxonomyVersion: providererror.FailureTaxonomyV1,
+		Class:           providererror.ClassBilling,
 	}
 	overloadedDetail := providererror.Detail{
-		Type:    "overloaded_error",
-		Code:    "overloaded_error",
-		Message: "The provider is temporarily overloaded.",
-		Scope:   "model",
+		Type:            "overloaded_error",
+		Code:            "overloaded_error",
+		Message:         "The provider is temporarily overloaded.",
+		Scope:           "model",
+		TaxonomyVersion: providererror.FailureTaxonomyV1,
+		Class:           providererror.ClassOverloaded,
+	}
+	contextDetail := providererror.Detail{
+		Type:            "invalid_request_error",
+		Code:            "context_window_exceeded",
+		Message:         "Input exceeds the model context window.",
+		Scope:           providererror.ScopeRequest,
+		Reason:          "context_window_exceeded",
+		TaxonomyVersion: providererror.FailureTaxonomyV1,
+		Class:           providererror.ClassContextWindow,
 	}
 	signals := []struct {
 		name                    string
@@ -124,11 +195,13 @@ func TestClaudeExecutorStreamProviderErrorsAreTerminalAcrossProtocols(t *testing
 			},
 		},
 		{
-			name:              "context_invalid_request",
-			event:             `{"type":"error","error":{"type":"invalid_request_error","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"request_id":"req_stream_context_private"}`,
-			wantStatus:        http.StatusBadRequest,
-			wantRetryable:     false,
-			wantErrorContains: "context window",
+			name:                    "context_invalid_request",
+			event:                   `{"type":"error","error":{"type":"invalid_request_error","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"request_id":"req_stream_context_private"}`,
+			wantStatus:              http.StatusBadRequest,
+			wantRetryable:           false,
+			wantCode:                "context_window_exceeded",
+			wantErrorContains:       "context window",
+			wantProviderErrorDetail: &contextDetail,
 			forbiddenPayload: []string{
 				"event: error",
 				"invalid_request_error",
@@ -360,8 +433,17 @@ func TestClaudeExecutorNonStreamProviderErrorsAreTypedAndSafeAcrossTranslatedPro
 			event:             `{"type":"error","error":{"type":"invalid_request_error","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"request_id":"req_nonstream_context_private"}`,
 			wantStatus:        http.StatusBadRequest,
 			wantRetryable:     false,
-			wantCode:          "invalid_request_error",
+			wantCode:          "context_window_exceeded",
 			wantErrorContains: "context window",
+			wantProviderErrorDetail: &providererror.Detail{
+				Type:            "invalid_request_error",
+				Code:            "context_window_exceeded",
+				Message:         "Input exceeds the model context window.",
+				Scope:           providererror.ScopeRequest,
+				Reason:          "context_window_exceeded",
+				TaxonomyVersion: providererror.FailureTaxonomyV1,
+				Class:           providererror.ClassContextWindow,
+			},
 			forbiddenError: []string{
 				`{"type"`,
 				"req_nonstream_context_private",

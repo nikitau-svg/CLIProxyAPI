@@ -139,8 +139,8 @@ func TestFileRequestLogger_HomeEnabled_ForwardsWhenRequestLogEnabled(t *testing.
 	if got.Headers == nil || got.Headers["Content-Type"][0] != "application/json" {
 		t.Fatalf("headers.content-type = %+v, want application/json", got.Headers["Content-Type"])
 	}
-	if got.Headers == nil || got.Headers["Authorization"][0] != "Bearer secret" {
-		t.Fatalf("headers.authorization = %+v, want Bearer secret", got.Headers["Authorization"])
+	if got.Headers == nil || got.Headers["Authorization"][0] != "Bearer [REDACTED]" {
+		t.Fatalf("headers.authorization = %+v, want fully redacted Bearer value", got.Headers["Authorization"])
 	}
 	if got.RequestID != "req-1" {
 		t.Fatalf("request_id = %q, want req-1", got.RequestID)
@@ -314,7 +314,10 @@ func TestFileRequestLogger_HomeEnabled_ForwardsStreamingRequestID(t *testing.T) 
 	writer, errLog := logger.LogStreamingRequest(
 		"/v1/responses",
 		http.MethodPost,
-		map[string][]string{"Content-Type": {"application/json"}},
+		map[string][]string{
+			"Content-Type":  {"application/json"},
+			"Authorization": {"Bearer streaming-secret"},
+		},
 		[]byte(`{"input":"hello"}`),
 		"stream-req-1",
 	)
@@ -335,14 +338,18 @@ func TestFileRequestLogger_HomeEnabled_ForwardsStreamingRequestID(t *testing.T) 
 	}
 
 	var got struct {
-		RequestID  string `json:"request_id"`
-		RequestLog string `json:"request_log"`
+		Headers    map[string][]string `json:"headers"`
+		RequestID  string              `json:"request_id"`
+		RequestLog string              `json:"request_log"`
 	}
 	if errUnmarshal := json.Unmarshal(stub.pushed[0], &got); errUnmarshal != nil {
 		t.Fatalf("unmarshal payload: %v payload=%s", errUnmarshal, string(stub.pushed[0]))
 	}
 	if got.RequestID != "stream-req-1" {
 		t.Fatalf("request_id = %q, want stream-req-1", got.RequestID)
+	}
+	if got.Headers["Authorization"][0] != "Bearer [REDACTED]" {
+		t.Fatalf("headers.authorization = %+v, want fully redacted Bearer value", got.Headers["Authorization"])
 	}
 	if got.RequestLog == "" {
 		t.Fatalf("request_log empty, want non-empty")

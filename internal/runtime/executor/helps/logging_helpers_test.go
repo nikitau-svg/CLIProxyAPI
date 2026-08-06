@@ -12,7 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 )
 
-func TestRecordAPIRequestClonesDeferredBodyWhenRequestLogDisabled(t *testing.T) {
+func TestRecordAPIRequestOmitsDeferredBodyWhenRequestLogDisabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
@@ -24,8 +24,6 @@ func TestRecordAPIRequestClonesDeferredBodyWhenRequestLogDisabled(t *testing.T) 
 		Method: http.MethodPost,
 		Body:   body,
 	})
-	body[10] = 'X'
-
 	value, exists := ginCtx.Get(logging.DeferredAPIRequestContextKey)
 	if !exists {
 		t.Fatal("deferred API request was not captured")
@@ -35,8 +33,11 @@ func TestRecordAPIRequestClonesDeferredBodyWhenRequestLogDisabled(t *testing.T) 
 		t.Fatalf("deferred API requests = %#v, want one request", value)
 	}
 	captured := string(requests[0]())
-	if !strings.Contains(captured, `{"model":"original"}`) {
-		t.Fatalf("captured API request = %q, want original body", captured)
+	if strings.Contains(captured, `{"model":"original"}`) || strings.Contains(captured, "original") {
+		t.Fatalf("captured API request leaked the upstream body: %q", captured)
+	}
+	if !strings.Contains(captured, "OMITTED") || !strings.Contains(captured, "20-byte") {
+		t.Fatalf("captured API request = %q, want an explicit body omission marker", captured)
 	}
 }
 

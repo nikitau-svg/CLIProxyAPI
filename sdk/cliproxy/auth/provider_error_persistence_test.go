@@ -22,6 +22,130 @@ func (rawPalantirCoreError) ProviderErrorDetail() (providererror.Detail, bool) {
 	return providererror.Parse(corePalantirCreditsPayload)
 }
 
+type typedCoreProviderError struct {
+	detail providererror.Detail
+	status int
+}
+
+func (e typedCoreProviderError) Error() string     { return e.detail.Message }
+func (e typedCoreProviderError) ErrorCode() string { return e.detail.Code }
+func (e typedCoreProviderError) StatusCode() int   { return e.status }
+func (e typedCoreProviderError) Retryable() bool {
+	return e.detail.Scope == providererror.ScopeModel
+}
+func (e typedCoreProviderError) ProviderErrorDetail() (providererror.Detail, bool) {
+	return e.detail, true
+}
+
+func TestManagerFailureScopeControlsHealthMutation(t *testing.T) {
+	tests := []struct {
+		name                string
+		detail              *providererror.Detail
+		wantAuthUnavailable bool
+		wantModelState      bool
+		wantLastError       bool
+	}{
+		{
+			name: "request context overflow is health neutral",
+			detail: &providererror.Detail{
+				Type:            "invalid_request_error",
+				Code:            "context_window_exceeded",
+				Message:         "Input requires 1003466 tokens and exceeds the model context limit of 1000000 tokens.",
+				Scope:           providererror.ScopeRequest,
+				Reason:          "prompt_too_long",
+				TaxonomyVersion: providererror.FailureTaxonomyV1,
+				Class:           providererror.ClassContextWindow,
+				RequiredTokens:  1003466,
+				LimitTokens:     1000000,
+			},
+		},
+		{
+			name: "model failure changes only model state",
+			detail: &providererror.Detail{
+				Type:            "rate_limit_error",
+				Code:            "rate_limit_error",
+				Message:         "The provider rate limit was reached.",
+				Scope:           providererror.ScopeModel,
+				TaxonomyVersion: providererror.FailureTaxonomyV1,
+				Class:           providererror.ClassRateLimit,
+			},
+			wantModelState: true,
+			wantLastError:  true,
+		},
+		{
+			name: "account failure is not narrowed by result model",
+			detail: &providererror.Detail{
+				Type:            "authentication_error",
+				Code:            "authentication_error",
+				Message:         "The provider rejected the subscription credentials.",
+				Scope:           providererror.ScopeAccount,
+				TaxonomyVersion: providererror.FailureTaxonomyV1,
+				Class:           providererror.ClassAuthentication,
+			},
+			wantAuthUnavailable: true,
+			wantLastError:       true,
+		},
+		{
+			name: "unknown typed scope is terminal and health neutral",
+			detail: &providererror.Detail{
+				Type:    "future_provider_error",
+				Code:    "future_provider_error",
+				Message: "The provider returned an unclassified failure.",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			authID := "scope-test-" + strings.ReplaceAll(test.name, " ", "-")
+			model := "claude-opus-5"
+			auth := &Auth{
+				ID:       authID,
+				Provider: "claude",
+				Status:   StatusActive,
+				ModelStates: map[string]*ModelState{
+					"claude-sonnet-5": {Status: StatusActive},
+				},
+			}
+			if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+			status := http.StatusBadRequest
+			if test.detail.Scope == providererror.ScopeModel {
+				status = http.StatusTooManyRequests
+			}
+			if test.detail.Scope == providererror.ScopeAccount {
+				status = http.StatusUnauthorized
+			}
+			resultErr := resultErrorFromError(typedCoreProviderError{detail: *test.detail, status: status})
+
+			manager.MarkResult(WithSkipPersist(context.Background()), Result{
+				AuthID:   authID,
+				Provider: "claude",
+				Model:    model,
+				Success:  false,
+				Error:    resultErr,
+			})
+
+			updated, ok := manager.GetByID(authID)
+			if !ok || updated == nil {
+				t.Fatal("updated auth was not found")
+			}
+			if updated.Unavailable != test.wantAuthUnavailable {
+				t.Errorf("Auth.Unavailable = %t, want %t", updated.Unavailable, test.wantAuthUnavailable)
+			}
+			_, hasModelState := updated.ModelStates[model]
+			if hasModelState != test.wantModelState {
+				t.Errorf("model state present = %t, want %t: %#v", hasModelState, test.wantModelState, updated.ModelStates)
+			}
+			if (updated.LastError != nil) != test.wantLastError {
+				t.Errorf("LastError = %#v, want present=%t", updated.LastError, test.wantLastError)
+			}
+		})
+	}
+}
+
 func TestResultErrorFromErrorSanitizesPalantirProviderDetail(t *testing.T) {
 	resultErr := resultErrorFromError(rawPalantirCoreError{})
 	assertSafeCoreProviderError(t, "result error", resultErr)

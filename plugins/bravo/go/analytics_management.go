@@ -52,6 +52,9 @@ type analyticsMetrics struct {
 	Failures            int64   `json:"failures"`
 	LatencyMS           int64   `json:"latency_ms"`
 	AverageLatencyMS    float64 `json:"average_latency_ms"`
+	TTFTMS              int64   `json:"ttft_ms,omitempty"`
+	TTFTSamples         int64   `json:"ttft_samples,omitempty"`
+	AverageTTFTMS       float64 `json:"average_ttft_ms,omitempty"`
 	FailureRatePercent  float64 `json:"failure_rate_percent"`
 }
 
@@ -105,6 +108,8 @@ type analyticsRetentionView struct {
 type analyticsMetricSemantics struct {
 	LatencyMS        string `json:"latency_ms"`
 	AverageLatencyMS string `json:"average_latency_ms"`
+	TTFTMS           string `json:"ttft_ms"`
+	AverageTTFTMS    string `json:"average_ttft_ms"`
 }
 
 type analyticsResponse struct {
@@ -345,6 +350,8 @@ func collectAnalyticsWithPresentations(
 		MetricSemantics: analyticsMetricSemantics{
 			LatencyMS:        "sum of complete provider-attempt durations, including streamed response consumption",
 			AverageLatencyMS: "latency_ms divided by requests; this is full attempt duration, not time to first token",
+			TTFTMS:           "sum of host-measured time-to-first-token for streaming requests with a recorded first token",
+			AverageTTFTMS:    "ttft_ms divided by ttft_samples; non-streaming requests are excluded",
 		},
 		CoverageFrom:          coverage,
 		BreakdownCoverageFrom: breakdownCoverage,
@@ -554,10 +561,15 @@ func analyticsMetricsFromCounters(value usageCounters) analyticsMetrics {
 		TotalTokens:         value.TotalTokens,
 		Failures:            value.Failures,
 		LatencyMS:           value.LatencyMS,
+		TTFTMS:              value.TTFTMS,
+		TTFTSamples:         value.TTFTSamples,
 	}
 	if value.Requests > 0 {
 		metrics.AverageLatencyMS = float64(value.LatencyMS) / float64(value.Requests)
 		metrics.FailureRatePercent = float64(value.Failures) * 100 / float64(value.Requests)
+	}
+	if value.TTFTSamples > 0 {
+		metrics.AverageTTFTMS = float64(value.TTFTMS) / float64(value.TTFTSamples)
 	}
 	return metrics
 }

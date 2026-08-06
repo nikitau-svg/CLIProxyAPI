@@ -5,7 +5,10 @@ package providererror
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -14,21 +17,57 @@ const (
 	monthlySpendLimitNoticeTitle = "You've hit your monthly spend limit"
 	rateLimitErrorType           = "rate_limit_error"
 	maxProviderErrorPayloadBytes = 256 << 10
+	maxReviewedTokenCount        = int64(1_000_000_000_000)
 )
+
+const FailureTaxonomyV1 uint8 = 1
+
+type FailureClass = string
+type FailureScope = string
+
+const (
+	ClassInvalidRequest   FailureClass = "invalid_request"
+	ClassContextWindow    FailureClass = "context_window"
+	ClassPayloadTooLarge  FailureClass = "payload_too_large"
+	ClassAuthentication   FailureClass = "authentication"
+	ClassPermission       FailureClass = "permission"
+	ClassBilling          FailureClass = "billing"
+	ClassQuota            FailureClass = "quota"
+	ClassRateLimit        FailureClass = "rate_limit"
+	ClassNotFound         FailureClass = "not_found"
+	ClassConflict         FailureClass = "conflict"
+	ClassTimeout          FailureClass = "timeout"
+	ClassOverloaded       FailureClass = "overloaded"
+	ClassProviderInternal FailureClass = "provider_internal"
+	ClassTransport        FailureClass = "transport"
+	ClassCanceled         FailureClass = "canceled"
+)
+
+const (
+	ScopeRequest FailureScope = "request"
+	ScopeModel   FailureScope = "model"
+	ScopeAccount FailureScope = "account"
+)
+
+var anthropicPromptTooLongPattern = regexp.MustCompile(`(?i)^\s*prompt is too long:\s*([0-9]{1,12})\s+tokens?\s*>\s*([0-9]{1,12})\s+maximum\s*$`)
 
 // Detail contains the provider error fields that are safe to propagate across
 // executor and plugin boundaries.
 type Detail struct {
-	Type             string `json:"type,omitempty"`
-	Code             string `json:"code,omitempty"`
-	Message          string `json:"message,omitempty"`
-	Model            string `json:"model,omitempty"`
-	ModelDisplayName string `json:"model_display_name,omitempty"`
-	NoticeTitle      string `json:"notice_title,omitempty"`
-	NoticeText       string `json:"notice_text,omitempty"`
-	DisabledReason   string `json:"disabled_reason,omitempty"`
-	Scope            string `json:"scope,omitempty"`
-	Reason           string `json:"reason,omitempty"`
+	Type             string       `json:"type,omitempty"`
+	Code             string       `json:"code,omitempty"`
+	Message          string       `json:"message,omitempty"`
+	Model            string       `json:"model,omitempty"`
+	ModelDisplayName string       `json:"model_display_name,omitempty"`
+	NoticeTitle      string       `json:"notice_title,omitempty"`
+	NoticeText       string       `json:"notice_text,omitempty"`
+	DisabledReason   string       `json:"disabled_reason,omitempty"`
+	Scope            FailureScope `json:"scope,omitempty"`
+	Reason           string       `json:"reason,omitempty"`
+	TaxonomyVersion  uint8        `json:"taxonomy_version,omitempty"`
+	Class            FailureClass `json:"class,omitempty"`
+	RequiredTokens   int64        `json:"required_tokens,omitempty"`
+	LimitTokens      int64        `json:"limit_tokens,omitempty"`
 }
 
 // DetailProvider exposes an already-sanitized provider diagnostic without
@@ -65,7 +104,8 @@ func FromError(err error) (Detail, bool) {
 	if detail.Code == "" && detail.Type == "" && detail.Message == "" &&
 		detail.Model == "" && detail.ModelDisplayName == "" &&
 		detail.NoticeTitle == "" && detail.NoticeText == "" &&
-		detail.DisabledReason == "" && detail.Scope == "" && detail.Reason == "" {
+		detail.DisabledReason == "" && detail.Scope == "" && detail.Reason == "" &&
+		detail.Class == "" && detail.RequiredTokens == 0 && detail.LimitTokens == 0 {
 		return Detail{}, false
 	}
 	return detail, true
@@ -131,10 +171,14 @@ func Parse(value string) (Detail, bool) {
 		DisabledReason:   envelope.Error.Details.DisabledReason,
 	})
 	if detail.Model != "" {
-		detail.Scope = "model"
+		detail.Scope = ScopeModel
 	}
 	if detail.NoticeTitle == monthlySpendLimitNoticeTitle {
 		detail.Reason = "monthly_spend_limit"
+	}
+	if detail.Scope != "" {
+		detail.TaxonomyVersion = FailureTaxonomyV1
+		detail.Class = ClassQuota
 	}
 	return detail, true
 }
@@ -158,15 +202,22 @@ func ParseAnthropicStandard(value string) (Classification, bool) {
 	}
 
 	errorType := strings.TrimSpace(envelope.Error.Type)
-	status, retryable, scope, message, ok := anthropicStandardClassification(errorType)
+	if errorType == "invalid_request_error" {
+		if classification, ok := anthropicContextWindowClassification(envelope.Error.Message); ok {
+			return classification, true
+		}
+	}
+	status, retryable, scope, class, message, ok := anthropicStandardClassification(errorType)
 	if !ok {
 		return Classification{}, false
 	}
 	detail := Sanitize(Detail{
-		Type:    errorType,
-		Code:    errorType,
-		Message: message,
-		Scope:   scope,
+		Type:            errorType,
+		Code:            errorType,
+		Message:         message,
+		Scope:           scope,
+		TaxonomyVersion: FailureTaxonomyV1,
+		Class:           class,
 	})
 	return Classification{
 		Detail:    detail,
@@ -178,42 +229,98 @@ func ParseAnthropicStandard(value string) (Classification, bool) {
 func anthropicStandardClassification(errorType string) (
 	status int,
 	retryable bool,
-	scope string,
+	scope FailureScope,
+	class FailureClass,
 	message string,
 	ok bool,
 ) {
 	switch errorType {
 	case "invalid_request_error":
-		return http.StatusBadRequest, false, "request", "The provider rejected the request.", true
+		return http.StatusBadRequest, false, ScopeRequest, ClassInvalidRequest, "The provider rejected the request.", true
 	case "authentication_error":
-		return http.StatusUnauthorized, true, "account", "The provider rejected the subscription credentials.", true
+		return http.StatusUnauthorized, true, ScopeAccount, ClassAuthentication, "The provider rejected the subscription credentials.", true
 	case "billing_error":
-		return http.StatusPaymentRequired, true, "account", "The provider reported a billing restriction.", true
+		return http.StatusPaymentRequired, true, ScopeAccount, ClassBilling, "The provider reported a billing restriction.", true
 	case "permission_error":
-		return http.StatusForbidden, true, "account", "The provider denied this subscription access.", true
+		return http.StatusForbidden, true, ScopeAccount, ClassPermission, "The provider denied this subscription access.", true
 	case "not_found_error":
-		return http.StatusNotFound, false, "request", "The provider could not find the requested resource.", true
+		return http.StatusNotFound, false, ScopeRequest, ClassNotFound, "The provider could not find the requested resource.", true
 	case "conflict_error":
-		return http.StatusConflict, false, "request", "The request conflicts with provider state.", true
+		return http.StatusConflict, false, ScopeRequest, ClassConflict, "The request conflicts with provider state.", true
 	case "request_too_large":
-		return http.StatusRequestEntityTooLarge, false, "request", "The request exceeds the provider size limit.", true
+		return http.StatusRequestEntityTooLarge, false, ScopeRequest, ClassPayloadTooLarge, "The request exceeds the provider size limit.", true
 	case "rate_limit_error":
-		return http.StatusTooManyRequests, true, "model", "The provider rate limit was reached.", true
+		return http.StatusTooManyRequests, true, ScopeModel, ClassRateLimit, "The provider rate limit was reached.", true
 	case "api_error":
-		return http.StatusInternalServerError, true, "model", "The provider encountered an internal error.", true
+		return http.StatusInternalServerError, true, ScopeModel, ClassProviderInternal, "The provider encountered an internal error.", true
 	case "timeout_error":
-		return http.StatusGatewayTimeout, true, "model", "The provider timed out while processing the request.", true
+		return http.StatusGatewayTimeout, true, ScopeModel, ClassTimeout, "The provider timed out while processing the request.", true
 	case "overloaded_error":
-		return 529, true, "model", "The provider is temporarily overloaded.", true
+		return 529, true, ScopeModel, ClassOverloaded, "The provider is temporarily overloaded.", true
 	default:
-		return 0, false, "", "", false
+		return 0, false, "", "", "", false
 	}
+}
+
+func anthropicContextWindowClassification(message string) (Classification, bool) {
+	message = strings.TrimSpace(message)
+	matches := anthropicPromptTooLongPattern.FindStringSubmatch(message)
+	if len(matches) == 3 {
+		required, errRequired := strconv.ParseInt(matches[1], 10, 64)
+		limit, errLimit := strconv.ParseInt(matches[2], 10, 64)
+		if errRequired != nil || errLimit != nil || required <= limit || limit <= 0 ||
+			required > maxReviewedTokenCount || limit > maxReviewedTokenCount {
+			return Classification{}, false
+		}
+		return Classification{
+			Detail: Sanitize(Detail{
+				Type:            "invalid_request_error",
+				Code:            "context_window_exceeded",
+				Message:         fmt.Sprintf("Input requires %d tokens and exceeds the model context limit of %d tokens.", required, limit),
+				Scope:           ScopeRequest,
+				Reason:          "prompt_too_long",
+				TaxonomyVersion: FailureTaxonomyV1,
+				Class:           ClassContextWindow,
+				RequiredTokens:  required,
+				LimitTokens:     limit,
+			}),
+			Status:    http.StatusBadRequest,
+			Retryable: false,
+		}, true
+	}
+
+	lower := strings.ToLower(message)
+	for _, signal := range []string{
+		"context_length_exceeded",
+		"context_window_exceeded",
+		"context_too_large",
+		"input exceeds the context window",
+		"exceeds the context window of this model",
+		"maximum context length",
+	} {
+		if strings.Contains(lower, signal) {
+			return Classification{
+				Detail: Sanitize(Detail{
+					Type:            "invalid_request_error",
+					Code:            "context_window_exceeded",
+					Message:         "Input exceeds the model context window.",
+					Scope:           ScopeRequest,
+					Reason:          "context_window_exceeded",
+					TaxonomyVersion: FailureTaxonomyV1,
+					Class:           ClassContextWindow,
+				}),
+				Status:    http.StatusBadRequest,
+				Retryable: false,
+			}, true
+		}
+	}
+	return Classification{}, false
 }
 
 // Sanitize bounds and redacts every provider-authored field in a Detail. It is
 // safe to apply repeatedly at host and plugin boundaries.
 func Sanitize(detail Detail) Detail {
-	return Detail{
+	sanitized := Detail{
 		Type:             safeMachineText(detail.Type, 64),
 		Code:             safeMachineText(detail.Code, 128),
 		Message:          safeProviderText(detail.Message, 512),
@@ -224,6 +331,34 @@ func Sanitize(detail Detail) Detail {
 		DisabledReason:   safeMachineText(detail.DisabledReason, 128),
 		Scope:            safeMachineText(detail.Scope, 32),
 		Reason:           safeMachineText(detail.Reason, 128),
+	}
+	if detail.TaxonomyVersion == FailureTaxonomyV1 &&
+		knownFailureClass(detail.Class) && knownFailureScope(detail.Scope) {
+		sanitized.TaxonomyVersion = FailureTaxonomyV1
+		sanitized.Class = detail.Class
+		if detail.Class == ClassContextWindow && detail.RequiredTokens > detail.LimitTokens &&
+			detail.LimitTokens > 0 && detail.RequiredTokens <= maxReviewedTokenCount &&
+			detail.LimitTokens <= maxReviewedTokenCount {
+			sanitized.RequiredTokens = detail.RequiredTokens
+			sanitized.LimitTokens = detail.LimitTokens
+		}
+	}
+	return sanitized
+}
+
+func knownFailureScope(scope FailureScope) bool {
+	return scope == ScopeRequest || scope == ScopeModel || scope == ScopeAccount
+}
+
+func knownFailureClass(class FailureClass) bool {
+	switch class {
+	case ClassInvalidRequest, ClassContextWindow, ClassPayloadTooLarge,
+		ClassAuthentication, ClassPermission, ClassBilling, ClassQuota,
+		ClassRateLimit, ClassNotFound, ClassConflict, ClassTimeout,
+		ClassOverloaded, ClassProviderInternal, ClassTransport, ClassCanceled:
+		return true
+	default:
+		return false
 	}
 }
 

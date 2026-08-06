@@ -96,7 +96,9 @@ func TestStatusErrCarriesSafeCodexServerError(t *testing.T) {
 	}
 	if detail.Type != "server_error" ||
 		detail.Code != "server_error" ||
-		detail.Scope != "model" ||
+		detail.Scope != providererror.ScopeModel ||
+		detail.Class != providererror.ClassProviderInternal ||
+		detail.TaxonomyVersion != providererror.FailureTaxonomyV1 ||
 		detail.Message != "The provider encountered an internal error." {
 		t.Fatalf("ProviderErrorDetail = %#v, want safe model-scoped server_error", detail)
 	}

@@ -146,7 +146,19 @@ func secondaryQuotaEligible(
 	authIndex string,
 	reservation float64,
 ) bool {
-	if quotaConfidence(quota) != "confirmed" {
+	return secondaryQuotaEligibleAt(cfg, quota, model, tariff, authIndex, reservation, time.Now())
+}
+
+func secondaryQuotaEligibleAt(
+	cfg pluginConfig,
+	quota credentialQuotaState,
+	model string,
+	tariff tariffConfig,
+	authIndex string,
+	reservation float64,
+	now time.Time,
+) bool {
+	if quotaRoutingConfidenceAt(quota, model, cfg, now) != "confirmed" {
 		return cfg.UnknownSecondaryPolicy == "allow"
 	}
 	session, weekly := effectiveQuotaWindows(quota, model)
@@ -163,7 +175,7 @@ func allocatorStress(cfg pluginConfig, attempt executionAttempt) float64 {
 	tariff := tariffByID(cfg, attempt.TariffID)
 	session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
 	minHeadroom := 1.0
-	if quotaConfidence(quota) == "confirmed" {
+	if quotaRoutingConfidenceAt(quota, attempt.Candidate.Model, cfg, time.Now()) == "confirmed" {
 		sessionHeadroom := normalizedHeadroom(session.RemainingPercent, tariff.SessionFloorPercent)
 		weeklyHeadroom := normalizedHeadroom(weekly.RemainingPercent, tariff.WeeklyFloorPercent)
 		minHeadroom = math.Min(sessionHeadroom, weeklyHeadroom)
@@ -196,7 +208,7 @@ func acquireAttemptLease(attempt executionAttempt) (func(bool), bool) {
 	allocatorRuntime.Lock()
 	quota := quotaSnapshot(authIndex)
 	tariff := tariffByID(cfg, attempt.TariffID)
-	if quotaConfidence(quota) != "confirmed" {
+	if quotaRoutingConfidenceAt(quota, attempt.Candidate.Model, cfg, time.Now()) != "confirmed" {
 		// An unknown snapshot only blocks secondaries; a pinned primary is
 		// still trusted while quota discovery catches up.
 		if !attempt.Primary && cfg.UnknownSecondaryPolicy != "allow" {

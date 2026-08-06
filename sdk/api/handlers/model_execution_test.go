@@ -112,6 +112,37 @@ func (e modelExecutionStatusHeaderError) ProviderErrorDetail() (providererror.De
 	return providererror.Sanitize(*e.providerError), true
 }
 
+func TestModelExecutionStreamErrorPreservesContextTaxonomy(t *testing.T) {
+	want := providererror.Detail{
+		Type:            "invalid_request_error",
+		Code:            "context_window_exceeded",
+		Message:         "Input requires 1003466 tokens and exceeds the model context limit of 1000000 tokens.",
+		Scope:           providererror.ScopeRequest,
+		Reason:          "prompt_too_long",
+		TaxonomyVersion: providererror.FailureTaxonomyV1,
+		Class:           providererror.ClassContextWindow,
+		RequiredTokens:  1003466,
+		LimitTokens:     1000000,
+	}
+	got := modelExecutionStreamErrorFromMessage(&interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error: modelExecutionStatusHeaderError{
+			statusCode:    http.StatusBadRequest,
+			message:       want.Message,
+			providerError: &want,
+		},
+	})
+	if got == nil {
+		t.Fatal("modelExecutionStreamErrorFromMessage() = nil")
+	}
+	if got.Code != want.Code || got.StatusCode != http.StatusBadRequest || got.Retryable {
+		t.Fatalf("stream error = %#v", got)
+	}
+	if got.ProviderError == nil || *got.ProviderError != want {
+		t.Fatalf("ProviderError = %#v, want %#v", got.ProviderError, want)
+	}
+}
+
 func (e *modelExecutionCaptureExecutor) Identifier() string {
 	if e.provider != "" {
 		return e.provider
@@ -574,16 +605,16 @@ func TestExecuteModelStreamTerminalError(t *testing.T) {
 	if chunk.Err.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("terminal status = %d, want %d", chunk.Err.StatusCode, http.StatusTooManyRequests)
 	}
-	if chunk.Err.Message != "rate limited" {
-		t.Fatalf("terminal message = %q, want rate limited", chunk.Err.Message)
+	if chunk.Err.Message != "Fable 5: credits_required" {
+		t.Fatalf("terminal message = %q, want safe provider summary", chunk.Err.Message)
 	}
-	if chunk.Err.Error() != "rate limited" {
-		t.Fatalf("terminal Error() = %q, want rate limited", chunk.Err.Error())
+	if chunk.Err.Error() != "Fable 5: credits_required" {
+		t.Fatalf("terminal Error() = %q, want safe provider summary", chunk.Err.Error())
 	}
 	if chunk.Err.Headers.Get("X-Stream-Error") != "terminal" {
 		t.Fatalf("terminal headers = %#v, want stream error header", chunk.Err.Headers)
 	}
-	if chunk.Err.Code != "model_execution_failed" || !chunk.Err.Retryable || chunk.Err.RetryAfter != "12" {
+	if chunk.Err.Code != "credits_required" || !chunk.Err.Retryable || chunk.Err.RetryAfter != "12" {
 		t.Fatalf("terminal structured error = %#v", chunk.Err)
 	}
 	if chunk.Err.ProviderError == nil ||

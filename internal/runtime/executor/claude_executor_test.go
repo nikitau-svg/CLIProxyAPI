@@ -2394,8 +2394,11 @@ func TestClaudeExecutor_Execute_GzipErrorBodyNoContentEncodingHeader(t *testing.
 	if err == nil {
 		t.Fatal("expected an error for 400 response, got nil")
 	}
-	if !strings.Contains(err.Error(), "test error") {
-		t.Errorf("error message should contain decompressed JSON, got: %q", err.Error())
+	if detail, ok := providererror.FromError(err); !ok || detail.Type != "invalid_request_error" {
+		t.Errorf("decompressed body classification = %#v, %t; want invalid_request_error", detail, ok)
+	}
+	if strings.Contains(err.Error(), "test error") || strings.Contains(err.Error(), errJSON) {
+		t.Errorf("error leaked arbitrary provider text: %q", err.Error())
 	}
 }
 
@@ -2435,8 +2438,11 @@ func TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader(t *te
 	if err == nil {
 		t.Fatal("expected an error for 400 response, got nil")
 	}
-	if !strings.Contains(err.Error(), "stream test error") {
-		t.Errorf("error message should contain decompressed JSON, got: %q", err.Error())
+	if detail, ok := providererror.FromError(err); !ok || detail.Type != "invalid_request_error" {
+		t.Errorf("decompressed stream body classification = %#v, %t; want invalid_request_error", detail, ok)
+	}
+	if strings.Contains(err.Error(), "stream test error") || strings.Contains(err.Error(), errJSON) {
+		t.Errorf("stream error leaked arbitrary provider text: %q", err.Error())
 	}
 }
 

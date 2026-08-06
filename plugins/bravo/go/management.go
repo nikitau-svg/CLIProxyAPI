@@ -78,6 +78,7 @@ func registerManagement() ([]byte, error) {
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: "/bravo/status", Description: "Bravo runtime and model status."},
 			{Method: http.MethodGet, Path: "/bravo/events", Description: "Recent Bravo execution attempts."},
+			{Method: http.MethodGet, Path: "/bravo/traces", Description: "Read persistent, redacted Bravo route traces."},
 			{Method: http.MethodGet, Path: "/bravo/config", Description: "Redacted effective Bravo configuration."},
 			{Method: http.MethodGet, Path: "/bravo/projects", Description: "List redacted Bravo projects and logical model options."},
 			{Method: http.MethodPost, Path: "/bravo/projects", Description: "Create a Bravo project and return its key once."},
@@ -115,6 +116,9 @@ func handleManagement(raw []byte) ([]byte, error) {
 	}
 	if response, errAnalytics := handleAnalyticsManagement(rpcReq); response != nil || errAnalytics != nil {
 		return response, errAnalytics
+	}
+	if response, errTraces := handleRouteTraceManagement(rpcReq); response != nil || errTraces != nil {
+		return response, errTraces
 	}
 	if response, errCompatibility := handleCompatibilityManagement(rpcReq); response != nil || errCompatibility != nil {
 		return response, errCompatibility
@@ -527,7 +531,7 @@ func quotaExhaustedForModel(authIndex, model string) bool {
 		return false
 	}
 	quota := quotaSnapshot(authIndex)
-	if quotaConfidence(quota) != "confirmed" {
+	if quotaRoutingConfidenceAt(quota, model, loadedConfig(), time.Now()) != "confirmed" {
 		return false
 	}
 	session, weekly := effectiveQuotaWindows(quota, model)
@@ -554,19 +558,26 @@ func redactedBravoConfig(cfg pluginConfig) map[string]any {
 		})
 	}
 	return map[string]any{
-		"enabled":                      cfg.Enabled,
-		"prefix":                       cfg.Prefix,
-		"require_smart_key":            cfg.RequireSmartKey,
-		"max_attempts":                 cfg.MaxAttempts,
-		"cooldown_seconds":             cfg.CooldownSeconds,
-		"fallback_hedge_delay_seconds": cfg.FallbackHedgeDelaySeconds,
-		"allocator_mode":               cfg.AllocatorMode,
-		"quota_refresh_seconds":        cfg.QuotaRefreshSeconds,
-		"unknown_secondary_policy":     cfg.UnknownSecondaryPolicy,
-		"tariffs":                      append([]tariffConfig(nil), cfg.Tariffs...),
-		"subscriptions":                append([]subscriptionConfig(nil), cfg.Subscriptions...),
-		"smart_keys":                   keys,
-		"models":                       models,
+		"enabled":                                cfg.Enabled,
+		"prefix":                                 cfg.Prefix,
+		"require_smart_key":                      cfg.RequireSmartKey,
+		"max_attempts":                           cfg.MaxAttempts,
+		"cooldown_seconds":                       cfg.CooldownSeconds,
+		"compact_bypass_cooldown_seconds":        cfg.CompactBypassCooldownSeconds,
+		"fallback_hedge_delay_seconds":           cfg.FallbackHedgeDelaySeconds,
+		"allocator_mode":                         cfg.AllocatorMode,
+		"quota_refresh_seconds":                  cfg.QuotaRefreshSeconds,
+		"quota_usage_refresh_seconds":            cfg.QuotaUsageRefreshSeconds,
+		"quota_usage_max_stale_seconds":          cfg.QuotaUsageMaxStaleSeconds,
+		"quota_profile_refresh_seconds":          cfg.QuotaProfileRefreshSeconds,
+		"quota_refresh_jitter_percent":           cfg.QuotaRefreshJitterPercent,
+		"quota_refresh_provider_min_interval_ms": cfg.QuotaRefreshProviderMinIntervalMS,
+		"quota_refresh_provider_concurrency":     cfg.QuotaRefreshProviderConcurrency,
+		"unknown_secondary_policy":               cfg.UnknownSecondaryPolicy,
+		"tariffs":                                append([]tariffConfig(nil), cfg.Tariffs...),
+		"subscriptions":                          append([]subscriptionConfig(nil), cfg.Subscriptions...),
+		"smart_keys":                             keys,
+		"models":                                 models,
 	}
 }
 

@@ -31,8 +31,10 @@ type subscriptionWindowView struct {
 
 type subscriptionQuotaView struct {
 	Confidence  string                   `json:"confidence"`
+	Freshness   string                   `json:"freshness"`
 	ObservedAt  time.Time                `json:"observed_at,omitempty"`
 	Error       string                   `json:"error,omitempty"`
+	Refresh     quotaRefreshState        `json:"refresh"`
 	Session     subscriptionWindowView   `json:"session"`
 	Weekly      subscriptionWindowView   `json:"weekly"`
 	ModelWeekly []subscriptionWindowView `json:"model_weekly,omitempty"`
@@ -56,6 +58,7 @@ type subscriptionView struct {
 	ModelIssues       []subscriptionModelIssueView `json:"model_issues,omitempty"`
 	PrimaryProjectIDs []string                     `json:"primary_project_ids"`
 	Quota             subscriptionQuotaView        `json:"quota"`
+	ProfileRefresh    quotaRefreshState            `json:"profile_refresh"`
 	Usage             usageSummaryView             `json:"usage"`
 }
 
@@ -163,14 +166,18 @@ func buildSubscriptionView(
 	primaryProjects []string,
 ) subscriptionView {
 	confidence := quotaConfidence(quota)
+	now := time.Now()
+	freshness := quotaFreshnessAt(quota, "", cfg, now)
+	routingConfidence := quotaRoutingConfidenceAt(quota, "", cfg, now)
 	session, weekly := effectiveQuotaWindows(quota, "")
 	enabled := subscriptionEnabled(subscription)
-	sessionEligible, sessionReason := quotaWindowEligibility(cfg, confidence, enabled, session.RemainingPercent, tariff.SessionFloorPercent)
-	weeklyEligible, weeklyReason := quotaWindowEligibility(cfg, confidence, enabled, weekly.RemainingPercent, tariff.WeeklyFloorPercent)
+	sessionEligible, sessionReason := quotaWindowEligibility(cfg, routingConfidence, enabled, session.RemainingPercent, tariff.SessionFloorPercent)
+	weeklyEligible, weeklyReason := quotaWindowEligibility(cfg, routingConfidence, enabled, weekly.RemainingPercent, tariff.WeeklyFloorPercent)
 	modelWeekly := make([]subscriptionWindowView, 0, len(quota.ModelWeekly))
 	for _, modelWindow := range quota.ModelWeekly {
 		window := normalizeQuotaWindow(modelWindow.quotaWindowState)
-		eligible, reason := quotaWindowEligibility(cfg, confidence, enabled, window.RemainingPercent, tariff.WeeklyFloorPercent)
+		modelConfidence := quotaRoutingConfidenceAt(quota, modelWindow.Model, cfg, now)
+		eligible, reason := quotaWindowEligibility(cfg, modelConfidence, enabled, window.RemainingPercent, tariff.WeeklyFloorPercent)
 		modelWeekly = append(modelWeekly, quotaWindowView(
 			confidence,
 			modelWindow.Model,
@@ -185,6 +192,12 @@ func buildSubscriptionView(
 	}
 	presentation := subscriptionPresentationFor(auth, quota)
 	modelIssues := subscriptionModelIssues(auth)
+	usageRefresh := quotaRefreshStateForView(quota.UsageRefresh)
+	profileRefresh := quotaRefreshStateForView(quota.ProfileRefresh)
+	refreshError := ""
+	if usageRefresh.Error != nil {
+		refreshError = usageRefresh.Error.Message
+	}
 	return subscriptionView{
 		AuthIndex:   strings.TrimSpace(auth.AuthIndex),
 		AnalyticsID: analyticsSubscriptionID(auth.AuthIndex),
@@ -210,14 +223,44 @@ func buildSubscriptionView(
 		PrimaryProjectIDs: append([]string(nil), primaryProjects...),
 		Quota: subscriptionQuotaView{
 			Confidence:  confidence,
-			ObservedAt:  quota.RefreshedAt,
-			Error:       quota.Error,
+			Freshness:   freshness,
+			ObservedAt:  quotaConfirmedAt(quota),
+			Error:       refreshError,
+			Refresh:     usageRefresh,
 			Session:     quotaWindowView(confidence, "", session, sessionEligible, sessionReason),
 			Weekly:      quotaWindowView(confidence, "", weekly, weeklyEligible, weeklyReason),
 			ModelWeekly: modelWeekly,
 		},
-		Usage: authUsageSummary(auth.AuthIndex, time.Now()),
+		ProfileRefresh: profileRefresh,
+		Usage:          authUsageSummary(auth.AuthIndex, time.Now()),
 	}
+}
+
+func quotaRefreshStateForView(state quotaRefreshState) quotaRefreshState {
+	if state.Error == nil {
+		return state
+	}
+	errorCopy := *state.Error
+	switch strings.ToLower(strings.TrimSpace(errorCopy.Code)) {
+	case "rate_limited":
+		errorCopy.Message = "Провайдер временно ограничил частоту обновления квоты. Последняя подтверждённая квота сохранена."
+	case "timeout":
+		errorCopy.Message = "Обновление квоты не успело завершиться. Последняя подтверждённая квота сохранена."
+	case "transport_unavailable":
+		errorCopy.Message = "Сервис не смог подключиться к странице квоты провайдера. Последняя подтверждённая квота сохранена."
+	case "provider_unavailable":
+		errorCopy.Message = "Страница квоты провайдера временно недоступна. Последняя подтверждённая квота сохранена."
+	case "auth_stale":
+		errorCopy.Message = "Провайдер отклонил авторизацию при обновлении квоты. Проверьте подключение аккаунта."
+	case "forbidden":
+		errorCopy.Message = "Провайдер запретил чтение квоты для этой подписки."
+	case "response_invalid", "quota_response_invalid", "windows_missing", "quota_windows_missing":
+		errorCopy.Message = "Провайдер вернул неполные или некорректные данные квоты. Последняя подтверждённая квота сохранена."
+	default:
+		errorCopy.Message = "Не удалось обновить квоту. Последняя подтверждённая квота сохранена."
+	}
+	state.Error = &errorCopy
+	return state
 }
 
 func classifyBravoSubscriptionHealth(provider string, auth pluginapi.HostAuthFileEntry, now time.Time) bravoAuthHealth {

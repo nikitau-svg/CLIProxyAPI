@@ -215,16 +215,23 @@ func defaultPluginConfig() pluginConfig {
 	models["auto"] = models["frontier"]
 
 	return pluginConfig{
-		Enabled:                   true,
-		Prefix:                    defaultPrefix,
-		RequireSmartKey:           false,
-		MaxAttempts:               0,
-		CooldownSeconds:           30,
-		FallbackHedgeDelaySeconds: 40,
-		StatePath:                 defaultStatePath,
-		AllocatorMode:             "enforce",
-		QuotaRefreshSeconds:       60,
-		UnknownSecondaryPolicy:    "block",
+		Enabled:                           true,
+		Prefix:                            defaultPrefix,
+		RequireSmartKey:                   false,
+		MaxAttempts:                       0,
+		CooldownSeconds:                   30,
+		CompactBypassCooldownSeconds:      15 * 60,
+		FallbackHedgeDelaySeconds:         40,
+		StatePath:                         defaultStatePath,
+		AllocatorMode:                     "enforce",
+		QuotaRefreshSeconds:               60,
+		QuotaUsageRefreshSeconds:          60,
+		QuotaUsageMaxStaleSeconds:         15 * 60,
+		QuotaProfileRefreshSeconds:        6 * 60 * 60,
+		QuotaRefreshJitterPercent:         20,
+		QuotaRefreshProviderMinIntervalMS: 250,
+		QuotaRefreshProviderConcurrency:   1,
+		UnknownSecondaryPolicy:            "block",
 		Tariffs: []tariffConfig{
 			{ID: "x1", SessionFloorPercent: 50, WeeklyFloorPercent: 50, Multiplier: 1, ReservationPercent: 0.5},
 			{ID: "x5", SessionFloorPercent: 30, WeeklyFloorPercent: 30, Multiplier: 5, ReservationPercent: 0.1},
@@ -248,12 +255,16 @@ func configure(raw []byte) error {
 			return fmt.Errorf("decode Bravo config: %w", errUnmarshal)
 		}
 		var presence struct {
-			Tariffs *[]tariffConfig `yaml:"tariffs"`
+			Tariffs                  *[]tariffConfig `yaml:"tariffs"`
+			QuotaUsageRefreshSeconds *int            `yaml:"quota_usage_refresh_seconds"`
 		}
 		if errPresence := yaml.Unmarshal(req.ConfigYAML, &presence); errPresence != nil {
 			return fmt.Errorf("decode Bravo tariff presence: %w", errPresence)
 		}
 		cfg.PersistedTariffIDs = make(map[string]bool)
+		if presence.QuotaUsageRefreshSeconds == nil {
+			cfg.QuotaUsageRefreshSeconds = cfg.QuotaRefreshSeconds
+		}
 		if presence.Tariffs != nil {
 			for _, tariff := range *presence.Tariffs {
 				id := strings.ToLower(strings.TrimSpace(tariff.ID))
@@ -268,6 +279,9 @@ func configure(raw []byte) error {
 	}
 	if errState := configureUsageState(cfg.StatePath); errState != nil {
 		return fmt.Errorf("configure Bravo state: %w", errState)
+	}
+	if errTraces := configureRouteTraceStore(cfg.StatePath); errTraces != nil {
+		return fmt.Errorf("configure Bravo route traces: %w", errTraces)
 	}
 	currentConfig.Store(cfg)
 	return nil
@@ -290,6 +304,9 @@ func normalizeConfig(cfg *pluginConfig) error {
 	if cfg.CooldownSeconds <= 0 {
 		cfg.CooldownSeconds = 30
 	}
+	if cfg.CompactBypassCooldownSeconds < 0 {
+		return fmt.Errorf("compact_bypass_cooldown_seconds must be zero or positive")
+	}
 	if cfg.FallbackHedgeDelaySeconds < 0 {
 		return fmt.Errorf("fallback_hedge_delay_seconds must be zero or positive")
 	}
@@ -307,6 +324,24 @@ func normalizeConfig(cfg *pluginConfig) error {
 	}
 	if cfg.QuotaRefreshSeconds <= 0 {
 		cfg.QuotaRefreshSeconds = 60
+	}
+	if cfg.QuotaUsageRefreshSeconds <= 0 {
+		cfg.QuotaUsageRefreshSeconds = cfg.QuotaRefreshSeconds
+	}
+	if cfg.QuotaUsageMaxStaleSeconds < cfg.QuotaUsageRefreshSeconds {
+		cfg.QuotaUsageMaxStaleSeconds = max(cfg.QuotaUsageRefreshSeconds, 15*60)
+	}
+	if cfg.QuotaProfileRefreshSeconds <= 0 {
+		cfg.QuotaProfileRefreshSeconds = 6 * 60 * 60
+	}
+	if cfg.QuotaRefreshJitterPercent < 0 || cfg.QuotaRefreshJitterPercent > 100 {
+		return fmt.Errorf("quota_refresh_jitter_percent must be between 0 and 100")
+	}
+	if cfg.QuotaRefreshProviderMinIntervalMS < 0 {
+		return fmt.Errorf("quota_refresh_provider_min_interval_ms must be zero or positive")
+	}
+	if cfg.QuotaRefreshProviderConcurrency <= 0 {
+		cfg.QuotaRefreshProviderConcurrency = 1
 	}
 	cfg.UnknownSecondaryPolicy = strings.ToLower(strings.TrimSpace(cfg.UnknownSecondaryPolicy))
 	switch cfg.UnknownSecondaryPolicy {

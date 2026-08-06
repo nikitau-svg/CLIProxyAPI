@@ -189,9 +189,8 @@ func HideAPIKey(apiKey string) string {
 	return apiKey
 }
 
-// maskAuthorizationHeader masks the Authorization header value while preserving the auth type prefix.
-// Common formats: "Bearer <token>", "Basic <credentials>", "ApiKey <key>", etc.
-// It preserves the prefix (e.g., "Bearer ") and only masks the token/credential part.
+// MaskAuthorizationHeader redacts the Authorization credential while preserving
+// only the authentication scheme for diagnostics.
 //
 // Parameters:
 //   - value: The Authorization header value
@@ -201,16 +200,16 @@ func HideAPIKey(apiKey string) string {
 func MaskAuthorizationHeader(value string) string {
 	parts := strings.SplitN(strings.TrimSpace(value), " ", 2)
 	if len(parts) < 2 {
-		return HideAPIKey(value)
+		return "[REDACTED]"
 	}
-	return parts[0] + " " + HideAPIKey(parts[1])
+	return parts[0] + " [REDACTED]"
 }
 
 // MaskSensitiveHeaderValue masks sensitive header values while preserving expected formats.
 //
 // Behavior by header key (case-insensitive):
-//   - "Authorization": Preserve the auth type prefix (e.g., "Bearer ") and mask only the credential part.
-//   - Headers containing "api-key": Mask the entire value using HideAPIKey.
+//   - "Authorization": Preserve only the auth type prefix (e.g., "Bearer").
+//   - Headers containing credential markers: Replace the entire value.
 //   - Others: Return the original value unchanged.
 //
 // Parameters:
@@ -227,8 +226,9 @@ func MaskSensitiveHeaderValue(key, value string) string {
 	case strings.Contains(lowerKey, "api-key"),
 		strings.Contains(lowerKey, "apikey"),
 		strings.Contains(lowerKey, "token"),
-		strings.Contains(lowerKey, "secret"):
-		return HideAPIKey(value)
+		strings.Contains(lowerKey, "secret"),
+		strings.Contains(lowerKey, "cookie"):
+		return "[REDACTED]"
 	default:
 		return value
 	}

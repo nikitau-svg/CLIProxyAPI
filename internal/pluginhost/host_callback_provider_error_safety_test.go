@@ -20,6 +20,51 @@ func (rawPalantirHostCallbackError) ErrorCode() string { return "credits_require
 func (rawPalantirHostCallbackError) StatusCode() int   { return http.StatusTooManyRequests }
 func (rawPalantirHostCallbackError) Retryable() bool   { return true }
 
+type typedContextHostCallbackError struct {
+	detail providererror.Detail
+}
+
+func (e typedContextHostCallbackError) Error() string     { return e.detail.Message }
+func (e typedContextHostCallbackError) ErrorCode() string { return e.detail.Code }
+func (e typedContextHostCallbackError) StatusCode() int   { return http.StatusBadRequest }
+func (e typedContextHostCallbackError) Retryable() bool   { return false }
+func (e typedContextHostCallbackError) ProviderErrorDetail() (providererror.Detail, bool) {
+	return e.detail, true
+}
+
+func TestHostModelCallbackPreservesTypedContextFailure(t *testing.T) {
+	want := providererror.Detail{
+		Type:            "invalid_request_error",
+		Code:            "context_window_exceeded",
+		Message:         "Input requires 1003466 tokens and exceeds the model context limit of 1000000 tokens.",
+		Scope:           providererror.ScopeRequest,
+		Reason:          "prompt_too_long",
+		TaxonomyVersion: providererror.FailureTaxonomyV1,
+		Class:           providererror.ClassContextWindow,
+		RequiredTokens:  1003466,
+		LimitTokens:     1000000,
+	}
+	callbackErr := newHostModelCallbackError(&interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      typedContextHostCallbackError{detail: want},
+	})
+	rawEnvelope := marshalHostCallbackError(callbackErr)
+
+	var envelope pluginabi.Envelope
+	if errUnmarshal := json.Unmarshal(rawEnvelope, &envelope); errUnmarshal != nil {
+		t.Fatalf("unmarshal callback envelope: %v", errUnmarshal)
+	}
+	if envelope.OK || envelope.Error == nil {
+		t.Fatalf("callback envelope = %#v, want structured error", envelope)
+	}
+	if envelope.Error.Code != want.Code || envelope.Error.HTTPStatus != http.StatusBadRequest || envelope.Error.Retryable {
+		t.Fatalf("callback error = %#v", envelope.Error)
+	}
+	if envelope.Error.ProviderError == nil || *envelope.Error.ProviderError != want {
+		t.Fatalf("callback provider_error = %#v, want %#v", envelope.Error.ProviderError, want)
+	}
+}
+
 func TestHostModelCallbackSanitizesExactPalantirCreditsError(t *testing.T) {
 	callbackErr := newHostModelCallbackError(&interfaces.ErrorMessage{
 		StatusCode: http.StatusTooManyRequests,

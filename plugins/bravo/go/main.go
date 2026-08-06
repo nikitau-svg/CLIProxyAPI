@@ -60,6 +60,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -124,7 +125,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodModelRegister:
-		return registerModels()
+		return registerModels(request)
 	case pluginabi.MethodFrontendAuthIdentifier:
 		return okEnvelope(map[string]string{"identifier": pluginIdentifier})
 	case pluginabi.MethodFrontendAuthAuthenticate:
@@ -166,10 +167,17 @@ func pluginRegistration() registration {
 				{Name: "require_smart_key", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Require a Bravo smart key for logical models."},
 				{Name: "max_attempts", Type: pluginapi.ConfigFieldTypeInteger, Description: "Global provider-call budget. Zero means every eligible configured account."},
 				{Name: "cooldown_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Fallback cooldown when Retry-After is absent."},
+				{Name: "compact_bypass_cooldown_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Per-project/session cooldown for a Claude CLI /compact reserve-floor bypass. Zero disables the bypass."},
 				{Name: "fallback_hedge_delay_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Delay before one cross-provider streaming-bootstrap hedge. Zero disables hedging."},
 				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "Private persistent Bravo usage and quota snapshot."},
 				{Name: "allocator_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Allocator mode: off, observe, or enforce."},
 				{Name: "quota_refresh_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Confirmed quota cache lifetime."},
+				{Name: "quota_usage_refresh_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Provider-confirmed usage refresh interval."},
+				{Name: "quota_usage_max_stale_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum age for stale quota to authorize secondary routing."},
+				{Name: "quota_profile_refresh_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Safe account profile refresh interval."},
+				{Name: "quota_refresh_jitter_percent", Type: pluginapi.ConfigFieldTypeInteger, Description: "Deterministic quota refresh staggering window."},
+				{Name: "quota_refresh_provider_min_interval_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Minimum interval between provider quota request starts."},
+				{Name: "quota_refresh_provider_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum concurrent quota requests per provider."},
 				{Name: "unknown_secondary_policy", Type: pluginapi.ConfigFieldTypeString, Description: "Unknown secondary quota policy: block or allow."},
 				{Name: "tariffs", Type: pluginapi.ConfigFieldTypeArray, Description: "Allocator tariff floors and reservation policy."},
 				{Name: "subscriptions", Type: pluginapi.ConfigFieldTypeArray, Description: "Auth-index subscription policy."},
@@ -231,10 +239,27 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 
 type hostCallFunc func(method string, payload any) (json.RawMessage, error)
 
-var hostCall hostCallFunc = callHostABI
+var hostCallState = struct {
+	sync.RWMutex
+	callback hostCallFunc
+}{callback: callHostABI}
 
 func callHost(method string, payload any) (json.RawMessage, error) {
-	return hostCall(method, payload)
+	hostCallState.RLock()
+	callback := hostCallState.callback
+	hostCallState.RUnlock()
+	return callback(method, payload)
+}
+
+func swapHostCall(callback hostCallFunc) hostCallFunc {
+	if callback == nil {
+		callback = callHostABI
+	}
+	hostCallState.Lock()
+	previous := hostCallState.callback
+	hostCallState.callback = callback
+	hostCallState.Unlock()
+	return previous
 }
 
 func callHostABI(method string, payload any) (json.RawMessage, error) {

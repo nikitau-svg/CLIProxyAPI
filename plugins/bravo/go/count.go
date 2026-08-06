@@ -46,7 +46,7 @@ func countTokens(raw []byte) ([]byte, error) {
 	}
 
 	var lastFailure executionFailure
-	var failureTraces []executionFailureTrace
+	failureTraces := initialExecutionFailureTraces(plan)
 	blockedModels := make(map[string]bool)
 	providerCalls := 0
 	for _, attempt := range plan {

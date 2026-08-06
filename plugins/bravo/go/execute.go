@@ -58,20 +58,26 @@ func execute(raw []byte) ([]byte, error) {
 			Status:  http.StatusBadRequest,
 		}), nil
 	}
+	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
+	routeTrace := newRouteTraceRecorder(req, logicalModelID, protocol, false)
 	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
 	if errPlan != nil {
-		return failureEnvelope(executionFailure{
+		failure := executionFailure{
 			Code:      "bravo_no_eligible_account",
 			Message:   errPlan.Error(),
 			Status:    http.StatusServiceUnavailable,
 			Retryable: true,
-		}), nil
+		}
+		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
 
-	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
+	if len(plan) > 0 {
+		routeTrace.preflight(plan[0].PreflightRejections)
+	}
 	var lastFailure executionFailure
-	var failureTraces []executionFailureTrace
+	failureTraces := initialExecutionFailureTraces(plan)
 	blockedModels := make(map[string]bool)
+	contextRouting := newContextRoutingState(req.HostCallbackID)
 	providerCalls := 0
 	for _, attempt := range plan {
 		if blockedModels[executionFailureModelKey(attempt)] {
@@ -82,22 +88,45 @@ func execute(raw []byte) ([]byte, error) {
 		}
 		if errPreflight := verifyCandidateContract(attempt.Candidate, contract); errPreflight != nil {
 			lastFailure = contractFailure(errPreflight)
+			routeTrace.failure(attempt, time.Now(), lastFailure.Status, lastFailure)
 			continue
 		}
 
 		physicalModel := candidateModelName(attempt.Candidate)
 		candidateBody, errRewrite := rewriteCandidateRequest(candidateSourceBody, protocol, physicalModel, false, req.Headers.Get("Content-Type"))
 		if errRewrite != nil {
-			return failureEnvelope(executionFailure{
+			failure := executionFailure{
 				Code:    "bravo_request_invalid",
 				Message: errRewrite.Error(),
 				Status:  http.StatusBadRequest,
-			}), nil
+			}
+			routeTrace.failure(attempt, time.Now(), failure.Status, failure)
+			return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
+		}
+		if contextRouting.active() && !contextRouting.proveCandidate(
+			req,
+			attempt,
+			protocol,
+			physicalModel,
+			candidateBody,
+		) {
+			routeTrace.failure(attempt, time.Now(), http.StatusUnprocessableEntity, executionFailure{
+				Code:    "bravo_context_target_incompatible",
+				Message: "Целевая модель не прошла доказательную проверку вместимости контекста.",
+				Status:  http.StatusUnprocessableEntity,
+			})
+			continue
 		}
 		if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
 			break
 		}
-		releaseLease, acquired := acquireAttemptLease(attempt)
+		releaseLease, acquired, leaseFailure := acquireExecutionAttemptLease(attempt)
+		if leaseFailure != nil {
+			lastFailure = *leaseFailure
+			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, *leaseFailure)
+			routeTrace.failure(attempt, time.Now(), leaseFailure.Status, *leaseFailure)
+			continue
+		}
 		if !acquired {
 			continue
 		}
@@ -110,7 +139,9 @@ func execute(raw []byte) ([]byte, error) {
 		if errCall != nil {
 			releaseLease(false)
 			failure := classifyExecutionError(errCall)
+			contextRouting.observeFailure(attempt, failure)
 			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
+			routeTrace.failure(attempt, started, failure.Status, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
@@ -120,7 +151,7 @@ func execute(raw []byte) ([]byte, error) {
 			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelope(finalExecutionFailure(failureTraces, failure)), nil
+			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
 		}
 		// A host response means the provider accepted the attempt. Keep the
 		// reservation until the next confirmed quota snapshot, even when the
@@ -136,13 +167,16 @@ func execute(raw []byte) ([]byte, error) {
 				Retryable: true,
 			}
 			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
+			routeTrace.failure(attempt, started, failure.Status, failure)
 			lastFailure = failure
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
 			failure := classifyHTTPFailure(response.StatusCode, response.Headers, "candidate returned an HTTP error", response.Body)
+			contextRouting.observeFailure(attempt, failure)
 			recordExecutionAttempt(attempt, started, response.StatusCode, false, failure)
+			routeTrace.failure(attempt, started, response.StatusCode, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
@@ -152,23 +186,30 @@ func execute(raw []byte) ([]byte, error) {
 			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelope(finalExecutionFailure(failureTraces, failure)), nil
+			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
 		}
 
 		response.Headers.Del("Content-Length")
 		recordExecutionAttempt(attempt, started, response.StatusCode, true, executionFailure{})
+		routeTrace.success(attempt, started, response.StatusCode)
+		responseHeaders := cloneHeader(response.Headers)
+		metadata := map[string]any{
+			"bravo_logical_model":    logicalModelID,
+			"bravo_physical_model":   physicalModel,
+			"bravo_provider":         normalizeProvider(attempt.Candidate.Provider),
+			"bravo_auth_id":          pinnedAuthID(attempt.Auth),
+			"bravo_effort":           attempt.Candidate.Effort,
+			"bravo_requested_effort": attempt.RequestedEffort,
+			"bravo_effective_effort": attempt.EffectiveEffort,
+		}
+		compactBypassResponseWarning(responseHeaders, metadata, attempt)
+		traceID := routeTrace.finish(true, response.StatusCode, executionFailure{})
+		responseHeaders = attachRouteTraceHeader(responseHeaders, traceID)
+		metadata["bravo_trace_id"] = traceID
 		return okEnvelope(pluginapi.ExecutorResponse{
-			Payload: rewriteResponseModel(response.Body, physicalModel, logicalModelID),
-			Headers: cloneHeader(response.Headers),
-			Metadata: map[string]any{
-				"bravo_logical_model":    logicalModelID,
-				"bravo_physical_model":   physicalModel,
-				"bravo_provider":         normalizeProvider(attempt.Candidate.Provider),
-				"bravo_auth_id":          pinnedAuthID(attempt.Auth),
-				"bravo_effort":           attempt.Candidate.Effort,
-				"bravo_requested_effort": attempt.RequestedEffort,
-				"bravo_effective_effort": attempt.EffectiveEffort,
-			},
+			Payload:  rewriteResponseModel(response.Body, physicalModel, logicalModelID),
+			Headers:  responseHeaders,
+			Metadata: metadata,
 		})
 	}
 	if lastFailure.Code == "" {
@@ -178,7 +219,17 @@ func execute(raw []byte) ([]byte, error) {
 			Status:  http.StatusUnprocessableEntity,
 		}
 	}
-	return failureEnvelope(finalExecutionFailure(failureTraces, lastFailure)), nil
+	return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, lastFailure)), nil
+}
+
+func failureEnvelopeWithRouteTrace(recorder *routeTraceRecorder, failure executionFailure) []byte {
+	status := failure.Status
+	if status <= 0 {
+		status = http.StatusBadGateway
+	}
+	traceID := recorder.finish(false, status, failure)
+	failure.Headers = attachRouteTraceHeader(cloneHeader(failure.Headers), traceID)
+	return failureEnvelope(failure)
 }
 
 func nestedHostModelRequest(req rpcExecutorRequest, attempt executionAttempt, protocol, physicalModel string, body []byte, stream bool) pluginapi.HostModelExecutionRequest {
@@ -270,7 +321,7 @@ func requestProtocol(req pluginapi.ExecutorRequest) string {
 }
 
 func failureEnvelope(failure executionFailure) []byte {
-	failure = sanitizeExecutionFailure(failure)
+	failure = clientExecutionFailureRU(failure)
 	status := failure.Status
 	if status == 0 {
 		status = http.StatusBadGateway
@@ -370,6 +421,14 @@ func classifyExecutionError(err error) executionFailure {
 
 func classifyProviderFailureDetail(failure executionFailure, detail providererror.Detail) executionFailure {
 	detail = providererror.Sanitize(detail)
+	if strings.EqualFold(strings.TrimSpace(detail.Class), "context_window") ||
+		strings.EqualFold(strings.TrimSpace(detail.Code), "context_window_exceeded") ||
+		providerContextWindowSignal(detail.Type, detail.Code, detail.Message, detail.Reason) {
+		contextFailure := contextExecutionFailure(detail)
+		contextFailure.Headers = cloneHeader(failure.Headers)
+		contextFailure.RetryAfter = failure.RetryAfter
+		return contextFailure
+	}
 	if strings.EqualFold(strings.TrimSpace(detail.Code), "credits_required") &&
 		(strings.EqualFold(strings.TrimSpace(detail.Type), "rate_limit_error") ||
 			strings.TrimSpace(detail.Type) == "") {
@@ -618,6 +677,7 @@ func providerContextWindowSignal(values ...string) bool {
 			continue
 		}
 		for _, signal := range []string{
+			"prompt is too long",
 			"context_length_exceeded",
 			"context_window_exceeded",
 			"context_too_large",
@@ -822,7 +882,11 @@ func retryAfterTime(value string, now time.Time) time.Time {
 }
 
 func recordExecutionAttempt(attempt executionAttempt, started time.Time, status int, success bool, failure executionFailure) {
-	failure = sanitizeExecutionFailure(failure)
+	if success {
+		failure = executionFailure{}
+	} else {
+		failure = clientExecutionFailureRU(failure)
+	}
 	record := attemptRecord{
 		At:              started.UTC(),
 		LogicalModel:    attempt.LogicalModel,
@@ -838,6 +902,7 @@ func recordExecutionAttempt(attempt executionAttempt, started time.Time, status 
 		Retryable:       failure.Retryable,
 		ErrorCode:       failure.Code,
 		Error:           failure.Message,
+		CompactBypass:   attempt.CompactBypass,
 		LatencyMS:       time.Since(started).Milliseconds(),
 	}
 	if failure.Provider != nil {

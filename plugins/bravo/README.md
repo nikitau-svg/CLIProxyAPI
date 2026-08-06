@@ -157,6 +157,7 @@ plugins:
       require_smart_key: true
       max_attempts: 0
       cooldown_seconds: 30
+      compact_bypass_cooldown_seconds: 900
       smart_keys:
         - id: prj_example
           name: default-project
@@ -177,6 +178,21 @@ The configured `cooldown_seconds` still controls a generic retryable 429 with
 no provider hint. Exact model-credits exhaustion without a valid
 `Retry-After` uses a conservative 15-minute probe barrier; any valid explicit
 `Retry-After`, including a shorter value, remains authoritative.
+
+Client-visible Bravo execution errors are localized in Russian while retaining
+their stable machine-readable `code`, HTTP status, and `Retry-After`. A final
+failure describes the complete safe route, including candidates withheld by
+CLIProxyAPI's internal reserve floors and the physical fallback that ultimately
+failed.
+
+For Claude Code, a genuine `/compact` request may cross only the internal
+allocator reserve floor when a project-authorized Claude credential is healthy
+and still has confirmed positive provider quota. The detector requires the
+Claude protocol, Claude CLI user agent, session ID, and the current compaction
+prompt; historical `/compact` text does not qualify. Authorization boundaries,
+provider/Core cooldowns, disabled subscriptions, and exhausted or unknown quota
+remain fail-closed. A committed bypass starts the configured per-project/session
+cooldown and emits a redacted Russian warning; `0` disables this behavior.
 
 The authenticated CLIProxyAPI Management API owns project-key persistence:
 

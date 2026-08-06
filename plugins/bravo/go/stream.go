@@ -42,7 +42,7 @@ func executeStream(raw []byte) ([]byte, error) {
 			Status:  http.StatusBadRequest,
 		}), nil
 	}
-	_, model, _, failure := prepareBravoExecution(req)
+	logicalName, model, cfg, failure := prepareBravoExecution(req)
 	if failure != nil {
 		return failureEnvelope(*failure), nil
 	}
@@ -55,17 +55,25 @@ func executeStream(raw []byte) ([]byte, error) {
 	if errPreflight := verifyLogicalModelContract(model, contract); errPreflight != nil {
 		return failureEnvelope(contractFailure(errPreflight)), nil
 	}
-	go runBravoStream(req, streamID)
+	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
+	routeRecorder := newRouteTraceRecorder(req, logicalModelID, protocol, true)
+	go runBravoStreamWithTrace(req, streamID, routeRecorder)
 	return okEnvelope(map[string]any{
 		"headers": http.Header{
-			"Content-Type":  []string{"text/event-stream"},
-			"Cache-Control": []string{"no-cache"},
+			"Content-Type":     []string{"text/event-stream"},
+			"Cache-Control":    []string{"no-cache"},
+			bravoTraceIDHeader: []string{routeRecorder.trace.TraceID},
 		},
 	})
 }
 
 func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
+	runBravoStreamWithTrace(req, pluginStreamID, nil)
+}
+
+func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, initialRecorder *routeTraceRecorder) {
 	launchedRuns := make([]*bravoStreamAttemptRun, 0, 2)
+	routeRecorder := initialRecorder
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			failure := executionFailure{
@@ -76,12 +84,18 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 			for _, run := range launchedRuns {
 				run.abort(failure)
 			}
-			closePluginStream(pluginStreamID, fmt.Sprintf("bravo_stream_panic: %v", recovered))
+			if routeRecorder != nil {
+				routeRecorder.finish(false, failure.Status, failure)
+			}
+			closePluginStreamFailure(pluginStreamID, failure)
 		}
 	}()
 
 	logicalName, model, cfg, failure := prepareBravoExecution(req)
 	if failure != nil {
+		if routeRecorder != nil {
+			routeRecorder.finish(false, failure.Status, *failure)
+		}
 		closePluginStreamFailure(pluginStreamID, *failure)
 		return
 	}
@@ -89,29 +103,55 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 	protocol := requestProtocol(req.ExecutorRequest)
 	contract, errDetect := detectRequestContract(protocol, body, true)
 	if errDetect != nil {
-		closePluginStreamFailure(pluginStreamID, contractFailure(errDetect))
+		failure := contractFailure(errDetect)
+		if routeRecorder != nil {
+			routeRecorder.finish(false, failure.Status, failure)
+		}
+		closePluginStreamFailure(pluginStreamID, failure)
 		return
 	}
 	candidateSourceBody, errStrip := stripRequestEffort(body, protocol, contract.Effort)
 	if errStrip != nil {
-		closePluginStream(pluginStreamID, "bravo_request_invalid: "+errStrip.Error())
+		failure := executionFailure{
+			Code:    "bravo_request_invalid",
+			Message: errStrip.Error(),
+			Status:  http.StatusBadRequest,
+		}
+		if routeRecorder != nil {
+			routeRecorder.finish(false, failure.Status, failure)
+		}
+		closePluginStreamFailure(pluginStreamID, failure)
 		return
 	}
 	hedgeDelay := time.Duration(cfg.FallbackHedgeDelaySeconds) * time.Second
+	if project, authenticated := authenticatedExecutionProject(req, cfg); authenticated {
+		if _, compact := claudeCLICompactBypassKey(req, project); compact {
+			hedgeDelay = 0
+		}
+	}
 	hedgeAt := time.Time{}
+	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
+	if routeRecorder == nil {
+		routeRecorder = newRouteTraceRecorder(req, logicalModelID, protocol, true)
+	}
 	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
 	if errPlan != nil {
-		closePluginStreamFailure(pluginStreamID, executionFailure{
+		failure := executionFailure{
 			Code:      "bravo_no_eligible_account",
 			Message:   errPlan.Error(),
 			Status:    http.StatusServiceUnavailable,
 			Retryable: true,
-		})
+		}
+		routeRecorder.finish(false, failure.Status, failure)
+		closePluginStreamFailure(pluginStreamID, failure)
 		return
 	}
-	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
+	if len(plan) > 0 {
+		routeRecorder.preflight(plan[0].PreflightRejections)
+	}
 	var lastFailure executionFailure
-	failureTraces := make([]executionFailureTrace, 0, len(plan))
+	failureTraces := initialExecutionFailureTraces(plan)
+	contextRouting := newContextRoutingState(req.HostCallbackID)
 	providerCalls := 0
 	attempted := make(map[int]bool, len(plan))
 	hedgeUsed := false
@@ -121,19 +161,17 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 		if run == nil {
 			return
 		}
+		contextRouting.observeFailure(run.attempt, failure)
 		failureTraces = appendExecutionFailureTrace(failureTraces, run.attempt, failure)
+		routeRecorder.failure(run.attempt, run.started, failure.Status, failure)
 	}
 	closeTerminalFailure := func(failure executionFailure) {
-		closePluginStreamFailure(pluginStreamID, finalExecutionFailure(failureTraces, failure))
+		final := finalExecutionFailure(failureTraces, failure)
+		routeRecorder.finish(false, final.Status, final)
+		closePluginStreamFailure(pluginStreamID, final)
 	}
 	canContinueStreamingRoute := func(failure executionFailure) bool {
-		// A context overflow is request-scoped and never cools the credential,
-		// but blindly moving to another model can only repeat the failure or
-		// silently change behavior. Candidate config does not yet carry a
-		// verified context-window size, so streaming must fail closed until a
-		// strictly larger compatible candidate can be proven.
-		return executionFailureCanContinueRoute(failure) &&
-			!executionFailureBlocksPhysicalModel(failure)
+		return executionFailureCanContinueRoute(failure)
 	}
 
 	canHedgeFrom := func(index int) bool {
@@ -163,6 +201,7 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 		if errPreflight := verifyCandidateContract(attempt.Candidate, contract); errPreflight != nil {
 			failure := contractFailure(errPreflight)
 			lastFailure = failure
+			routeRecorder.failure(attempt, time.Now(), failure.Status, failure)
 			return nil, &failure, false
 		}
 		physicalModel := candidateModelName(attempt.Candidate)
@@ -173,7 +212,22 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 				Message: errRewrite.Error(),
 				Status:  http.StatusBadRequest,
 			}
+			routeRecorder.failure(attempt, time.Now(), failure.Status, failure)
 			return nil, &failure, false
+		}
+		if contextRouting.active() && !contextRouting.proveCandidate(
+			req,
+			attempt,
+			protocol,
+			physicalModel,
+			candidateBody,
+		) {
+			routeRecorder.failure(attempt, time.Now(), http.StatusUnprocessableEntity, executionFailure{
+				Code:    "bravo_context_target_incompatible",
+				Message: "Целевая модель не прошла доказательную проверку вместимости контекста.",
+				Status:  http.StatusUnprocessableEntity,
+			})
+			return nil, nil, false
 		}
 		if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
 			return nil, nil, false
@@ -184,12 +238,21 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 			childID, errFork := forkHostCallbackScope(req.HostCallbackID)
 			if errFork != nil {
 				failure := classifyExecutionError(errFork)
+				routeRecorder.failure(attempt, time.Now(), failure.Status, failure)
 				return nil, &failure, false
 			}
 			callbackID = childID
 			ownsScope = true
 		}
-		releaseLease, acquired := acquireAttemptLease(attempt)
+		releaseLease, acquired, leaseFailure := acquireExecutionAttemptLease(attempt)
+		if leaseFailure != nil {
+			if ownsScope {
+				_ = closeHostCallbackScope(callbackID)
+			}
+			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, *leaseFailure)
+			routeRecorder.failure(attempt, time.Now(), leaseFailure.Status, *leaseFailure)
+			return nil, leaseFailure, false
+		}
 		if !acquired {
 			if ownsScope {
 				_ = closeHostCallbackScope(callbackID)
@@ -206,6 +269,7 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 			callbackID,
 			ownsScope,
 			releaseLease,
+			routeRecorder,
 		)
 		launchedRuns = append(launchedRuns, run)
 		return run, nil, true
@@ -321,6 +385,16 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 							settleBravoCompetingAttempt(hedge, hedgeResults, nil)
 							hedgeResults = nil
 						}
+						if winnerFailure == nil {
+							routeRecorder.success(primary.attempt, primary.started, http.StatusOK)
+							routeRecorder.finish(true, http.StatusOK, executionFailure{})
+						} else {
+							lastFailure = *winnerFailure
+							contextRouting.observeFailure(primary.attempt, *winnerFailure)
+							failureTraces = appendExecutionFailureTrace(failureTraces, primary.attempt, *winnerFailure)
+							routeRecorder.failureWithCommit(primary.attempt, primary.started, winnerFailure.Status, *winnerFailure, true)
+							routeRecorder.finish(false, winnerFailure.Status, *winnerFailure)
+						}
 						return
 					}
 					if winnerFailure != nil {
@@ -384,6 +458,16 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 						if primaryResults != nil {
 							settleBravoCompetingAttempt(primary, primaryResults, nil)
 							primaryResults = nil
+						}
+						if winnerFailure == nil {
+							routeRecorder.success(hedge.attempt, hedge.started, http.StatusOK)
+							routeRecorder.finish(true, http.StatusOK, executionFailure{})
+						} else {
+							lastFailure = *winnerFailure
+							contextRouting.observeFailure(hedge.attempt, *winnerFailure)
+							failureTraces = appendExecutionFailureTrace(failureTraces, hedge.attempt, *winnerFailure)
+							routeRecorder.failureWithCommit(hedge.attempt, hedge.started, winnerFailure.Status, *winnerFailure, true)
+							routeRecorder.finish(false, winnerFailure.Status, *winnerFailure)
 						}
 						return
 					}
@@ -538,7 +622,8 @@ func forwardBravoStreamWinner(
 	if committed {
 		// Switching provider after the client observed bytes would splice two
 		// unrelated streams. Fail closed and let the caller retry explicitly.
-		closePluginStream(pluginStreamID, streamFailure.Code+": "+streamFailure.Message)
+		localized := clientExecutionFailureRU(*streamFailure)
+		closePluginStream(pluginStreamID, localized.Code+": "+localized.Message)
 		return true, streamFailure
 	}
 	return false, streamFailure
@@ -722,14 +807,6 @@ func claudeStreamPayloadFailure(payload []byte) *executionFailure {
 		!strings.EqualFold(strings.TrimSpace(envelope.Type), "error") {
 		return nil
 	}
-	if providerContextWindowSignal(envelope.Error.Type, envelope.Error.Message) {
-		failure := classifyProviderFailureSignal(executionFailure{
-			Code:    firstNonEmpty(envelope.Error.Type, "invalid_request_error"),
-			Message: "Input exceeds this model's context window.",
-			Status:  http.StatusBadRequest,
-		}, envelope.Error.Type, envelope.Error.Message)
-		return &failure
-	}
 	if classification, reviewed := providererror.ParseAnthropicStandard(raw); reviewed {
 		failure := classifyProviderFailureDetail(executionFailure{
 			Code:      classification.Detail.Code,
@@ -737,6 +814,14 @@ func claudeStreamPayloadFailure(payload []byte) *executionFailure {
 			Status:    classification.Status,
 			Retryable: classification.Retryable,
 		}, classification.Detail)
+		return &failure
+	}
+	if providerContextWindowSignal(envelope.Error.Type, envelope.Error.Message) {
+		failure := classifyProviderFailureSignal(executionFailure{
+			Code:    firstNonEmpty(envelope.Error.Type, "invalid_request_error"),
+			Message: "Input exceeds this model's context window.",
+			Status:  http.StatusBadRequest,
+		}, envelope.Error.Type, envelope.Error.Message)
 		return &failure
 	}
 	return &executionFailure{
@@ -769,7 +854,17 @@ func claudeStreamPayloadContainsContent(payload []byte) bool {
 		return true
 	}
 	var event struct {
-		Type string `json:"type"`
+		Type         string `json:"type"`
+		ContentBlock struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content_block"`
+		Delta struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
+			Partial  string `json:"partial_json"`
+		} `json:"delta"`
 	}
 	if errUnmarshal := json.Unmarshal([]byte(raw), &event); errUnmarshal != nil {
 		return true
@@ -777,7 +872,25 @@ func claudeStreamPayloadContainsContent(payload []byte) bool {
 	switch strings.ToLower(strings.TrimSpace(event.Type)) {
 	case "message_start", "ping", "message_delta", "message_stop":
 		return false
-	case "content_block_start", "content_block_delta", "content_block_stop":
+	case "content_block_start":
+		// An empty text block is protocol scaffolding. Tool, image and other
+		// semantic block starts alter client state immediately and commit.
+		return !strings.EqualFold(strings.TrimSpace(event.ContentBlock.Type), "text") ||
+			event.ContentBlock.Text != ""
+	case "content_block_delta":
+		switch strings.ToLower(strings.TrimSpace(event.Delta.Type)) {
+		case "text_delta":
+			return event.Delta.Text != ""
+		case "thinking_delta":
+			return event.Delta.Thinking != ""
+		case "input_json_delta":
+			return event.Delta.Partial != ""
+		default:
+			return true
+		}
+	case "content_block_stop":
+		return false
+	case "error":
 		return true
 	default:
 		return true
@@ -911,7 +1024,7 @@ func closePluginStream(streamID, errorMessage string) {
 // so without this a pool exhaustion reaches the SDK as a bare 500 and triggers
 // an immediate retry into the same exhausted pool.
 func closePluginStreamFailure(streamID string, failure executionFailure) {
-	failure = sanitizeExecutionFailure(failure)
+	failure = clientExecutionFailureRU(failure)
 	status := failure.Status
 	if status <= 0 {
 		status = http.StatusServiceUnavailable

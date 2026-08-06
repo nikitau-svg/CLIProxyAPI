@@ -519,6 +519,15 @@ func modelExecutionStreamErrorFromMessage(errMsg *interfaces.ErrorMessage) *Mode
 			}
 		}
 	}
+	providerDetail, hasProviderDetail := providererror.FromError(errMsg.Error)
+	if hasProviderDetail {
+		if providerCode := strings.TrimSpace(providerDetail.Code); providerCode != "" {
+			code = providerCode
+		}
+		if summary := strings.TrimSpace(providerDetail.Summary()); summary != "" {
+			message = summary
+		}
+	}
 	if code == "" {
 		code = "model_execution_failed"
 	}
@@ -530,8 +539,8 @@ func modelExecutionStreamErrorFromMessage(errMsg *interfaces.ErrorMessage) *Mode
 		Headers:    headers,
 		RetryAfter: retryAfter,
 	}
-	if detail, ok := providererror.FromError(errMsg.Error); ok {
-		streamErr.ProviderError = &detail
+	if hasProviderDetail {
+		streamErr.ProviderError = &providerDetail
 	}
 	return streamErr
 }

@@ -56,6 +56,19 @@ func TestResultErrorFromErrorPreservesPluginCodeForRequestScoped422(t *testing.T
 	}
 }
 
+func TestHumanMessageDoesNotDefineRequestScope(t *testing.T) {
+	err := &Error{
+		Message:    "invalid_request_error: prompt is too long",
+		HTTPStatus: http.StatusBadRequest,
+	}
+	if got := resultErrorFailureScope(err); got != "" {
+		t.Fatalf("failure scope = %q, want unknown", got)
+	}
+	if err.IsRequestScoped() || isRequestInvalidResultError(err) {
+		t.Fatal("human error text determined request scope")
+	}
+}
+
 func TestResultErrorFromErrorKeepsLegacyMarkerForUncoded422(t *testing.T) {
 	source := codedResultTestError{
 		message: "unprocessable request",
@@ -135,8 +148,8 @@ func TestModelSupport422IsNotMarkedRequestScoped(t *testing.T) {
 		message string
 	}{
 		{
-			name:    "message",
-			code:    "upstream_rejected",
+			name:    "stable code",
+			code:    "model_not_supported",
 			message: "requested model is not supported",
 		},
 		{

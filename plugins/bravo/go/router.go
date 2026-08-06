@@ -9,7 +9,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-func registerModels() ([]byte, error) {
+func registerModels(raw []byte) ([]byte, error) {
+	var request pluginapi.ModelRegistrationRequest
+	if len(strings.TrimSpace(string(raw))) > 0 {
+		if errUnmarshal := json.Unmarshal(raw, &request); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+	}
 	cfg := loadedConfig()
 	names := make([]string, 0, len(cfg.Models))
 	for name := range cfg.Models {
@@ -20,7 +26,7 @@ func registerModels() ([]byte, error) {
 	models := make([]pluginapi.ModelInfo, 0, len(names))
 	for _, name := range names {
 		item := cfg.Models[name]
-		models = append(models, registeredLogicalModel(cfg.Prefix, name, item))
+		models = append(models, registeredLogicalModel(cfg.Prefix, name, item, request.HostModels))
 	}
 	return okEnvelope(pluginapi.ModelRegistrationResponse{
 		Provider: pluginIdentifier,
@@ -28,7 +34,7 @@ func registerModels() ([]byte, error) {
 	})
 }
 
-func registeredLogicalModel(prefix, name string, item logicalModel) pluginapi.ModelInfo {
+func registeredLogicalModel(prefix, name string, item logicalModel, snapshots ...[]pluginapi.HostModelListEntry) pluginapi.ModelInfo {
 	id := prefix + name
 	info := pluginapi.ModelInfo{
 		ID:          id,
@@ -64,10 +70,16 @@ func registeredLogicalModel(prefix, name string, item logicalModel) pluginapi.Mo
 	}
 
 	info.Type = "smart-router"
-	info.InputTokenLimit = 128000
-	info.OutputTokenLimit = 32000
-	info.ContextLength = 128000
-	info.MaxCompletionTokens = 32000
+	var hostModels []pluginapi.HostModelListEntry
+	if len(snapshots) > 0 {
+		hostModels = snapshots[0]
+	}
+	if anchor, ok := logicalModelCapacityAnchor(item, hostModels); ok {
+		info.InputTokenLimit = anchor.InputTokenLimit
+		info.OutputTokenLimit = anchor.MaxCompletionTokens
+		info.ContextLength = anchor.ContextLength
+		info.MaxCompletionTokens = anchor.MaxCompletionTokens
+	}
 	info.SupportedGenerationMethods = []string{"generateContent", "streamGenerateContent"}
 	info.SupportedParameters = []string{"stream", "tools", "tool_choice", "reasoning_effort"}
 	info.SupportedInputModalities = []string{"text"}

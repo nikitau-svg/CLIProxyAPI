@@ -10,8 +10,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,6 +31,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 )
 
 var requestLogID atomic.Uint64
@@ -427,7 +430,65 @@ type homeRequestLogPayload struct {
 	RequestLog string              `json:"request_log,omitempty"`
 }
 
-func cloneHeaders(headers map[string][]string) map[string][]string {
+type safeErrorLogDiagnostic string
+
+func (e safeErrorLogDiagnostic) Error() string { return string(e) }
+
+func safeErrorLogMessages(messages []*interfaces.ErrorMessage) []*interfaces.ErrorMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	safe := make([]*interfaces.ErrorMessage, 0, len(messages))
+	for _, message := range messages {
+		if message == nil {
+			continue
+		}
+		code := "unclassified_request_failure"
+		diagnostic := "code=" + code
+		if message.Error != nil {
+			var coded interface{ ErrorCode() string }
+			if errors.As(message.Error, &coded) && coded != nil {
+				if value := strings.TrimSpace(coded.ErrorCode()); value != "" {
+					code = providererror.Sanitize(providererror.Detail{Code: value}).Code
+					diagnostic = "code=" + code
+				}
+			}
+			if detail, ok := providererror.FromError(message.Error); ok {
+				diagnostic = fmt.Sprintf(
+					"code=%s type=%s scope=%s reason=%s",
+					firstNonEmptyLogValue(detail.Code, code),
+					detail.Type,
+					detail.Scope,
+					detail.Reason,
+				)
+				if detail.Message != "" {
+					diagnostic += " message=" + detail.Message
+				}
+			}
+		}
+		safe = append(safe, &interfaces.ErrorMessage{
+			StatusCode: message.StatusCode,
+			Error:      safeErrorLogDiagnostic(strings.TrimSpace(diagnostic)),
+			Addon:      redactedHTTPHeader(message.Addon),
+		})
+	}
+	return safe
+}
+
+func firstNonEmptyLogValue(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func redactedHTTPHeader(headers map[string][]string) http.Header {
+	return http.Header(redactedHeaders(headers))
+}
+
+func redactedHeaders(headers map[string][]string) map[string][]string {
 	if len(headers) == 0 {
 		return nil
 	}
@@ -436,13 +497,11 @@ func cloneHeaders(headers map[string][]string) map[string][]string {
 		if strings.TrimSpace(key) == "" {
 			continue
 		}
-		if values == nil {
-			out[key] = nil
-			continue
+		masked := make([]string, len(values))
+		for index, value := range values {
+			masked[index] = util.MaskSensitiveHeaderValue(key, value)
 		}
-		copied := make([]string, len(values))
-		copy(copied, values)
-		out[key] = copied
+		out[key] = masked
 	}
 	if len(out) == 0 {
 		return nil
@@ -459,7 +518,7 @@ func (l *FileRequestLogger) forwardRequestLogToHome(ctx context.Context, headers
 		return nil
 	}
 	payload := homeRequestLogPayload{
-		Headers:    cloneHeaders(headers),
+		Headers:    redactedHeaders(headers),
 		RequestID:  strings.TrimSpace(requestID),
 		RequestLog: logText,
 	}
@@ -589,6 +648,19 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 
 	if !l.enabled && !force {
 		return nil
+	}
+	if force && !l.enabled {
+		body = []byte("[OMITTED: production error logs do not persist request bodies]")
+		response = []byte("[OMITTED: production error logs do not persist response bodies]")
+		websocketTimeline = nil
+		websocketTimelineSource = nil
+		apiRequest = nil
+		apiRequestSource = nil
+		apiResponse = nil
+		apiResponseSource = nil
+		apiWebsocketTimeline = nil
+		apiWebsocketTimelineSource = nil
+		apiResponseErrors = safeErrorLogMessages(apiResponseErrors)
 	}
 
 	if l.homeEnabled && l.enabled {
@@ -2159,7 +2231,7 @@ func (w *homeStreamingLogWriter) Close() error {
 	}
 
 	payload := homeRequestLogPayload{
-		Headers:    cloneHeaders(w.requestHeaders),
+		Headers:    redactedHeaders(w.requestHeaders),
 		RequestID:  w.requestID,
 		RequestLog: buf.String(),
 	}

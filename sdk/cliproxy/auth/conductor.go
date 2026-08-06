@@ -3872,7 +3872,19 @@ func (m *Manager) markResult(ctx context.Context, result Result) {
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
-			if result.Model != "" {
+			failureScope := resultErrorFailureScope(result.Error)
+			// Preserve the legacy auth.Result contract for untyped errors: an
+			// execution tied to a concrete model affects that model, while an
+			// auth-only operation affects the account. A non-empty unknown code
+			// is deliberately not guessed and therefore remains health-neutral.
+			if failureScope == "" && (result.Error == nil || strings.TrimSpace(result.Error.Code) == "") {
+				if result.Model != "" {
+					failureScope = providererror.ScopeModel
+				} else {
+					failureScope = providererror.ScopeAccount
+				}
+			}
+			if failureScope == providererror.ScopeModel && result.Model != "" {
 				if !isRequestScopedResultError(result.Error) {
 					disableCooling := m.cooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, result.Model)
@@ -3979,7 +3991,7 @@ func (m *Manager) markResult(ctx context.Context, result Result) {
 					auth.UpdatedAt = now
 					updateAggregatedAvailability(auth, now)
 				}
-			} else {
+			} else if failureScope == providererror.ScopeAccount {
 				disableCooling := m.cooldownDisabledForAuth(auth)
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			}
@@ -4283,6 +4295,7 @@ func resultErrorFromError(err error) *Error {
 		resultErr.HTTPStatus = statusCodeFromError(err)
 	}
 	if detail, ok := providererror.FromError(err); ok {
+		detail = providererror.Sanitize(detail)
 		if code := strings.TrimSpace(detail.Code); code != "" {
 			resultErr.Code = code
 		}
@@ -4494,37 +4507,118 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 }
 
 func isRequestScopedResultError(err *Error) bool {
-	return err != nil &&
-		(err.Code == requestScopedErrorCode ||
-			err.Code == requestCanceledErrorCode ||
-			isRequestInvalidResultError(err) ||
-			isRequestScopedNotFoundResultError(err))
+	return resultErrorFailureScope(err) == providererror.ScopeRequest
 }
 
 func isRequestInvalidResultError(err *Error) bool {
-	if err == nil ||
-		isCloudflareChallengeResultError(err) ||
-		isInvalidGrantResultError(err) ||
-		isModelSupportResultError(err) {
-		return false
+	return resultErrorFailureScope(err) == providererror.ScopeRequest
+}
+
+func resultErrorFailureScope(err *Error) providererror.FailureScope {
+	if err == nil {
+		return ""
 	}
+	code := strings.ToLower(strings.TrimSpace(err.Code))
+	switch code {
+	case requestScopedErrorCode, requestCanceledErrorCode,
+		"invalid_request_error", "bad_request_error", "invalid_argument",
+		"failed_precondition", "context_window_exceeded", "context_too_large",
+		"context_length_exceeded", "message_too_big", "previous_response_not_found":
+		return providererror.ScopeRequest
+	case "authentication_error", "unauthorized", "invalid_grant", "billing_error",
+		"permission_error", "payment_required":
+		return providererror.ScopeAccount
+	case "credits_required", "rate_limit", "rate_limit_error", "rate_limited", "quota_exhausted",
+		"api_error", "server_error", "timeout_error", "overloaded_error",
+		"provider_stream_error", "provider_stream_incomplete", "transport_error",
+		"model_not_supported", "model_unavailable", "model_not_found":
+		return providererror.ScopeModel
+	}
+	// Compatibility path for legacy executors that have not adopted
+	// providererror.Detail yet. Keep the old, narrow recognizers so the new
+	// taxonomy can ship without changing existing routing behavior.
+	if code == "" && (isCloudflareChallengeResultError(err) ||
+		isInvalidGrantResultError(err) ||
+		isModelSupportResultError(err)) {
+		return providererror.ScopeModel
+	}
+
+	// These statuses are request-shape proof on their own. Legacy model
+	// support was excluded immediately above.
+	if status := statusCodeFromResult(err); status == http.StatusRequestEntityTooLarge || status == http.StatusUnprocessableEntity {
+		return providererror.ScopeRequest
+	}
+	if code != "" {
+		// Unknown machine codes fail closed. Human text must never override a
+		// machine-readable classification supplied by a provider or plugin.
+		return ""
+	}
+
 	switch statusCodeFromResult(err) {
 	case http.StatusBadRequest:
-		message := err.Message
-		return strings.Contains(message, "invalid_request_error") ||
-			strings.Contains(message, "bad_request_error") ||
-			strings.Contains(message, "INVALID_ARGUMENT") ||
-			strings.Contains(message, "FAILED_PRECONDITION")
+		if isLegacyStructuredRequestErrorMessage(err.Message) {
+			return providererror.ScopeRequest
+		}
+		return ""
 	case http.StatusNotFound:
-		return isRequestScopedNotFoundMessage(err.Message)
-	case http.StatusUnprocessableEntity:
-		return true
+		if isRequestScopedNotFoundMessage(err.Message) {
+			return providererror.ScopeRequest
+		}
+		return ""
 	case http.StatusInternalServerError:
-		return strings.Contains(err.Message, `"status":"UNKNOWN"`) ||
-			strings.Contains(err.Message, `"status": "UNKNOWN"`)
+		if isLegacyStructuredRequestErrorMessage(err.Message) {
+			return providererror.ScopeRequest
+		}
+		return providererror.ScopeModel
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout, 529:
+		return providererror.ScopeModel
 	default:
+		return ""
+	}
+}
+
+func isLegacyStructuredRequestErrorMessage(message string) bool {
+	message = strings.TrimSpace(message)
+	if message == "" || !json.Valid([]byte(message)) {
 		return false
 	}
+	var payload any
+	if errUnmarshal := json.Unmarshal([]byte(message), &payload); errUnmarshal != nil {
+		return false
+	}
+	var walk func(any) bool
+	walk = func(value any) bool {
+		switch typed := value.(type) {
+		case map[string]any:
+			for key, item := range typed {
+				if text, ok := item.(string); ok {
+					identifier := strings.ToLower(strings.TrimSpace(text))
+					switch strings.ToLower(strings.TrimSpace(key)) {
+					case "type", "status":
+						if identifier == "invalid_request_error" ||
+							identifier == "bad_request_error" ||
+							identifier == "invalid_argument" ||
+							identifier == "failed_precondition" ||
+							identifier == "unknown" {
+							return true
+						}
+					}
+				}
+				if walk(item) {
+					return true
+				}
+			}
+		case []any:
+			for _, item := range typed {
+				if walk(item) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(payload)
 }
 
 func isCountTokensEndpointNotFoundError(err error, requestedModel string) bool {
@@ -4733,34 +4827,20 @@ func isRequestInvalidError(err error) bool {
 	if isRequestScopedError(err) {
 		return true
 	}
-	if isCloudflareChallengeError(err) {
-		return false
+	if detail, ok := providererror.FromError(err); ok &&
+		detail.TaxonomyVersion == providererror.FailureTaxonomyV1 {
+		return detail.Scope == providererror.ScopeRequest
 	}
-	if isInvalidGrantError(err) {
-		return false
+	code := ""
+	var coded interface{ ErrorCode() string }
+	if errors.As(err, &coded) && coded != nil {
+		code = strings.TrimSpace(coded.ErrorCode())
 	}
-	if isModelSupportError(err) {
-		return false
-	}
-	status := statusCodeFromError(err)
-	switch status {
-	case http.StatusBadRequest:
-		msg := err.Error()
-		return strings.Contains(msg, "invalid_request_error") ||
-			strings.Contains(msg, "bad_request_error") ||
-			strings.Contains(msg, "INVALID_ARGUMENT") ||
-			strings.Contains(msg, "FAILED_PRECONDITION")
-	case http.StatusNotFound:
-		return isRequestScopedNotFoundMessage(err.Error())
-	case http.StatusUnprocessableEntity:
-		return true
-	case http.StatusInternalServerError:
-		msg := err.Error()
-		return strings.Contains(msg, "\"status\":\"UNKNOWN\"") ||
-			strings.Contains(msg, "\"status\": \"UNKNOWN\"")
-	default:
-		return false
-	}
+	return resultErrorFailureScope(&Error{
+		Code:       code,
+		Message:    err.Error(),
+		HTTPStatus: statusCodeFromError(err),
+	}) == providererror.ScopeRequest
 }
 
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling bool) {

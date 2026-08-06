@@ -539,25 +539,6 @@ func claudeProviderStreamError(line []byte) error {
 		}
 	}
 
-	errorType := strings.TrimSpace(root.Get("error.type").String())
-	rawMessage := strings.TrimSpace(root.Get("error.message").String())
-	if claudeContextWindowSignal(errorType, rawMessage) {
-		message := providererror.Sanitize(providererror.Detail{Message: rawMessage}).Message
-		if message == "" {
-			message = "Input exceeds the provider model's context window."
-		}
-		code := errorType
-		if code == "" {
-			code = "context_window_exceeded"
-		}
-		return &claudeStructuredStreamError{
-			status:    http.StatusBadRequest,
-			code:      code,
-			message:   message,
-			retryable: false,
-		}
-	}
-
 	if classification, ok := providererror.ParseAnthropicStandard(string(payload)); ok {
 		detail := providererror.Sanitize(classification.Detail)
 		return &claudeStructuredStreamError{
@@ -596,25 +577,6 @@ func claudeIncompleteStreamError() error {
 		message:   "The provider returned an incomplete stream before message completion.",
 		retryable: true,
 	}
-}
-
-func claudeContextWindowSignal(values ...string) bool {
-	for _, value := range values {
-		value = strings.ToLower(strings.TrimSpace(value))
-		for _, signal := range []string{
-			"context_length_exceeded",
-			"context_window_exceeded",
-			"context_too_large",
-			"input exceeds the context window",
-			"exceeds the context window of this model",
-			"maximum context length",
-		} {
-			if strings.Contains(value, signal) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
@@ -1101,7 +1063,7 @@ func claudeHTTPStatusError(status int, body []byte) statusErr {
 			providerError: &detail,
 		}
 	}
-	if classification, ok := providererror.ParseAnthropicStandard(raw); ok && classification.Retryable {
+	if classification, ok := providererror.ParseAnthropicStandard(raw); ok {
 		detail := providererror.Sanitize(classification.Detail)
 		return statusErr{
 			code:          classification.Status,

@@ -20,8 +20,9 @@ import (
 )
 
 type failOnceStreamExecutor struct {
-	mu    sync.Mutex
-	calls int
+	mu        sync.Mutex
+	calls     int
+	secondErr error
 }
 
 func (e *failOnceStreamExecutor) Identifier() string { return "codex" }
@@ -35,6 +36,9 @@ func (e *failOnceStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, 
 	e.calls++
 	call := e.calls
 	e.mu.Unlock()
+	if call > 1 && e.secondErr != nil {
+		return nil, e.secondErr
+	}
 
 	ch := make(chan coreexecutor.StreamChunk, 1)
 	if call == 1 {
@@ -471,7 +475,12 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 }
 
 func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError(t *testing.T) {
-	executor := &failOnceStreamExecutor{}
+	executor := &failOnceStreamExecutor{
+		secondErr: &coreauth.Error{
+			Code:    "auth_unavailable",
+			Message: "no auth available",
+		},
+	}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
@@ -535,8 +544,8 @@ func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError
 		t.Fatalf("message missing model context: %q", authErr.Message)
 	}
 
-	if executor.Calls() != 1 {
-		t.Fatalf("expected exactly one upstream call before retry path selection failure, got %d", executor.Calls())
+	if executor.Calls() != 2 {
+		t.Fatalf("expected the bootstrap attempt and one synchronous retry failure, got %d calls", executor.Calls())
 	}
 }
 

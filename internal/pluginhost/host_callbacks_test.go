@@ -389,7 +389,7 @@ func TestHostModelCallbackErrorPreservesRetryAfterWithoutHeader(t *testing.T) {
 		Code:             "credits_required",
 		Model:            "claude-fable-5",
 		ModelDisplayName: "Fable 5",
-		Scope:            "model",
+		Scope:            providererror.ScopeModel,
 		Reason:           "monthly_spend_limit",
 	}
 	errCall := newHostModelCallbackError(&interfaces.ErrorMessage{
@@ -408,7 +408,7 @@ func TestHostModelCallbackErrorPreservesRetryAfterWithoutHeader(t *testing.T) {
 		t.Fatalf("unmarshal callback envelope: %v", errUnmarshal)
 	}
 	if envelope.Error == nil ||
-		envelope.Error.Code != "rate_limited" ||
+		envelope.Error.Code != "credits_required" ||
 		envelope.Error.HTTPStatus != http.StatusTooManyRequests ||
 		!envelope.Error.Retryable ||
 		envelope.Error.RetryAfter != "23" ||
@@ -762,22 +762,23 @@ func TestHostModelStreamReadAndCloseValidateStreamID(t *testing.T) {
 func TestHostModelStreamReadReturnsPayloadAndTerminalError(t *testing.T) {
 	host := New()
 	providerDetail := providererror.Detail{
-		Type:             "rate_limit_error",
-		Code:             "credits_required",
-		Model:            "claude-fable-5",
-		ModelDisplayName: "Fable 5",
-		Scope:            "model",
-		Reason:           "monthly_spend_limit",
+		Type:            "invalid_request_error",
+		Code:            "context_window_exceeded",
+		Message:         "Input requires 1003466 tokens and exceeds the model context limit of 1000000 tokens.",
+		Scope:           providererror.ScopeRequest,
+		Reason:          "prompt_too_long",
+		TaxonomyVersion: providererror.FailureTaxonomyV1,
+		Class:           providererror.ClassContextWindow,
+		RequiredTokens:  1003466,
+		LimitTokens:     1000000,
 	}
 	chunks := make(chan handlers.ModelExecutionChunk, 2)
 	chunks <- handlers.ModelExecutionChunk{Payload: []byte("first")}
 	chunks <- handlers.ModelExecutionChunk{Err: &handlers.ModelExecutionStreamError{
-		Code:          "upstream_unavailable",
-		StatusCode:    http.StatusBadGateway,
-		Message:       "terminal boom",
-		Retryable:     true,
-		Headers:       http.Header{"Retry-After": []string{"3"}},
-		RetryAfter:    "3",
+		Code:          "context_window_exceeded",
+		StatusCode:    http.StatusBadRequest,
+		Message:       providerDetail.Message,
+		Retryable:     false,
 		ProviderError: &providerDetail,
 	}}
 	host.SetModelExecutor(&fakeHostModelExecutor{
@@ -815,18 +816,20 @@ func TestHostModelStreamReadReturnsPayloadAndTerminalError(t *testing.T) {
 	if errDecode != nil {
 		t.Fatalf("decode terminal response: %v", errDecode)
 	}
-	if !terminal.Done || terminal.Error != "terminal boom" || len(terminal.Payload) != 0 {
+	if !terminal.Done || terminal.Error != providerDetail.Message || len(terminal.Payload) != 0 {
 		t.Fatalf("terminal read = %#v, want done terminal error", terminal)
 	}
 	if terminal.ErrorDetail == nil ||
-		terminal.ErrorDetail.Code != "upstream_unavailable" ||
-		terminal.ErrorDetail.HTTPStatus != http.StatusBadGateway ||
-		!terminal.ErrorDetail.Retryable ||
-		terminal.ErrorDetail.Headers.Get("Retry-After") != "3" ||
-		terminal.ErrorDetail.RetryAfter != "3" ||
+		terminal.ErrorDetail.Code != "context_window_exceeded" ||
+		terminal.ErrorDetail.HTTPStatus != http.StatusBadRequest ||
+		terminal.ErrorDetail.Retryable ||
+		terminal.ErrorDetail.RetryAfter != "" ||
 		terminal.ErrorDetail.ProviderError == nil ||
-		terminal.ErrorDetail.ProviderError.Code != "credits_required" ||
-		terminal.ErrorDetail.ProviderError.Model != "claude-fable-5" {
+		terminal.ErrorDetail.ProviderError.Code != "context_window_exceeded" ||
+		terminal.ErrorDetail.ProviderError.Class != providererror.ClassContextWindow ||
+		terminal.ErrorDetail.ProviderError.Scope != providererror.ScopeRequest ||
+		terminal.ErrorDetail.ProviderError.RequiredTokens != 1003466 ||
+		terminal.ErrorDetail.ProviderError.LimitTokens != 1000000 {
 		t.Fatalf("terminal error detail = %#v", terminal.ErrorDetail)
 	}
 }

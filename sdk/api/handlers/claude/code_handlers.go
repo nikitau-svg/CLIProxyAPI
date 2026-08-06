@@ -434,6 +434,7 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 			}
 		}
 	}
+	handlers.WriteBravoTraceHeader(c, msg)
 	handlers.WriteRetryAfterHeader(c, msg)
 
 	body, err := json.Marshal(h.toClaudeError(msg))

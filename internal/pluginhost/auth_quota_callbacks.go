@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -34,8 +35,12 @@ type authQuotaHTTPDoer interface {
 }
 
 type authQuotaFailure struct {
-	code    string
-	message string
+	code       string
+	message    string
+	statusCode int
+	retryable  bool
+	retryAfter string
+	retryAt    time.Time
 }
 
 type authQuotaResult struct {
@@ -135,6 +140,15 @@ func (h *Host) callHostAuthQuotaGet(ctx context.Context, request []byte) ([]byte
 	}
 
 	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	scope := strings.ToLower(strings.TrimSpace(req.Scope))
+	if scope == "" {
+		scope = pluginapi.HostAuthQuotaScopeAll
+	}
+	switch scope {
+	case pluginapi.HostAuthQuotaScopeAll, pluginapi.HostAuthQuotaScopeUsage, pluginapi.HostAuthQuotaScopeProfile:
+	default:
+		return nil, fmt.Errorf("unsupported quota acquisition scope %q", scope)
+	}
 	response := newHostAuthQuotaResponse(auth, provider)
 	if provider != "claude" && provider != "codex" {
 		return marshalRPCResult(unknownHostAuthQuotaResponse(response, authQuotaFailure{
@@ -150,28 +164,81 @@ func (h *Host) callHostAuthQuotaGet(ctx context.Context, request []byte) ([]byte
 	defer cancel()
 
 	client := h.newHTTPClient(auth, provider)
-	var (
-		result  authQuotaResult
-		failure *authQuotaFailure
-	)
+	var result authQuotaResult
 	switch provider {
 	case "claude":
-		result, failure = fetchClaudeAuthQuota(fetchCtx, client, auth)
+		switch scope {
+		case pluginapi.HostAuthQuotaScopeUsage:
+			var failure *authQuotaFailure
+			result, failure = fetchClaudeAuthUsageQuota(fetchCtx, client, auth)
+			if failure != nil {
+				response.ObservedAt = time.Now().UTC()
+				return marshalRPCResult(unknownHostAuthQuotaUsageResponse(response, *failure))
+			}
+			applyUsageQuotaResult(&response, result)
+			return marshalRPCResult(response)
+		case pluginapi.HostAuthQuotaScopeProfile:
+			var failure *authQuotaFailure
+			result, failure = fetchClaudeAuthProfile(fetchCtx, client, auth)
+			if failure != nil {
+				response.ObservedAt = time.Now().UTC()
+				response.ProfileError = hostAuthQuotaError(*failure)
+				return marshalRPCResult(response)
+			}
+			applyProfileQuotaResult(&response, result)
+			return marshalRPCResult(response)
+		default:
+			var failure *authQuotaFailure
+			result, failure = fetchClaudeAuthQuota(fetchCtx, client, auth)
+			if failure != nil {
+				response.ObservedAt = time.Now().UTC()
+				return marshalRPCResult(unknownHostAuthQuotaUsageResponse(response, *failure))
+			}
+		}
 	case "codex":
+		if scope == pluginapi.HostAuthQuotaScopeProfile {
+			// Codex profile labels are derived from the signed local auth record;
+			// there is no separate provider profile endpoint to poll.
+			response.ProfileObservedAt = time.Now().UTC()
+			response.ObservedAt = response.ProfileObservedAt
+			return marshalRPCResult(response)
+		}
+		var failure *authQuotaFailure
 		result, failure = fetchCodexAuthQuota(fetchCtx, client, auth)
-	}
-	if failure != nil {
-		response.ObservedAt = time.Now().UTC()
-		return marshalRPCResult(unknownHostAuthQuotaResponse(response, *failure))
+		if failure != nil {
+			response.ObservedAt = time.Now().UTC()
+			return marshalRPCResult(unknownHostAuthQuotaUsageResponse(response, *failure))
+		}
 	}
 
-	response.WorkspaceLabel = result.workspaceLabel
-	response.AccountLabel = result.accountLabel
-	response.PlanLabel = result.planLabel
+	applyUsageQuotaResult(&response, result)
+	// Legacy all-scope callers receive the safe labels gathered with usage.
+	response.ProfileObservedAt = result.observedAt
+	return marshalRPCResult(response)
+}
+
+func applyUsageQuotaResult(response *pluginapi.HostAuthQuotaResponse, result authQuotaResult) {
+	if response == nil {
+		return
+	}
+	response.WorkspaceLabel = firstSafeQuotaLabel(result.workspaceLabel, response.WorkspaceLabel)
+	response.AccountLabel = firstSafeQuotaLabel(result.accountLabel, response.AccountLabel)
+	response.PlanLabel = firstSafeQuotaLabel(result.planLabel, response.PlanLabel)
 	response.ObservedAt = result.observedAt
+	response.UsageObservedAt = result.observedAt
 	response.Confidence = pluginapi.HostAuthQuotaConfidenceConfirmed
 	response.Windows = result.windows
-	return marshalRPCResult(response)
+}
+
+func applyProfileQuotaResult(response *pluginapi.HostAuthQuotaResponse, result authQuotaResult) {
+	if response == nil {
+		return
+	}
+	response.WorkspaceLabel = firstSafeQuotaLabel(result.workspaceLabel, response.WorkspaceLabel)
+	response.AccountLabel = firstSafeQuotaLabel(result.accountLabel, response.AccountLabel)
+	response.PlanLabel = firstSafeQuotaLabel(result.planLabel, response.PlanLabel)
+	response.ObservedAt = result.observedAt
+	response.ProfileObservedAt = result.observedAt
 }
 
 func newHostAuthQuotaResponse(auth *coreauth.Auth, provider string) pluginapi.HostAuthQuotaResponse {
@@ -196,16 +263,29 @@ func newHostAuthQuotaResponse(auth *coreauth.Auth, provider string) pluginapi.Ho
 }
 
 func unknownHostAuthQuotaResponse(response pluginapi.HostAuthQuotaResponse, failure authQuotaFailure) pluginapi.HostAuthQuotaResponse {
+	return unknownHostAuthQuotaUsageResponse(response, failure)
+}
+
+func unknownHostAuthQuotaUsageResponse(response pluginapi.HostAuthQuotaResponse, failure authQuotaFailure) pluginapi.HostAuthQuotaResponse {
 	response.Confidence = pluginapi.HostAuthQuotaConfidenceUnknown
 	response.Windows = make([]pluginapi.HostAuthQuotaWindow, 0)
-	response.Error = &pluginapi.HostAuthQuotaError{
-		Code:    failure.code,
-		Message: failure.message,
-	}
+	response.Error = hostAuthQuotaError(failure)
+	response.UsageError = hostAuthQuotaError(failure)
 	if response.ObservedAt.IsZero() {
 		response.ObservedAt = time.Now().UTC()
 	}
 	return response
+}
+
+func hostAuthQuotaError(failure authQuotaFailure) *pluginapi.HostAuthQuotaError {
+	return &pluginapi.HostAuthQuotaError{
+		Code:       failure.code,
+		Message:    failure.message,
+		StatusCode: failure.statusCode,
+		Retryable:  failure.retryable,
+		RetryAfter: failure.retryAfter,
+		RetryAt:    failure.retryAt,
+	}
 }
 
 func fetchClaudeAuthQuota(ctx context.Context, client authQuotaHTTPDoer, auth *coreauth.Auth) (authQuotaResult, *authQuotaFailure) {
@@ -249,6 +329,58 @@ func fetchClaudeAuthQuota(ctx context.Context, client authQuotaHTTPDoer, auth *c
 	return parseClaudeAuthQuota(usageBody, profileBody, observedAt, auth)
 }
 
+func fetchClaudeAuthUsageQuota(ctx context.Context, client authQuotaHTTPDoer, auth *coreauth.Auth) (authQuotaResult, *authQuotaFailure) {
+	token, failure := authQuotaAccessToken(auth)
+	if failure != nil {
+		return authQuotaResult{}, failure
+	}
+	headers := claudeQuotaHeaders(token)
+	usageBody, usageFailure := fetchAuthQuotaEndpoint(ctx, client, claudeQuotaUsageURL, headers)
+	if usageFailure != nil {
+		return authQuotaResult{}, usageFailure
+	}
+	return parseClaudeAuthQuota(usageBody, nil, time.Now().UTC(), auth)
+}
+
+func fetchClaudeAuthProfile(ctx context.Context, client authQuotaHTTPDoer, auth *coreauth.Auth) (authQuotaResult, *authQuotaFailure) {
+	token, failure := authQuotaAccessToken(auth)
+	if failure != nil {
+		return authQuotaResult{}, failure
+	}
+	profileBody, profileFailure := fetchAuthQuotaEndpoint(ctx, client, claudeQuotaProfileURL, claudeQuotaHeaders(token))
+	if profileFailure != nil {
+		return authQuotaResult{}, profileFailure
+	}
+	var profile claudeQuotaProfilePayload
+	if errDecode := decodeAuthQuotaJSON(profileBody, &profile); errDecode != nil {
+		return authQuotaResult{}, invalidQuotaPayloadFailure()
+	}
+	observedAt := time.Now().UTC()
+	return authQuotaResult{
+		workspaceLabel: firstSafeQuotaLabel(
+			claudeProfileOrganizationValue(profile.Organization, func(organization *claudeQuotaProfileOrganization) string { return organization.Name }),
+			authMetadataString(auth, "organization_name"),
+		),
+		accountLabel: firstSafeQuotaLabel(
+			claudeProfileAccountValue(profile.Account, func(account *claudeQuotaProfileAccount) string { return account.DisplayName }),
+			claudeProfileAccountValue(profile.Account, func(account *claudeQuotaProfileAccount) string { return account.FullName }),
+			claudeProfileAccountValue(profile.Account, func(account *claudeQuotaProfileAccount) string { return account.Email }),
+			authMetadataString(auth, "email"),
+		),
+		planLabel:  claudeQuotaPlanLabel(profile, auth),
+		observedAt: observedAt,
+	}, nil
+}
+
+func claudeQuotaHeaders(token string) http.Header {
+	return http.Header{
+		"Authorization":  []string{"Bearer " + token},
+		"Accept":         []string{"application/json"},
+		"Content-Type":   []string{"application/json"},
+		"anthropic-beta": []string{"oauth-2025-04-20"},
+	}
+}
+
 func fetchCodexAuthQuota(ctx context.Context, client authQuotaHTTPDoer, auth *coreauth.Auth) (authQuotaResult, *authQuotaFailure) {
 	token, failure := authQuotaAccessToken(auth)
 	if failure != nil {
@@ -272,8 +404,12 @@ func fetchCodexAuthQuota(ctx context.Context, client authQuotaHTTPDoer, auth *co
 }
 
 func fetchAuthQuotaEndpoint(ctx context.Context, client authQuotaHTTPDoer, url string, headers http.Header) ([]byte, *authQuotaFailure) {
+	return fetchAuthQuotaEndpointAt(ctx, client, url, headers, time.Now().UTC())
+}
+
+func fetchAuthQuotaEndpointAt(ctx context.Context, client authQuotaHTTPDoer, url string, headers http.Header, now time.Time) ([]byte, *authQuotaFailure) {
 	if client == nil {
-		return nil, &authQuotaFailure{code: "quota_unavailable", message: "host quota transport is unavailable"}
+		return nil, &authQuotaFailure{code: "transport_unavailable", message: "host quota transport is unavailable", retryable: true}
 	}
 	response, errDo := client.Do(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodGet,
@@ -281,15 +417,39 @@ func fetchAuthQuotaEndpoint(ctx context.Context, client authQuotaHTTPDoer, url s
 		Headers: cloneHeader(headers),
 	})
 	if errDo != nil {
-		return nil, &authQuotaFailure{code: "quota_unavailable", message: "live quota request failed"}
+		code := "transport_unavailable"
+		message := "live quota request failed"
+		if errors.Is(errDo, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			code = "timeout"
+			message = "live quota request timed out"
+		}
+		return nil, &authQuotaFailure{code: code, message: message, retryable: true}
 	}
 	if response.StatusCode == http.StatusUnauthorized {
-		return nil, &authQuotaFailure{code: "auth_stale", message: "provider rejected the current credential"}
+		return nil, &authQuotaFailure{code: "auth_stale", message: "provider rejected the current credential", statusCode: response.StatusCode}
+	}
+	if response.StatusCode == http.StatusForbidden {
+		return nil, &authQuotaFailure{code: "forbidden", message: "provider forbids quota discovery for this credential", statusCode: response.StatusCode}
+	}
+	if response.StatusCode == http.StatusTooManyRequests {
+		retryAfter := sanitizeQuotaRetryAfter(response.Headers.Get("Retry-After"))
+		return nil, &authQuotaFailure{
+			code: "rate_limited", message: "provider quota endpoint is rate-limited",
+			statusCode: response.StatusCode, retryable: true, retryAfter: retryAfter,
+			retryAt: parseQuotaRetryAfter(retryAfter, now),
+		}
+	}
+	if response.StatusCode >= http.StatusInternalServerError {
+		return nil, &authQuotaFailure{
+			code: "provider_unavailable", message: "provider quota endpoint is unavailable",
+			statusCode: response.StatusCode, retryable: true,
+		}
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return nil, &authQuotaFailure{
-			code:    "quota_unavailable",
-			message: fmt.Sprintf("provider quota endpoint returned HTTP %d", response.StatusCode),
+			code:       "quota_unavailable",
+			message:    fmt.Sprintf("provider quota endpoint returned HTTP %d", response.StatusCode),
+			statusCode: response.StatusCode,
 		}
 	}
 	if len(response.Body) == 0 {
@@ -299,6 +459,46 @@ func fetchAuthQuotaEndpoint(ctx context.Context, client authQuotaHTTPDoer, url s
 		return nil, &authQuotaFailure{code: "quota_response_invalid", message: "provider quota response is too large"}
 	}
 	return bytes.Clone(response.Body), nil
+}
+
+func sanitizeQuotaRetryAfter(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 128 {
+		return ""
+	}
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			return ""
+		}
+	}
+	return value
+}
+
+func parseQuotaRetryAfter(value string, now time.Time) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	if seconds, errParse := strconv.ParseInt(value, 10, 64); errParse == nil {
+		if seconds < 0 {
+			return time.Time{}
+		}
+		deadline := now.UTC().Add(time.Duration(seconds) * time.Second)
+		maximum := now.UTC().Add(24 * time.Hour)
+		if deadline.After(maximum) {
+			return maximum
+		}
+		return deadline
+	}
+	deadline, errParse := http.ParseTime(value)
+	if errParse != nil || deadline.Before(now.UTC()) {
+		return time.Time{}
+	}
+	maximum := now.UTC().Add(24 * time.Hour)
+	if deadline.After(maximum) {
+		return maximum
+	}
+	return deadline.UTC()
 }
 
 func parseClaudeAuthQuota(usageBody, profileBody []byte, observedAt time.Time, auth *coreauth.Auth) (authQuotaResult, *authQuotaFailure) {

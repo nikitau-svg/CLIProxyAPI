@@ -61,6 +61,9 @@ type compatibilityModelResponse struct {
 
 type compatibilityHostMetadata struct {
 	Type                      string                         `json:"type,omitempty"`
+	InputTokenLimit           int64                          `json:"input_token_limit,omitempty"`
+	ContextLength             int64                          `json:"context_length,omitempty"`
+	MaxCompletionTokens       int64                          `json:"max_completion_tokens,omitempty"`
 	SupportedParameters       []string                       `json:"supported_parameters"`
 	SupportedInputModalities  []string                       `json:"supported_input_modalities"`
 	SupportedOutputModalities []string                       `json:"supported_output_modalities"`
@@ -511,6 +514,9 @@ func capabilitySetContains(actual, required []string) bool {
 func compatibilityHostMetadataFromEntry(hostModel pluginapi.HostModelListEntry) *compatibilityHostMetadata {
 	metadata := &compatibilityHostMetadata{
 		Type:                      strings.TrimSpace(hostModel.Type),
+		InputTokenLimit:           hostModel.InputTokenLimit,
+		ContextLength:             hostModel.ContextLength,
+		MaxCompletionTokens:       hostModel.MaxCompletionTokens,
 		SupportedParameters:       normalizeStrings(hostModel.SupportedParameters),
 		SupportedInputModalities:  normalizeStrings(hostModel.SupportedInputModalities),
 		SupportedOutputModalities: normalizeStrings(hostModel.SupportedOutputModalities),

@@ -21,13 +21,17 @@ func (h *Host) callHostModelList(ctx context.Context, request []byte) ([]byte, e
 	if _, errContext := h.requiredModelCallbackContext(ctx, req.HostCallbackID); errContext != nil {
 		return nil, errContext
 	}
+	return marshalRPCResult(pluginapi.HostModelListResponse{Models: h.hostModelListSnapshot("")})
+}
 
+func (h *Host) hostModelListSnapshot(excludedProvider string) []pluginapi.HostModelListEntry {
 	modelRegistry := registry.GetGlobalRegistry()
+	excludedProvider = strings.ToLower(strings.TrimSpace(excludedProvider))
 	entriesByKey := make(map[string]pluginapi.HostModelListEntry)
 	upsert := func(entry pluginapi.HostModelListEntry) {
 		entry.Provider = strings.ToLower(strings.TrimSpace(entry.Provider))
 		entry.ID = strings.TrimSpace(entry.ID)
-		if entry.Provider == "" || entry.ID == "" {
+		if entry.Provider == "" || entry.ID == "" || entry.Provider == excludedProvider {
 			return
 		}
 		key := entry.Provider + "\x00" + strings.ToLower(entry.ID)
@@ -36,27 +40,7 @@ func (h *Host) callHostModelList(ctx context.Context, request []byte) ([]byte, e
 			entriesByKey[key] = entry
 			return
 		}
-		current.Catalog = current.Catalog || entry.Catalog
-		current.Available = current.Available || entry.Available
-		if current.DisplayName == "" {
-			current.DisplayName = entry.DisplayName
-		}
-		if current.Type == "" {
-			current.Type = entry.Type
-		}
-		if len(current.SupportedParameters) == 0 {
-			current.SupportedParameters = append([]string(nil), entry.SupportedParameters...)
-		}
-		if len(current.SupportedInputModalities) == 0 {
-			current.SupportedInputModalities = append([]string(nil), entry.SupportedInputModalities...)
-		}
-		if len(current.SupportedOutputModalities) == 0 {
-			current.SupportedOutputModalities = append([]string(nil), entry.SupportedOutputModalities...)
-		}
-		if current.Thinking == nil {
-			current.Thinking = entry.Thinking
-		}
-		entriesByKey[key] = current
+		entriesByKey[key] = mergeHostModelListEntry(current, entry)
 	}
 
 	for _, info := range registry.GetClaudeModels() {
@@ -104,7 +88,57 @@ func (h *Host) callHostModelList(ctx context.Context, request []byte) ([]byte, e
 		}
 		return entries[i].Provider < entries[j].Provider
 	})
-	return marshalRPCResult(pluginapi.HostModelListResponse{Models: entries})
+	return entries
+}
+
+func mergeHostModelListEntry(current, incoming pluginapi.HostModelListEntry) pluginapi.HostModelListEntry {
+	// A reviewed catalog entry owns descriptive metadata. Live metadata only
+	// fills catalog gaps. If two reviewed sources disagree, preserve the lower
+	// non-zero capacity rather than advertising an unverified larger window.
+	if incoming.Catalog && !current.Catalog {
+		current, incoming = incoming, current
+	}
+	bothReviewed := current.Catalog && incoming.Catalog
+	current.Catalog = current.Catalog || incoming.Catalog
+	current.Available = current.Available || incoming.Available
+	if current.DisplayName == "" {
+		current.DisplayName = incoming.DisplayName
+	}
+	if current.Type == "" {
+		current.Type = incoming.Type
+	}
+	if len(current.SupportedParameters) == 0 {
+		current.SupportedParameters = append([]string(nil), incoming.SupportedParameters...)
+	}
+	if len(current.SupportedInputModalities) == 0 {
+		current.SupportedInputModalities = append([]string(nil), incoming.SupportedInputModalities...)
+	}
+	if len(current.SupportedOutputModalities) == 0 {
+		current.SupportedOutputModalities = append([]string(nil), incoming.SupportedOutputModalities...)
+	}
+	if current.Thinking == nil {
+		current.Thinking = incoming.Thinking
+	}
+	current.InputTokenLimit = mergeReviewedModelLimit(current.InputTokenLimit, incoming.InputTokenLimit, bothReviewed)
+	current.ContextLength = mergeReviewedModelLimit(current.ContextLength, incoming.ContextLength, bothReviewed)
+	current.MaxCompletionTokens = mergeReviewedModelLimit(current.MaxCompletionTokens, incoming.MaxCompletionTokens, bothReviewed)
+	return current
+}
+
+func mergeReviewedModelLimit(current, incoming int64, bothReviewed bool) int64 {
+	if current <= 0 {
+		if incoming > 0 {
+			return incoming
+		}
+		return 0
+	}
+	if incoming <= 0 || !bothReviewed {
+		return current
+	}
+	if incoming < current {
+		return incoming
+	}
+	return current
 }
 
 func hostModelListEntry(provider string, info *registry.ModelInfo, catalog, available bool) pluginapi.HostModelListEntry {
@@ -116,6 +150,9 @@ func hostModelListEntry(provider string, info *registry.ModelInfo, catalog, avai
 		ID:                        strings.TrimSpace(info.ID),
 		DisplayName:               strings.TrimSpace(info.DisplayName),
 		Type:                      strings.TrimSpace(info.Type),
+		InputTokenLimit:           positiveModelLimit(info.InputTokenLimit),
+		ContextLength:             positiveModelLimit(info.ContextLength),
+		MaxCompletionTokens:       positiveModelLimit(info.MaxCompletionTokens),
 		SupportedParameters:       append([]string(nil), info.SupportedParameters...),
 		SupportedInputModalities:  append([]string(nil), info.SupportedInputModalities...),
 		SupportedOutputModalities: append([]string(nil), info.SupportedOutputModalities...),
@@ -140,4 +177,11 @@ func hostModelListEntry(provider string, info *registry.ModelInfo, catalog, avai
 		sort.Strings(entry.Thinking.Levels)
 	}
 	return entry
+}
+
+func positiveModelLimit(value int) int64 {
+	if value <= 0 {
+		return 0
+	}
+	return int64(value)
 }

@@ -224,7 +224,7 @@ func TestAllocatorBypassIsLogged(t *testing.T) {
 		t.Fatalf("logged %d entries, want 1", len(logged))
 	}
 	message, _ := logged[0]["message"].(string)
-	if !strings.Contains(message, "allocator withheld") {
+	if !strings.Contains(message, "резервного порога") {
 		t.Fatalf("log message = %q, want it to name the allocator override", message)
 	}
 }

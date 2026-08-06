@@ -80,7 +80,7 @@ func TestBravoFinalErrorPreservesCreditsAndContextFailures(t *testing.T) {
 	if env.OK || env.Error == nil {
 		t.Fatalf("response = %s, want a composite terminal failure", raw)
 	}
-	for _, want := range []string{"Fable 5", "monthly spend", "gpt-5.6-sol", "context window"} {
+	for _, want := range []string{"Fable 5", "лимит расходов", "gpt-5.6-sol", "контекст переписки"} {
 		if !strings.Contains(env.Error.Message, want) {
 			t.Errorf("final message = %q, missing %q", env.Error.Message, want)
 		}

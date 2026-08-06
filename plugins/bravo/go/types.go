@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.7.10"
+	pluginVersion    = "0.8.0"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -88,21 +88,28 @@ type hostAuthListResponse struct {
 }
 
 type pluginConfig struct {
-	Enabled                   bool                    `yaml:"enabled" json:"enabled"`
-	Prefix                    string                  `yaml:"prefix" json:"prefix"`
-	RequireSmartKey           bool                    `yaml:"require_smart_key" json:"require_smart_key"`
-	MaxAttempts               int                     `yaml:"max_attempts" json:"max_attempts"`
-	CooldownSeconds           int                     `yaml:"cooldown_seconds" json:"cooldown_seconds"`
-	FallbackHedgeDelaySeconds int                     `yaml:"fallback_hedge_delay_seconds" json:"fallback_hedge_delay_seconds"`
-	StatePath                 string                  `yaml:"state_path" json:"state_path"`
-	AllocatorMode             string                  `yaml:"allocator_mode" json:"allocator_mode"`
-	QuotaRefreshSeconds       int                     `yaml:"quota_refresh_seconds" json:"quota_refresh_seconds"`
-	UnknownSecondaryPolicy    string                  `yaml:"unknown_secondary_policy" json:"unknown_secondary_policy"`
-	Tariffs                   []tariffConfig          `yaml:"tariffs" json:"tariffs"`
-	Subscriptions             []subscriptionConfig    `yaml:"subscriptions" json:"subscriptions"`
-	SmartKeys                 []smartKeyConfig        `yaml:"smart_keys" json:"smart_keys"`
-	RouteOverrides            []routeOverrideConfig   `yaml:"route_overrides" json:"route_overrides"`
-	Models                    map[string]logicalModel `yaml:"models" json:"models"`
+	Enabled                           bool                    `yaml:"enabled" json:"enabled"`
+	Prefix                            string                  `yaml:"prefix" json:"prefix"`
+	RequireSmartKey                   bool                    `yaml:"require_smart_key" json:"require_smart_key"`
+	MaxAttempts                       int                     `yaml:"max_attempts" json:"max_attempts"`
+	CooldownSeconds                   int                     `yaml:"cooldown_seconds" json:"cooldown_seconds"`
+	CompactBypassCooldownSeconds      int                     `yaml:"compact_bypass_cooldown_seconds" json:"compact_bypass_cooldown_seconds"`
+	FallbackHedgeDelaySeconds         int                     `yaml:"fallback_hedge_delay_seconds" json:"fallback_hedge_delay_seconds"`
+	StatePath                         string                  `yaml:"state_path" json:"state_path"`
+	AllocatorMode                     string                  `yaml:"allocator_mode" json:"allocator_mode"`
+	QuotaRefreshSeconds               int                     `yaml:"quota_refresh_seconds" json:"quota_refresh_seconds"`
+	QuotaUsageRefreshSeconds          int                     `yaml:"quota_usage_refresh_seconds" json:"quota_usage_refresh_seconds"`
+	QuotaUsageMaxStaleSeconds         int                     `yaml:"quota_usage_max_stale_seconds" json:"quota_usage_max_stale_seconds"`
+	QuotaProfileRefreshSeconds        int                     `yaml:"quota_profile_refresh_seconds" json:"quota_profile_refresh_seconds"`
+	QuotaRefreshJitterPercent         int                     `yaml:"quota_refresh_jitter_percent" json:"quota_refresh_jitter_percent"`
+	QuotaRefreshProviderMinIntervalMS int                     `yaml:"quota_refresh_provider_min_interval_ms" json:"quota_refresh_provider_min_interval_ms"`
+	QuotaRefreshProviderConcurrency   int                     `yaml:"quota_refresh_provider_concurrency" json:"quota_refresh_provider_concurrency"`
+	UnknownSecondaryPolicy            string                  `yaml:"unknown_secondary_policy" json:"unknown_secondary_policy"`
+	Tariffs                           []tariffConfig          `yaml:"tariffs" json:"tariffs"`
+	Subscriptions                     []subscriptionConfig    `yaml:"subscriptions" json:"subscriptions"`
+	SmartKeys                         []smartKeyConfig        `yaml:"smart_keys" json:"smart_keys"`
+	RouteOverrides                    []routeOverrideConfig   `yaml:"route_overrides" json:"route_overrides"`
+	Models                            map[string]logicalModel `yaml:"models" json:"models"`
 	// BaseModels is the normalized pre-override model map. It is runtime-only so
 	// deleting an override can restore the configured/default route exactly.
 	BaseModels map[string]logicalModel `yaml:"-" json:"-"`
@@ -174,16 +181,20 @@ type candidate struct {
 }
 
 type executionAttempt struct {
-	LogicalModel       string
-	Candidate          candidate
-	Auth               pluginapi.HostAuthFileEntry
-	RequestedEffort    string
-	EffectiveEffort    string
-	ProjectID          string
-	Primary            bool
-	AllocatorManaged   bool
-	ReservationPercent float64
-	TariffID           string
+	LogicalModel                 string
+	Candidate                    candidate
+	Auth                         pluginapi.HostAuthFileEntry
+	RequestedEffort              string
+	EffectiveEffort              string
+	ProjectID                    string
+	Primary                      bool
+	AllocatorManaged             bool
+	ReservationPercent           float64
+	TariffID                     string
+	CompactBypass                bool
+	CompactBypassKey             string
+	CompactBypassCooldownSeconds int
+	PreflightRejections          []candidateRejection
 }
 
 type attemptRecord struct {
@@ -210,6 +221,7 @@ type attemptRecord struct {
 	ProviderDisabledReason   string    `json:"provider_disabled_reason,omitempty"`
 	ProviderErrorReason      string    `json:"provider_error_reason,omitempty"`
 	Scope                    string    `json:"scope,omitempty"`
+	CompactBypass            bool      `json:"compact_bypass,omitempty"`
 	LatencyMS                int64     `json:"latency_ms"`
 }
 

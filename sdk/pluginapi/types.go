@@ -374,6 +374,10 @@ type ModelRegistrar interface {
 type ModelRegistrationRequest struct {
 	// Plugin is the metadata of the plugin being registered.
 	Plugin Metadata
+	// HostModels is a redacted reviewed host-catalog snapshot. It lets a model
+	// registrar describe logical/router models without inventing physical model
+	// limits. Older hosts leave it empty and older plugins ignore it.
+	HostModels []HostModelListEntry
 }
 
 // ModelRegistrationResponse returns provider and model metadata to register.
@@ -731,6 +735,15 @@ type HostModelListEntry struct {
 	DisplayName string `json:"display_name,omitempty"`
 	// Type is the registry model capability family.
 	Type string `json:"type,omitempty"`
+	// InputTokenLimit is the maximum accepted input token count. Zero means
+	// unknown, not unlimited.
+	InputTokenLimit int64 `json:"input_token_limit,omitempty"`
+	// ContextLength is the maximum combined context length. Zero means unknown,
+	// not unlimited.
+	ContextLength int64 `json:"context_length,omitempty"`
+	// MaxCompletionTokens is the maximum completion token count. Zero means
+	// unknown, not unlimited.
+	MaxCompletionTokens int64 `json:"max_completion_tokens,omitempty"`
 	// SupportedParameters lists parameters advertised by the host registry.
 	SupportedParameters []string `json:"supported_parameters,omitempty"`
 	// SupportedInputModalities lists accepted input modalities.
@@ -929,6 +942,14 @@ const (
 	// HostAuthQuotaResetModeNotApplicable means the provider does not expose
 	// this class of quota window for the current plan.
 	HostAuthQuotaResetModeNotApplicable = "not_applicable"
+
+	// HostAuthQuotaScopeAll preserves the original callback behaviour and asks
+	// the host for every quota resource it supports.
+	HostAuthQuotaScopeAll = "all"
+	// HostAuthQuotaScopeUsage asks only for provider-confirmed usage windows.
+	HostAuthQuotaScopeUsage = "usage"
+	// HostAuthQuotaScopeProfile asks only for safe account/workspace metadata.
+	HostAuthQuotaScopeProfile = "profile"
 )
 
 // HostAuthQuotaRequest asks the host to acquire live quota for one exact runtime
@@ -936,6 +957,9 @@ const (
 type HostAuthQuotaRequest struct {
 	// AuthIndex identifies the exact runtime credential.
 	AuthIndex string `json:"auth_index"`
+	// Scope is usage, profile, or all. Empty is treated as all for compatibility
+	// with plugins built before scoped quota acquisition was introduced.
+	Scope string `json:"scope,omitempty"`
 }
 
 // HostAuthQuotaError is a safe, machine-readable acquisition failure. It never
@@ -945,6 +969,15 @@ type HostAuthQuotaError struct {
 	Code string `json:"code"`
 	// Message is a safe human-readable description.
 	Message string `json:"message"`
+	// StatusCode is the reviewed upstream HTTP status when one was received.
+	StatusCode int `json:"status_code,omitempty"`
+	// Retryable reports whether retrying the quota acquisition can succeed
+	// without changing the credential or request.
+	Retryable bool `json:"retryable,omitempty"`
+	// RetryAfter preserves a sanitized Retry-After header value.
+	RetryAfter string `json:"retry_after,omitempty"`
+	// RetryAt is the parsed UTC retry deadline when Retry-After was valid.
+	RetryAt time.Time `json:"retry_at,omitempty"`
 }
 
 // HostAuthQuotaWindow is a normalized, provider-confirmed quota window.
@@ -984,10 +1017,20 @@ type HostAuthQuotaResponse struct {
 	PlanLabel string `json:"plan_label"`
 	// ObservedAt is when the live provider response was validated.
 	ObservedAt time.Time `json:"observed_at"`
+	// UsageObservedAt is the observation time for confirmed usage windows.
+	UsageObservedAt time.Time `json:"usage_observed_at,omitempty"`
+	// ProfileObservedAt is the observation time for safe profile metadata.
+	ProfileObservedAt time.Time `json:"profile_observed_at,omitempty"`
 	// Confidence is confirmed or unknown.
 	Confidence string `json:"confidence"`
 	// Error explains why Confidence is unknown.
 	Error *HostAuthQuotaError `json:"error,omitempty"`
+	// UsageError reports a usage acquisition failure independently from profile
+	// metadata. Error remains its compatibility alias.
+	UsageError *HostAuthQuotaError `json:"usage_error,omitempty"`
+	// ProfileError reports a profile acquisition failure without invalidating
+	// confirmed usage windows.
+	ProfileError *HostAuthQuotaError `json:"profile_error,omitempty"`
 	// Windows contains only fully validated windows.
 	Windows []HostAuthQuotaWindow `json:"windows"`
 }

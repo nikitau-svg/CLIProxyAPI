@@ -24,6 +24,7 @@ type bravoStreamAttemptRun struct {
 	releaseLease  func(bool)
 	releaseOnce   sync.Once
 	finalized     atomic.Bool
+	traceRecorder *routeTraceRecorder
 }
 
 type bravoStreamBootstrapResult struct {
@@ -40,6 +41,7 @@ func launchBravoStreamAttempt(
 	callbackID string,
 	ownsScope bool,
 	releaseLease func(bool),
+	traceRecorder *routeTraceRecorder,
 ) *bravoStreamAttemptRun {
 	run := &bravoStreamAttemptRun{
 		attempt:       attempt,
@@ -50,6 +52,7 @@ func launchBravoStreamAttempt(
 		started:       time.Now(),
 		results:       make(chan bravoStreamBootstrapResult, 1),
 		releaseLease:  releaseLease,
+		traceRecorder: traceRecorder,
 	}
 	go run.execute(req, protocol)
 	return run
@@ -160,6 +163,7 @@ func (r *bravoStreamAttemptRun) supersede() {
 		Status:  499,
 	}
 	recordExecutionAttempt(r.attempt, r.started, failure.Status, false, failure)
+	r.traceRecorder.superseded(r.attempt, r.started)
 }
 
 func (r *bravoStreamAttemptRun) cancelWithRequest(failure executionFailure) {

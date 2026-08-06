@@ -8,6 +8,79 @@ import (
 
 const creditsRequiredPayload = `{"type":"error","error":{"type":"rate_limit_error","message":"Usage credits are required for this model.","details":{"error_code":"credits_required","notice":{"title":"You've hit your monthly spend limit","text":"Ask your admin to raise your spend limit, or switch models to continue this chat.","cta":{"copy":"Switch models","intent":"switch_model","redirect_hint":null},"is_dismissible":true},"model_display_name":"Fable 5","can_user_purchase_credits":false,"model":"claude-fable-5","has_chargeable_saved_payment_method":true,"disabled_reason":"org_level_disabled_until","exhausted_included_allowance":false}},"request_id":"req_must_not_be_retained"}`
 
+const anthropicPromptTooLongPayload = `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1003466 tokens > 1000000 maximum"},"request_id":"req_context_private"}`
+
+func TestParseAnthropicPromptTooLongReturnsSafeTypedContextFailure(t *testing.T) {
+	t.Parallel()
+
+	classification, ok := ParseAnthropicStandard(anthropicPromptTooLongPayload)
+	if !ok {
+		t.Fatal("ParseAnthropicStandard() did not recognize prompt-too-long")
+	}
+	want := Classification{
+		Detail: Detail{
+			Type:            "invalid_request_error",
+			Code:            "context_window_exceeded",
+			Message:         "Input requires 1003466 tokens and exceeds the model context limit of 1000000 tokens.",
+			Scope:           ScopeRequest,
+			Reason:          "prompt_too_long",
+			TaxonomyVersion: FailureTaxonomyV1,
+			Class:           ClassContextWindow,
+			RequiredTokens:  1003466,
+			LimitTokens:     1000000,
+		},
+		Status:    400,
+		Retryable: false,
+	}
+	if classification != want {
+		t.Fatalf("classification = %#v, want %#v", classification, want)
+	}
+
+	serialized, err := json.Marshal(classification)
+	if err != nil {
+		t.Fatalf("marshal classification: %v", err)
+	}
+	for _, forbidden := range []string{"req_context_private", "request_id", "prompt is too long"} {
+		if strings.Contains(string(serialized), forbidden) {
+			t.Fatalf("classification retained forbidden provider text %q: %s", forbidden, serialized)
+		}
+	}
+}
+
+func TestParseAnthropicPromptTooLongFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []string{
+		"prompt is too long: 1000000 tokens > 1000000 maximum",
+		"prompt is too long: 999999 tokens > 1000000 maximum",
+		"prompt is too long: 0 tokens > 1000000 maximum",
+		"prompt is too long: 1000000000001 tokens > 1 maximum",
+		"prompt is too long: 1003466 tokens > 1000000 maximum request_id=req_private",
+	}
+	for _, message := range tests {
+		payload := `{"type":"error","error":{"type":"invalid_request_error","message":` + string(mustJSON(t, message)) + `}}`
+		classification, ok := ParseAnthropicStandard(payload)
+		if !ok {
+			t.Fatalf("generic invalid_request_error was not recognized for %q", message)
+		}
+		if classification.Detail.Class == ClassContextWindow ||
+			classification.Detail.Code == "context_window_exceeded" ||
+			classification.Detail.RequiredTokens != 0 ||
+			classification.Detail.LimitTokens != 0 {
+			t.Fatalf("unsafe prompt-too-long variant was classified as context: %#v", classification)
+		}
+	}
+}
+
+func mustJSON(t *testing.T, value string) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 func TestParseCreditsRequired(t *testing.T) {
 	t.Parallel()
 
@@ -27,6 +100,8 @@ func TestParseCreditsRequired(t *testing.T) {
 		DisabledReason:   "org_level_disabled_until",
 		Scope:            "model",
 		Reason:           "monthly_spend_limit",
+		TaxonomyVersion:  FailureTaxonomyV1,
+		Class:            ClassQuota,
 	}
 	if detail != want {
 		t.Fatalf("Parse() = %#v, want %#v", detail, want)
@@ -73,6 +148,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 		wantStatus    int
 		wantRetryable bool
 		wantScope     string
+		wantClass     FailureClass
 		wantMessage   string
 	}{
 		{
@@ -81,6 +157,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    400,
 			wantRetryable: false,
 			wantScope:     "request",
+			wantClass:     ClassInvalidRequest,
 			wantMessage:   "The provider rejected the request.",
 		},
 		{
@@ -89,6 +166,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    401,
 			wantRetryable: true,
 			wantScope:     "account",
+			wantClass:     ClassAuthentication,
 			wantMessage:   "The provider rejected the subscription credentials.",
 		},
 		{
@@ -97,6 +175,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    402,
 			wantRetryable: true,
 			wantScope:     "account",
+			wantClass:     ClassBilling,
 			wantMessage:   "The provider reported a billing restriction.",
 		},
 		{
@@ -105,6 +184,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    403,
 			wantRetryable: true,
 			wantScope:     "account",
+			wantClass:     ClassPermission,
 			wantMessage:   "The provider denied this subscription access.",
 		},
 		{
@@ -113,6 +193,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    404,
 			wantRetryable: false,
 			wantScope:     "request",
+			wantClass:     ClassNotFound,
 			wantMessage:   "The provider could not find the requested resource.",
 		},
 		{
@@ -121,6 +202,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    409,
 			wantRetryable: false,
 			wantScope:     "request",
+			wantClass:     ClassConflict,
 			wantMessage:   "The request conflicts with provider state.",
 		},
 		{
@@ -129,6 +211,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    413,
 			wantRetryable: false,
 			wantScope:     "request",
+			wantClass:     ClassPayloadTooLarge,
 			wantMessage:   "The request exceeds the provider size limit.",
 		},
 		{
@@ -137,6 +220,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    429,
 			wantRetryable: true,
 			wantScope:     "model",
+			wantClass:     ClassRateLimit,
 			wantMessage:   "The provider rate limit was reached.",
 		},
 		{
@@ -145,6 +229,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    500,
 			wantRetryable: true,
 			wantScope:     "model",
+			wantClass:     ClassProviderInternal,
 			wantMessage:   "The provider encountered an internal error.",
 		},
 		{
@@ -153,6 +238,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    504,
 			wantRetryable: true,
 			wantScope:     "model",
+			wantClass:     ClassTimeout,
 			wantMessage:   "The provider timed out while processing the request.",
 		},
 		{
@@ -161,6 +247,7 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 			wantStatus:    529,
 			wantRetryable: true,
 			wantScope:     "model",
+			wantClass:     ClassOverloaded,
 			wantMessage:   "The provider is temporarily overloaded.",
 		},
 	}
@@ -181,10 +268,12 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 					classification, test.wantStatus, test.wantRetryable)
 			}
 			wantDetail := Detail{
-				Type:    test.errorType,
-				Code:    test.errorType,
-				Message: test.wantMessage,
-				Scope:   test.wantScope,
+				Type:            test.errorType,
+				Code:            test.errorType,
+				Message:         test.wantMessage,
+				Scope:           test.wantScope,
+				TaxonomyVersion: FailureTaxonomyV1,
+				Class:           test.wantClass,
 			}
 			if classification.Detail != wantDetail {
 				t.Fatalf("detail = %#v, want %#v", classification.Detail, wantDetail)

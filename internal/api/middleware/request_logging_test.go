@@ -250,14 +250,14 @@ func TestRequestLoggingMiddlewareCapturesLargeErrorRequestAndDeferredAPIRequest(
 	if errReadLog != nil {
 		t.Fatalf("read error log: %v", errReadLog)
 	}
-	if !bytes.Contains(content, payload) {
-		t.Fatal("error log does not contain the complete large request body")
+	if bytes.Contains(content, payload) {
+		t.Fatal("production error log leaked the complete large request body")
 	}
-	if !bytes.Contains(content, []byte("=== API REQUEST 1 ===")) {
-		t.Fatal("error log does not contain the deferred API request section")
+	if !bytes.Contains(content, []byte("[OMITTED: production error logs do not persist request bodies]")) {
+		t.Fatal("production error log does not explain that the request body was omitted")
 	}
-	if !bytes.Contains(content, upstreamBody) {
-		t.Fatal("error log does not contain the deferred upstream request body")
+	if bytes.Contains(content, []byte("=== API REQUEST 1 ===")) || bytes.Contains(content, upstreamBody) {
+		t.Fatal("production error log leaked the deferred upstream request")
 	}
 }
 

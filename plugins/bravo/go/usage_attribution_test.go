@@ -65,3 +65,36 @@ func TestUsageStateKeepsLogicalRouteAlongsidePhysicalDimensions(t *testing.T) {
 		t.Fatalf("total tokens = %d, want 42", got.Usage.Total.TotalTokens)
 	}
 }
+
+func TestUsageStateSeparatesFullDurationFromStreamingTTFT(t *testing.T) {
+	store := usageStateStore{state: newPersistedUsageState()}
+	store.record(pluginapi.UsageRecord{
+		Provider:    "anthropic",
+		Model:       "claude-fable-5",
+		Alias:       "bravo/fable",
+		APIKey:      "bravo:prj_alpha",
+		AuthIndex:   "claude-index-1",
+		RequestedAt: time.Now().UTC(),
+		Latency:     11 * time.Second,
+		TTFT:        850 * time.Millisecond,
+		Detail:      pluginapi.UsageDetail{TotalTokens: 10},
+	})
+	store.record(pluginapi.UsageRecord{
+		Provider:    "anthropic",
+		Model:       "claude-fable-5",
+		Alias:       "bravo/fable",
+		APIKey:      "bravo:prj_alpha",
+		AuthIndex:   "claude-index-1",
+		RequestedAt: time.Now().UTC(),
+		Latency:     9 * time.Second,
+		Detail:      pluginapi.UsageDetail{TotalTokens: 5},
+	})
+
+	summary := usageSummary(store.state.ProjectTotals["prj_alpha"], time.Now().UTC())
+	if summary.AverageLatencyMS != 10_000 {
+		t.Fatalf("average full duration = %v, want 10000ms", summary.AverageLatencyMS)
+	}
+	if summary.AverageTTFTMS != 850 {
+		t.Fatalf("average TTFT = %v, want 850ms from streaming samples only", summary.AverageTTFTMS)
+	}
+}

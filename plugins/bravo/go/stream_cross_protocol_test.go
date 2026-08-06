@@ -272,7 +272,7 @@ func TestBravoStreamPreContentContextOverflowIsRequestScopedAcrossClientProtocol
 			}
 			if observation.pluginClose.ErrorStatus != http.StatusBadRequest ||
 				observation.pluginClose.ErrorCode != "bravo_context_window_exceeded" ||
-				!strings.Contains(observation.pluginClose.Error, "context window") {
+				!strings.Contains(observation.pluginClose.Error, "контекст переписки") {
 				t.Fatalf("plugin stream close = %#v, want request-scoped context failure", observation.pluginClose)
 			}
 			assertCrossProtocolSafeDiagnostics(t, observation)

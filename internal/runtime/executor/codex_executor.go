@@ -2387,13 +2387,17 @@ func codexSafeProviderErrorDetail(body []byte) (providererror.Detail, bool) {
 	code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
 
 	message := ""
+	failureClass := providererror.FailureClass("")
 	switch errorType {
 	case "server_error", "api_error", "upstream_error":
 		message = "The provider encountered an internal error."
+		failureClass = providererror.ClassProviderInternal
 	case "timeout_error":
 		message = "The provider timed out while processing the request."
+		failureClass = providererror.ClassTimeout
 	case "overloaded_error":
 		message = "The provider is temporarily overloaded."
+		failureClass = providererror.ClassOverloaded
 	default:
 		return providererror.Detail{}, false
 	}
@@ -2404,10 +2408,12 @@ func codexSafeProviderErrorDetail(body []byte) (providererror.Detail, bool) {
 		return providererror.Detail{}, false
 	}
 	detail := providererror.Sanitize(providererror.Detail{
-		Type:    errorType,
-		Code:    code,
-		Message: message,
-		Scope:   "model",
+		Type:            errorType,
+		Code:            code,
+		Message:         message,
+		Scope:           providererror.ScopeModel,
+		Class:           failureClass,
+		TaxonomyVersion: providererror.FailureTaxonomyV1,
 	})
 	if detail.Type == "" || detail.Code == "" {
 		return providererror.Detail{}, false

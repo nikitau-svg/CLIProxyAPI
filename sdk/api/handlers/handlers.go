@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -254,6 +255,12 @@ func ErrorCodeFromError(err error) string {
 // the established OpenAI status-derived codes in place for ordinary
 // authentication, permission, and rate-limit failures.
 func PreservedErrorCode(status int, err error) string {
+	if detail, ok := providererror.FromError(err); ok {
+		detail = providererror.Sanitize(detail)
+		if code := strings.TrimSpace(detail.Code); code != "" {
+			return code
+		}
+	}
 	code := ErrorCodeFromError(err)
 	if code == "" || strings.EqualFold(code, "request_scoped") {
 		return ""
@@ -1028,8 +1035,9 @@ func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryPro
 		return nil, nil, executionErrorMessage(errExecute)
 	}
 	rawResponseHeaders := cloneHeader(resp.Headers)
-	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
+	responseHeaders := downstreamPluginHeadersFromExecutor(executorPluginID, rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
 	body, responseHeaders := h.applyResponseInterceptors(ctx, responseProtocol, modelName, originalRequestedModel, opts, rawResponseHeaders, responseHeaders, opts.OriginalRequest, req.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID)
+	responseHeaders = copyBravoControlHeaders(responseHeaders, rawResponseHeaders)
 	return body, responseHeaders, nil
 }
 
@@ -1046,7 +1054,7 @@ func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerTyp
 		return nil, nil, executionErrorMessage(errCount)
 	}
 	rawResponseHeaders := cloneHeader(resp.Headers)
-	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
+	responseHeaders := downstreamPluginHeadersFromExecutor(executorPluginID, rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
 	body, responseHeaders := h.applyResponseInterceptors(ctx, handlerType, modelName, originalRequestedModel, opts, rawResponseHeaders, responseHeaders, opts.OriginalRequest, req.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID)
 	return body, responseHeaders, nil
 }
@@ -1196,7 +1204,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
 	baseStreamHeaders := cloneHeader(streamResult.Headers)
-	upstreamHeaders := downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled)
+	upstreamHeaders := downstreamPluginHeadersFromExecutor(executorPluginID, rawStreamHeaders, passthroughHeadersEnabled)
 	if upstreamHeaders == nil && (passthroughHeadersEnabled || streamInterceptorsActive) {
 		upstreamHeaders = make(http.Header)
 	}
@@ -1207,6 +1215,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			return
 		}
 		nextHeaders := downstreamHeadersAfterInterceptors(baseStreamHeaders, rawStreamHeaders, passthroughHeadersEnabled)
+		copyBravoControlHeaders(nextHeaders, baseStreamHeaders)
 		replaceHeader(upstreamHeaders, nextHeaders)
 	}
 	if streamInterceptorsActive {
@@ -1961,6 +1970,41 @@ func downstreamHeadersFromExecutor(headers http.Header, passthrough bool) http.H
 	return FilterUpstreamHeaders(headers)
 }
 
+func downstreamPluginHeadersFromExecutor(pluginID string, headers http.Header, passthrough bool) http.Header {
+	out := downstreamHeadersFromExecutor(headers, passthrough)
+	if strings.EqualFold(strings.TrimSpace(pluginID), "bravo") {
+		out = copyBravoControlHeaders(out, headers)
+	}
+	return out
+}
+
+func copyBravoControlHeaders(dst, src http.Header) http.Header {
+	if src == nil {
+		return dst
+	}
+	traceID := strings.TrimSpace(src.Get("X-Bravo-Trace-Id"))
+	if validBravoTraceID(traceID) {
+		if dst == nil {
+			dst = make(http.Header)
+		}
+		dst.Set("X-Bravo-Trace-Id", traceID)
+	}
+	return dst
+}
+
+func validBravoTraceID(value string) bool {
+	if len(value) != len("trc_")+24 || !strings.HasPrefix(value, "trc_") {
+		return false
+	}
+	for _, char := range value[len("trc_"):] {
+		if (char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func downstreamHeadersAfterInterceptors(baseRaw, finalRaw http.Header, passthrough bool) http.Header {
 	if passthrough {
 		return FilterUpstreamHeaders(finalRaw)
@@ -2389,6 +2433,22 @@ func WriteRetryAfterHeader(c *gin.Context, msg *interfaces.ErrorMessage) {
 	c.Writer.Header().Set("Retry-After", retryAfter)
 }
 
+// WriteBravoTraceHeader exposes only the proxy-authored opaque Bravo trace ID.
+// It is independent of upstream header passthrough and rejects arbitrary values.
+func WriteBravoTraceHeader(c *gin.Context, msg *interfaces.ErrorMessage) {
+	if c == nil || msg == nil || msg.Error == nil || msg.Addon == nil || c.Writer.Written() {
+		return
+	}
+	code := PreservedErrorCode(msg.StatusCode, msg.Error)
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(code)), "bravo_") {
+		return
+	}
+	traceID := strings.TrimSpace(msg.Addon.Get("X-Bravo-Trace-Id"))
+	if validBravoTraceID(traceID) {
+		c.Writer.Header().Set("X-Bravo-Trace-Id", traceID)
+	}
+}
+
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
 	status := http.StatusInternalServerError
@@ -2406,6 +2466,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 			}
 		}
 	}
+	WriteBravoTraceHeader(c, msg)
 	WriteRetryAfterHeader(c, msg)
 
 	errText := http.StatusText(status)

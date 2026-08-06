@@ -28,8 +28,8 @@ func TestQuotaRefreshTTLPreventsPerRequestProviderPolling(t *testing.T) {
 		RefreshedAt: now.Add(-10 * time.Second),
 		Dirty:       true,
 	}
-	if quotaNeedsRefresh(quota, time.Minute, now) {
-		t.Fatal("dirty confirmed quota refreshed before the configured TTL")
+	if !quotaNeedsRefresh(quota, time.Minute, now) {
+		t.Fatal("dirty confirmed quota did not request an early background refresh")
 	}
 	if !quotaNeedsRefresh(quota, time.Minute, now.Add(time.Minute)) {
 		t.Fatal("quota did not refresh after the configured TTL")
@@ -59,7 +59,10 @@ func TestQuotaRefreshIgnoresSingleModelAggregatePoison(t *testing.T) {
 
 	previousFetch := fetchQuotaSnapshot
 	var calls atomic.Int64
-	fetchQuotaSnapshot = func(_ string, _ pluginapi.HostAuthFileEntry) (credentialQuotaState, error) {
+	fetchQuotaSnapshot = func(_ string, _ pluginapi.HostAuthFileEntry, resource string) (credentialQuotaState, error) {
+		if resource == quotaRefreshResourceProfile {
+			return credentialQuotaState{ProfileRefreshedAt: time.Now().UTC()}, nil
+		}
 		calls.Add(1)
 		return credentialQuotaState{
 			Confidence:  "unknown",
@@ -90,12 +93,14 @@ func TestQuotaRefreshIgnoresSingleModelAggregatePoison(t *testing.T) {
 	}
 
 	refreshQuotaSnapshots("quota-model-scope-callback", []pluginapi.HostAuthFileEntry{auth}, true)
+	waitQuotaRefreshIdle(t)
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("quota refresh calls = %d, want 1 for a credential with one model-scoped failure", got)
 	}
 
 	setCooldown("claude", auth.ID, "", "account-wide", now.Add(time.Hour))
 	refreshQuotaSnapshots("quota-account-scope-callback", []pluginapi.HostAuthFileEntry{auth}, true)
+	waitQuotaRefreshIdle(t)
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("quota refresh calls = %d after account-wide cooldown, want unchanged", got)
 	}

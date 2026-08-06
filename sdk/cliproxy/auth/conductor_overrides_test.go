@@ -394,8 +394,9 @@ func TestManager_ModelSupportBadRequest_FallsBackAndSuspendsAuth(t *testing.T) {
 		id: "claude",
 		executeErrors: map[string]error{
 			"aa-bad-auth": &Error{
+				Code:       "model_not_supported",
 				HTTPStatus: http.StatusBadRequest,
-				Message:    "invalid_request_error: The requested model is not supported.",
+				Message:    "The requested model is not supported.",
 			},
 		},
 	}
@@ -616,8 +617,9 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 		id: "claude",
 		streamFirstErrors: map[string]error{
 			"aa-bad-auth": &Error{
+				Code:       "model_not_supported",
 				HTTPStatus: http.StatusBadRequest,
-				Message:    "invalid_request_error: The requested model is not supported.",
+				Message:    "The requested model is not supported.",
 			},
 		},
 	}

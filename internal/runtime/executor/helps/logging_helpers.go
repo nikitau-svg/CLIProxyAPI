@@ -20,13 +20,11 @@ import (
 )
 
 const (
-	apiAttemptsKey                 = "API_UPSTREAM_ATTEMPTS"
-	apiRequestKey                  = "API_REQUEST"
-	apiResponseKey                 = "API_RESPONSE"
-	apiWebsocketTimelineKey        = "API_WEBSOCKET_TIMELINE"
-	deferredAPIRequestBytesKey     = "DEFERRED_API_REQUEST_BYTES"
-	creditsUsedKey                 = "__antigravity_credits_used__"
-	maxDeferredAPIRequestBodyBytes = 32 << 20 // 32 MiB
+	apiAttemptsKey          = "API_UPSTREAM_ATTEMPTS"
+	apiRequestKey           = "API_REQUEST"
+	apiResponseKey          = "API_RESPONSE"
+	apiWebsocketTimelineKey = "API_WEBSOCKET_TIMELINE"
+	creditsUsedKey          = "__antigravity_credits_used__"
 )
 
 // UpstreamRequestLog captures the outbound upstream request details for logging.
@@ -135,29 +133,14 @@ func deferAPIRequest(ginCtx *gin.Context, info UpstreamRequestLog) {
 	index := len(requests) + 1
 	capturedInfo := info
 	capturedAt := time.Now()
-	capturedBytes, _ := ginCtx.Get(deferredAPIRequestBytesKey)
-	bytesUsed, _ := capturedBytes.(int)
-	remaining := maxDeferredAPIRequestBodyBytes - bytesUsed
-	if remaining < 0 {
-		remaining = 0
-	}
-	captureLength := len(info.Body)
-	if captureLength > remaining {
-		captureLength = remaining
-	}
-	capturedInfo.Body = bytes.Clone(info.Body[:captureLength])
-	bodyEmpty := len(info.Body) == 0
-	bodyTruncated := captureLength < len(info.Body)
-	ginCtx.Set(deferredAPIRequestBytesKey, bytesUsed+captureLength)
+	bodyLength := len(info.Body)
+	capturedInfo.Body = nil
 	requests = append(requests, func() []byte {
 		builder := newAPIRequestLogBuilder(index, capturedInfo, capturedAt)
-		if bodyEmpty {
+		if bodyLength == 0 {
 			builder.WriteString("<empty>")
 		} else {
-			builder.Write(capturedInfo.Body)
-			if bodyTruncated {
-				builder.WriteString(fmt.Sprintf("\n[API REQUEST BODY TRUNCATED: captured first %d bytes]", captureLength))
-			}
+			builder.WriteString(fmt.Sprintf("[OMITTED: production error log does not persist the %d-byte upstream body]", bodyLength))
 		}
 		builder.WriteString("\n\n")
 		return []byte(builder.String())

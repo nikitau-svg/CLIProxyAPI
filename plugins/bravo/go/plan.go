@@ -98,6 +98,9 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 			allocated := allocateCandidateAuths(req, cfg, project, resolved, eligible, sticky)
 			if cfg.AllocatorMode == "enforce" {
 				attempts = allocated
+				if len(attempts) == 0 {
+					attempts = compactBypassCandidateAttempts(req, cfg, project, resolved, eligible, sticky)
+				}
 			} else {
 				// Observe mode executes the pre-v0.4 order while still refreshing
 				// quota and calculating the allocation decision.
@@ -114,12 +117,13 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 			// Eligible credentials existed, so the allocator withheld all of
 			// them: quota below the tariff floor, a disabled subscription, or an
 			// unknown snapshot under a deny policy.
+			code, reason := allocatorCandidateRejection(cfg, project, resolved, eligible)
 			rejections = append(rejections, candidateRejection{
 				Provider: normalizeProvider(resolved.Provider),
 				Model:    resolved.Model,
 				Stage:    "allocator",
-				Code:     "bravo_allocator_withheld",
-				Reason:   fmt.Sprintf("allocator released none of %d eligible credentials", len(eligible)),
+				Code:     code,
+				Reason:   reason,
 			})
 			continue
 		}
@@ -142,7 +146,54 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		}
 		return nil, noEligibleCandidateError(logicalName, contract, rejections)
 	}
+	if len(rejections) > 0 {
+		plan[0].PreflightRejections = append([]candidateRejection(nil), rejections...)
+	}
 	return plan, nil
+}
+
+func allocatorCandidateRejection(
+	cfg pluginConfig,
+	project smartKeyConfig,
+	item candidate,
+	auths []pluginapi.HostAuthFileEntry,
+) (string, string) {
+	primaryIndexes := resolvedPrimaryAuthIndexes(project.PrimaryAuthIDs, auths)
+	reserveFloorOnly := len(auths) > 0
+	for _, auth := range auths {
+		authIndex := strings.TrimSpace(auth.AuthIndex)
+		subscription := subscriptionPolicy(cfg, authIndex)
+		if !subscriptionEnabled(subscription) {
+			reserveFloorOnly = false
+			break
+		}
+		if _, primary := primaryIndexes[authIndex]; primary {
+			reserveFloorOnly = false
+			break
+		}
+		quota := quotaSnapshot(authIndex)
+		if quotaRoutingConfidenceAt(quota, item.Model, cfg, time.Now()) != "confirmed" {
+			reserveFloorOnly = false
+			break
+		}
+		tariff := effectiveTariff(cfg, subscription, firstNonEmpty(auth.Provider, auth.Type), quota)
+		session, weekly := effectiveQuotaWindows(quota, item.Model)
+		if session.RemainingPercent <= 0 || weekly.RemainingPercent <= 0 ||
+			secondaryQuotaEligible(cfg, quota, item.Model, tariff, authIndex, tariff.ReservationPercent) {
+			reserveFloorOnly = false
+			break
+		}
+	}
+	if reserveFloorOnly {
+		return "bravo_allocator_reserve_floor", fmt.Sprintf(
+			"внутренний резерв CLIProxyAPI удержал все доступные подписки (%d): подтверждённый остаток положительный, но ниже настроенного порога тарифа",
+			len(auths),
+		)
+	}
+	return "bravo_allocator_withheld", fmt.Sprintf(
+		"внутренний распределитель CLIProxyAPI не выпустил ни одну из доступных подписок (%d): проверьте включение подписок, подтверждение квоты и резервные пороги",
+		len(auths),
+	)
 }
 
 // allocatorBypassPlan rebuilds a plan from credentials that passed provider
@@ -219,7 +270,7 @@ func logAllocatorBypass(logicalName string, rejections []candidateRejection) {
 	}
 	_, _ = callHost(pluginabi.MethodHostLog, map[string]any{
 		"level":   "warn",
-		"message": "bravo: allocator withheld every credential, serving request anyway",
+		"message": "Bravo: внутренний распределитель удержал все подписки; запрос обслуживается с контролируемым обходом резервного порога",
 		"fields": map[string]any{
 			"logical_model": logicalName,
 			"withheld":      strings.Join(details, "; "),
@@ -327,7 +378,7 @@ func logPlanRejections(logicalName string, contract requestCapabilityContract, d
 	}
 	_, _ = callHost(pluginabi.MethodHostLog, map[string]any{
 		"level":   "warn",
-		"message": "bravo: no execution plan for logical model",
+		"message": "Bravo: для логической модели не осталось доступного маршрута",
 		"fields": map[string]any{
 			"logical_model": logicalName,
 			"protocol":      contract.Protocol,
