@@ -56,13 +56,13 @@ var (
 	quotaRefreshRuntimeWG sync.WaitGroup
 	quotaRefreshRuntime   = struct {
 		sync.Mutex
-		calls           map[string]*quotaRefreshCall
-		gates           map[string]*quotaProviderGate
-		providerRetryAt map[string]time.Time
+		calls         map[string]*quotaRefreshCall
+		gates         map[string]*quotaProviderGate
+		egressRetryAt map[string]time.Time
 	}{
-		calls:           make(map[string]*quotaRefreshCall),
-		gates:           make(map[string]*quotaProviderGate),
-		providerRetryAt: make(map[string]time.Time),
+		calls:         make(map[string]*quotaRefreshCall),
+		gates:         make(map[string]*quotaProviderGate),
+		egressRetryAt: make(map[string]time.Time),
 	}
 )
 
@@ -233,9 +233,10 @@ func startQuotaRefresh(hostCallbackID string, auth pluginapi.HostAuthFileEntry, 
 		return closedQuotaRefreshChannel()
 	}
 	provider := normalizeProvider(firstNonEmpty(auth.Provider, auth.Type, current.Provider))
+	egressKey := quotaRefreshEgressKey(provider, auth.EgressID)
 	key := authIndex + "\x1f" + resource
 	quotaRefreshRuntime.Lock()
-	if retryAt := quotaRefreshRuntime.providerRetryAt[provider]; retryAt.After(now) {
+	if retryAt := quotaRefreshRuntime.egressRetryAt[egressKey]; retryAt.After(now) {
 		quotaRefreshRuntime.Unlock()
 		return closedQuotaRefreshChannel()
 	}
@@ -255,14 +256,14 @@ func startQuotaRefresh(hostCallbackID string, auth pluginapi.HostAuthFileEntry, 
 			close(call.done)
 			quotaRefreshRuntime.Unlock()
 		}()
-		runQuotaRefresh(hostCallbackID, auth, resource, provider, cfg)
+		runQuotaRefresh(hostCallbackID, auth, resource, provider, egressKey, cfg)
 	}()
 	return call.done
 }
 
-func runQuotaRefresh(hostCallbackID string, auth pluginapi.HostAuthFileEntry, resource, provider string, cfg pluginConfig) {
+func runQuotaRefresh(hostCallbackID string, auth pluginapi.HostAuthFileEntry, resource, provider, egressKey string, cfg pluginConfig) {
 	authIndex := strings.TrimSpace(auth.AuthIndex)
-	gate := quotaProviderRefreshGate(provider, cfg.QuotaRefreshProviderConcurrency)
+	gate := quotaProviderRefreshGate(egressKey, cfg.QuotaRefreshProviderConcurrency)
 	gate.semaphore <- struct{}{}
 	defer func() { <-gate.semaphore }()
 	gate.startMu.Lock()
@@ -274,11 +275,10 @@ func runQuotaRefresh(hostCallbackID string, auth pluginapi.HostAuthFileEntry, re
 	}
 	gate.lastStart = now
 	gate.startMu.Unlock()
-
 	quotaRefreshRuntime.Lock()
-	providerRetryAt := quotaRefreshRuntime.providerRetryAt[provider]
+	retryAt := quotaRefreshRuntime.egressRetryAt[egressKey]
 	quotaRefreshRuntime.Unlock()
-	if providerRetryAt.After(now) {
+	if retryAt.After(now) {
 		return
 	}
 
@@ -288,17 +288,17 @@ func runQuotaRefresh(hostCallbackID string, auth pluginapi.HostAuthFileEntry, re
 	completedAt := quotaRefreshNow().UTC()
 	if errFetch != nil {
 		failure := normalizeQuotaRefreshFailure(errFetch)
-		applyQuotaRefreshFailure(authIndex, resource, provider, failure, completedAt)
+		applyQuotaRefreshFailure(authIndex, resource, provider, egressKey, failure, completedAt)
 		return
 	}
 	applyQuotaRefreshSuccess(authIndex, resource, provider, refreshed, pendingAtStart, completedAt)
 }
 
-func quotaProviderRefreshGate(provider string, concurrency int) *quotaProviderGate {
+func quotaProviderRefreshGate(egressKey string, concurrency int) *quotaProviderGate {
 	if concurrency <= 0 {
 		concurrency = 1
 	}
-	key := normalizeProvider(provider) + fmt.Sprintf("/%d", concurrency)
+	key := strings.TrimSpace(egressKey) + fmt.Sprintf("/%d", concurrency)
 	quotaRefreshRuntime.Lock()
 	defer quotaRefreshRuntime.Unlock()
 	gate := quotaRefreshRuntime.gates[key]
@@ -312,6 +312,7 @@ func quotaProviderRefreshGate(provider string, concurrency int) *quotaProviderGa
 func markQuotaRefreshAttempt(authIndex, resource string, at time.Time) {
 	quota := quotaSnapshot(authIndex)
 	state := quotaResourceRefreshState(quota, resource)
+	state.AttemptCount++
 	state.LastAttemptAt = at.UTC()
 	setQuotaResourceRefreshState(&quota, resource, state)
 	storeQuotaSnapshot(authIndex, quota)
@@ -320,6 +321,7 @@ func markQuotaRefreshAttempt(authIndex, resource string, at time.Time) {
 func applyQuotaRefreshSuccess(authIndex, resource, provider string, refreshed credentialQuotaState, pendingAtStart float64, completedAt time.Time) {
 	current := quotaSnapshot(authIndex)
 	state := quotaResourceRefreshState(current, resource)
+	state.SuccessCount++
 	state.LastSuccessAt = completedAt.UTC()
 	state.LastFailureAt = time.Time{}
 	state.ConsecutiveFailure = 0
@@ -341,6 +343,8 @@ func applyQuotaRefreshSuccess(authIndex, resource, provider string, refreshed cr
 		confirmedAt = completedAt.UTC()
 	}
 	if !quotaConfirmedAt(current).IsZero() && confirmedAt.Before(quotaConfirmedAt(current)) {
+		current.UsageRefresh = state
+		storeQuotaSnapshot(authIndex, current)
 		return
 	}
 	// Preserve independently refreshed presentation state.
@@ -367,9 +371,10 @@ func applyQuotaRefreshSuccess(authIndex, resource, provider string, refreshed cr
 	clearPendingReservation(authIndex, pendingAtStart)
 }
 
-func applyQuotaRefreshFailure(authIndex, resource, provider string, failure *quotaRefreshFailure, at time.Time) {
+func applyQuotaRefreshFailure(authIndex, resource, provider, egressKey string, failure *quotaRefreshFailure, at time.Time) {
 	current := quotaSnapshot(authIndex)
 	state := quotaResourceRefreshState(current, resource)
+	state.FailureCount++
 	state.LastFailureAt = at.UTC()
 	state.ConsecutiveFailure++
 	state.Error = &quotaRefreshErrorState{
@@ -389,11 +394,19 @@ func applyQuotaRefreshFailure(authIndex, resource, provider string, failure *quo
 	storeQuotaSnapshot(authIndex, current)
 	if failure.StatusCode == 429 && state.NextAttemptAt.After(at) {
 		quotaRefreshRuntime.Lock()
-		if existing := quotaRefreshRuntime.providerRetryAt[provider]; state.NextAttemptAt.After(existing) {
-			quotaRefreshRuntime.providerRetryAt[provider] = state.NextAttemptAt
+		if existing := quotaRefreshRuntime.egressRetryAt[egressKey]; state.NextAttemptAt.After(existing) {
+			quotaRefreshRuntime.egressRetryAt[egressKey] = state.NextAttemptAt
 		}
 		quotaRefreshRuntime.Unlock()
 	}
+}
+
+func quotaRefreshEgressKey(provider, egressID string) string {
+	egressID = strings.TrimSpace(egressID)
+	if egressID == "" {
+		egressID = "direct"
+	}
+	return normalizeProvider(provider) + "\x1f" + egressID
 }
 
 func normalizeQuotaRefreshFailure(err error) *quotaRefreshFailure {
@@ -495,7 +508,7 @@ func resetQuotaRefreshRuntimeForTest() {
 	quotaRefreshRuntime.Lock()
 	quotaRefreshRuntime.calls = make(map[string]*quotaRefreshCall)
 	quotaRefreshRuntime.gates = make(map[string]*quotaProviderGate)
-	quotaRefreshRuntime.providerRetryAt = make(map[string]time.Time)
+	quotaRefreshRuntime.egressRetryAt = make(map[string]time.Time)
 	quotaRefreshRuntime.Unlock()
 }
 

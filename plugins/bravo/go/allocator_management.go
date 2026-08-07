@@ -94,6 +94,21 @@ type refreshQuotaRequest struct {
 	AuthIndexes []string `json:"auth_indexes,omitempty"`
 }
 
+type quotaRequestCountersView struct {
+	Attempts uint64 `json:"attempts"`
+	Success  uint64 `json:"success"`
+	Failure  uint64 `json:"failure"`
+}
+
+type quotaPollingView struct {
+	UsageIntervalSeconds   int                      `json:"usage_interval_seconds"`
+	MinimumIntervalSeconds int                      `json:"minimum_interval_seconds"`
+	MaximumIntervalSeconds int                      `json:"maximum_interval_seconds"`
+	ProfileIntervalSeconds int                      `json:"profile_interval_seconds"`
+	Usage                  quotaRequestCountersView `json:"usage_requests"`
+	Profile                quotaRequestCountersView `json:"profile_requests"`
+}
+
 func handleAllocatorManagement(req rpcManagementRequest) ([]byte, error) {
 	path := strings.TrimRight(strings.TrimSpace(req.Path), "/")
 	switch {
@@ -105,6 +120,7 @@ func handleAllocatorManagement(req rpcManagementRequest) ([]byte, error) {
 		return managementJSON(http.StatusOK, map[string]any{
 			"subscriptions": views,
 			"tariffs":       append([]tariffConfig(nil), loadedConfig().Tariffs...),
+			"quota_polling": quotaPollingSummary(),
 		})
 	case path == "/v0/management/bravo/subscriptions" && req.Method == http.MethodPatch:
 		allocatorMutationMu.Lock()
@@ -119,6 +135,30 @@ func handleAllocatorManagement(req rpcManagementRequest) ([]byte, error) {
 	default:
 		return nil, nil
 	}
+}
+
+func quotaPollingSummary() quotaPollingView {
+	cfg := loadedConfig()
+	view := quotaPollingView{
+		UsageIntervalSeconds:   cfg.QuotaUsageRefreshSeconds,
+		MinimumIntervalSeconds: minimumQuotaUsageRefreshSeconds,
+		MaximumIntervalSeconds: maximumQuotaUsageRefreshSeconds,
+		ProfileIntervalSeconds: cfg.QuotaProfileRefreshSeconds,
+	}
+	bravoUsageState.mu.RLock()
+	defer bravoUsageState.mu.RUnlock()
+	for _, quota := range bravoUsageState.state.Quotas {
+		if quota == nil {
+			continue
+		}
+		view.Usage.Attempts += quota.UsageRefresh.AttemptCount
+		view.Usage.Success += quota.UsageRefresh.SuccessCount
+		view.Usage.Failure += quota.UsageRefresh.FailureCount
+		view.Profile.Attempts += quota.ProfileRefresh.AttemptCount
+		view.Profile.Success += quota.ProfileRefresh.SuccessCount
+		view.Profile.Failure += quota.ProfileRefresh.FailureCount
+	}
+	return view
 }
 
 func collectSubscriptionViews(hostCallbackID string) ([]subscriptionView, error) {
@@ -140,7 +180,6 @@ func collectSubscriptionViews(hostCallbackID string) ([]subscriptionView, error)
 		}
 	}
 	primaryOwners := primaryProjectOwners(cfg, auths)
-	refreshQuotaSnapshots(hostCallbackID, auths, false)
 	indexes := make([]string, 0, len(known))
 	for authIndex := range known {
 		indexes = append(indexes, authIndex)
@@ -149,7 +188,7 @@ func collectSubscriptionViews(hostCallbackID string) ([]subscriptionView, error)
 	views := make([]subscriptionView, 0, len(indexes))
 	for _, authIndex := range indexes {
 		auth := known[authIndex]
-		quota := refreshQuotaIfNeeded(hostCallbackID, auth, false)
+		quota := normalizedQuotaState(quotaSnapshot(authIndex))
 		subscription := subscriptionPolicy(cfg, authIndex)
 		tariff := effectiveTariff(cfg, subscription, firstNonEmpty(auth.Provider, auth.Type), quota)
 		views = append(views, buildSubscriptionView(cfg, auth, subscription, tariff, quota, primaryOwners[authIndex]))
@@ -699,7 +738,11 @@ func refreshQuotas(req rpcManagementRequest) ([]byte, error) {
 	if errViews != nil {
 		return projectHostFailureJSON(errViews)
 	}
-	return managementJSON(http.StatusOK, map[string]any{"refreshed_auth_indexes": refreshed, "subscriptions": views})
+	return managementJSON(http.StatusOK, map[string]any{
+		"refreshed_auth_indexes": refreshed,
+		"subscriptions":          views,
+		"quota_polling":          quotaPollingSummary(),
+	})
 }
 
 func decodeAllocatorBody(body []byte, value any, optional bool) *projectFailure {

@@ -13,6 +13,12 @@ import (
 
 var currentConfig atomic.Value
 
+const (
+	defaultQuotaUsageRefreshSeconds = 15 * 60
+	minimumQuotaUsageRefreshSeconds = 5 * 60
+	maximumQuotaUsageRefreshSeconds = 24 * 60 * 60
+)
+
 // selfOnlyDefaultModels are connected Codex models with no counterpart on the
 // Claude side. They get a logical alias with a single self-candidate: routing
 // them to a mapped equivalent would silently answer from a different model,
@@ -224,12 +230,12 @@ func defaultPluginConfig() pluginConfig {
 		FallbackHedgeDelaySeconds:         40,
 		StatePath:                         defaultStatePath,
 		AllocatorMode:                     "enforce",
-		QuotaRefreshSeconds:               60,
-		QuotaUsageRefreshSeconds:          60,
-		QuotaUsageMaxStaleSeconds:         15 * 60,
+		QuotaRefreshSeconds:               defaultQuotaUsageRefreshSeconds,
+		QuotaUsageRefreshSeconds:          defaultQuotaUsageRefreshSeconds,
+		QuotaUsageMaxStaleSeconds:         60 * 60,
 		QuotaProfileRefreshSeconds:        6 * 60 * 60,
 		QuotaRefreshJitterPercent:         20,
-		QuotaRefreshProviderMinIntervalMS: 250,
+		QuotaRefreshProviderMinIntervalMS: 500,
 		QuotaRefreshProviderConcurrency:   1,
 		UnknownSecondaryPolicy:            "block",
 		Tariffs: []tariffConfig{
@@ -265,6 +271,13 @@ func configure(raw []byte) error {
 		if presence.QuotaUsageRefreshSeconds == nil {
 			cfg.QuotaUsageRefreshSeconds = cfg.QuotaRefreshSeconds
 		}
+		// 0.8.0 persisted the historical one-minute cache TTL in some installs.
+		// Treat every formerly accepted sub-five-minute value as an upgrade
+		// marker instead of failing plugin startup or preserving a provider-hostile
+		// polling rate forever.
+		if cfg.QuotaUsageRefreshSeconds > 0 && cfg.QuotaUsageRefreshSeconds < minimumQuotaUsageRefreshSeconds {
+			cfg.QuotaUsageRefreshSeconds = defaultQuotaUsageRefreshSeconds
+		}
 		if presence.Tariffs != nil {
 			for _, tariff := range *presence.Tariffs {
 				id := strings.ToLower(strings.TrimSpace(tariff.ID))
@@ -284,6 +297,8 @@ func configure(raw []byte) error {
 		return fmt.Errorf("configure Bravo route traces: %w", errTraces)
 	}
 	currentConfig.Store(cfg)
+	quotaPollingConfigured.Store(true)
+	wakeQuotaPolling()
 	return nil
 }
 
@@ -323,10 +338,13 @@ func normalizeConfig(cfg *pluginConfig) error {
 		return fmt.Errorf("allocator_mode must be off, observe, or enforce")
 	}
 	if cfg.QuotaRefreshSeconds <= 0 {
-		cfg.QuotaRefreshSeconds = 60
+		cfg.QuotaRefreshSeconds = defaultQuotaUsageRefreshSeconds
 	}
 	if cfg.QuotaUsageRefreshSeconds <= 0 {
-		cfg.QuotaUsageRefreshSeconds = cfg.QuotaRefreshSeconds
+		cfg.QuotaUsageRefreshSeconds = defaultQuotaUsageRefreshSeconds
+	}
+	if cfg.QuotaUsageRefreshSeconds < minimumQuotaUsageRefreshSeconds || cfg.QuotaUsageRefreshSeconds > maximumQuotaUsageRefreshSeconds {
+		return fmt.Errorf("quota_usage_refresh_seconds must be between %d and %d", minimumQuotaUsageRefreshSeconds, maximumQuotaUsageRefreshSeconds)
 	}
 	if cfg.QuotaUsageMaxStaleSeconds < cfg.QuotaUsageRefreshSeconds {
 		cfg.QuotaUsageMaxStaleSeconds = max(cfg.QuotaUsageRefreshSeconds, 15*60)

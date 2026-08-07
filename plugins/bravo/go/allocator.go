@@ -48,7 +48,7 @@ func allocateCandidateAuths(
 		if !subscriptionEnabled(subscription) {
 			continue
 		}
-		quota := refreshQuotaIfNeeded(req.HostCallbackID, auth, false)
+		quota := normalizedQuotaState(quotaSnapshot(authIndex))
 		tariff := effectiveTariff(cfg, subscription, firstNonEmpty(auth.Provider, auth.Type), quota)
 		_, isPrimary := primaryIndexes[authIndex]
 		attempt := executionAttempt{

@@ -237,6 +237,16 @@ The current release applies project ownership, strict pools, and reserve policy:
   remain confirmed at 100% with an `inactive` reset mode; a missing Codex
   window can be explicitly `not_applicable`.
 
+Quota discovery is a background control-plane task, not part of inference or a
+page read. Usage polling defaults to 15 minutes and is editable from the Bravo
+subscription-pool section (5 minutes through 24 hours, with a warning below 10
+minutes). The same panel shows persistent usage/profile provider-request
+counters globally and per account. Profile metadata keeps its independent
+six-hour interval. A 429 blocks only credentials sharing the same safe egress
+fingerprint: direct accounts share one group, the same proxy shares one group,
+and different proxies remain independent. Proxy URLs never enter plugin state
+or management responses.
+
 The authenticated allocator endpoints are:
 
 ```text

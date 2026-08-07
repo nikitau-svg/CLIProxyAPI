@@ -46,6 +46,7 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 	if errUnmarshal := json.Unmarshal(raw, &authResp); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode host auth list: %w", errUnmarshal)
 	}
+	observeQuotaPolling(req.HostCallbackID, authResp.Files)
 
 	sticky := executionStickyKey(req.ExecutorRequest)
 	now := time.Now()
@@ -56,12 +57,6 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		// Apply it before provider eligibility, quota observation, primary
 		// ordering, and every off/observe/enforce allocator branch.
 		authResp.Files = filterProjectAllowedAuths(project, authResp.Files)
-	}
-	if authenticatedProject && cfg.AllocatorMode != "off" {
-		// Refresh stale provider windows concurrently once per plan. Individual
-		// allocation passes then consume the cached snapshots without turning a
-		// 20-account pool into 20 serial network round trips.
-		refreshQuotaSnapshots(req.HostCallbackID, authResp.Files, false)
 	}
 	plan := make([]executionAttempt, 0)
 	// Every candidate that drops out records why. An empty plan is reported as

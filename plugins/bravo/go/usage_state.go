@@ -85,6 +85,9 @@ type quotaRefreshErrorState struct {
 }
 
 type quotaRefreshState struct {
+	AttemptCount       uint64                  `json:"attempt_count,omitempty"`
+	SuccessCount       uint64                  `json:"success_count,omitempty"`
+	FailureCount       uint64                  `json:"failure_count,omitempty"`
 	LastAttemptAt      time.Time               `json:"last_attempt_at,omitempty"`
 	LastSuccessAt      time.Time               `json:"last_success_at,omitempty"`
 	LastFailureAt      time.Time               `json:"last_failure_at,omitempty"`

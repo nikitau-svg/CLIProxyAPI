@@ -114,6 +114,9 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	quotaPollingConfigured.Store(false)
+	stopQuotaPolling()
+	quotaRefreshRuntimeWG.Wait()
 	flushUsageState()
 }
 
