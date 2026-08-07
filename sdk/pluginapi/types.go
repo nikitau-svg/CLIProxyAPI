@@ -829,6 +829,11 @@ type HostAuthFileEntry struct {
 	Type string `json:"type,omitempty"`
 	// Provider is the credential provider key.
 	Provider string `json:"provider,omitempty"`
+	// EgressID is a non-secret fingerprint of the effective upstream egress.
+	// Credentials without a proxy share "direct"; credentials using the same
+	// proxy share one opaque identifier. The proxy URL never crosses the host
+	// callback boundary.
+	EgressID string `json:"egress_id,omitempty"`
 	// Label is the human-readable credential label.
 	Label string `json:"label,omitempty"`
 	// Status is the current credential status.

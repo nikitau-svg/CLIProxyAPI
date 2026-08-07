@@ -749,6 +749,31 @@ Historical 0.2.1 conformance baseline:
 
 ## Next allocator/product increments
 
+- Quota-throttle audit evidence (2026-08-07): the historical implementation
+  used a 60-second quota TTL in the request planning path. In the 100 model
+  requests immediately preceding the earliest retained user-visible quota-429
+  evidence (2026-08-06 18:17:12--19:56:41 UTC), traffic remained active in 28
+  distinct minutes. Replaying the old TTL against those request timestamps
+  produces 24 refresh cycles: approximately 72 Claude `/api/oauth/usage`
+  calls plus 72 Claude profile calls for three credentials. No Bravo dashboard
+  request occurred in that sample, so the hot request path alone was sufficient
+  to create the polling load. Exact historical quota calls cannot be listed
+  because the old callback did not emit per-attempt audit events and persisted
+  only its latest snapshot.
+- The replacement design must take quota discovery out of the inference hot
+  path. Use an adaptive background schedule, retain last-known-good windows,
+  coalesce UI and scheduler work, respect account-scoped `Retry-After`, and
+  maintain a separate low-rate egress budget. Provider profile metadata must
+  keep its long TTL and must never be paired with every usage refresh.
+- Add the audit events that the historical implementation was missing: record
+  every quota attempt by pseudonymous account and effective egress, including
+  its trigger (scheduler, dashboard refresh, or operator action), timestamp,
+  HTTP status, and `Retry-After`. Verify the new cadence and single-flight
+  behavior with a controlled canary reproduction before changing production.
+- Redesign quota refresh only after that audit: account-scoped cooldown,
+  separate safe egress pacing keyed by a credential-free proxy/direct
+  fingerprint, stale-last-good quota retention, coalesced manual refresh, and
+  no inference denial caused solely by failure of the quota metadata endpoint.
 - Signed release-feed/GHCR delivery on top of the implemented compatibility
   advisor, so the UI can link a required code fix to a ready canary image and
   release notes. Binary updates remain operator-approved and pass through the

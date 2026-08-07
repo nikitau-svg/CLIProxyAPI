@@ -1,6 +1,6 @@
 # Bravo quota refresh contract
 
-Status: proposed implementation contract
+Status: implemented in Bravo 0.8.1
 Scope: host quota acquisition, Bravo quota cache, allocator eligibility, and management presentation
 Out of scope: model-request cooldown classification, billing reconciliation, and provider credential refresh
 
@@ -21,8 +21,8 @@ This contract replaces that behaviour with stale-while-revalidate (SWR):
 - the last provider-confirmed usage windows are immutable until a newer valid
   usage response replaces them;
 - refresh health is recorded separately from quota confidence;
-- request routing never waits for quota HTTP calls;
-- provider quota endpoints are protected by provider-wide scheduling,
+- request routing and management reads never initiate or wait for quota HTTP calls;
+- provider quota endpoints are protected by egress-aware scheduling,
   `Retry-After`, backoff, and deterministic staggering;
 - profile metadata and usage windows have independent freshness and failure
   state.
@@ -48,6 +48,9 @@ This contract replaces that behaviour with stale-while-revalidate (SWR):
 8. Runtime model-request evidence remains authoritative. A reviewed execution
    cooldown or disabled core auth blocks routing even when LKG says quota is
    available.
+9. Opening or refreshing a Bravo management page MUST NOT contact a provider.
+10. Every actual provider request start is counted persistently and separately
+    for usage and profile. Scheduler checks and cache reads are not requests.
 
 ## 3. Terms and state model
 
@@ -75,6 +78,9 @@ Usage and profile each own a `refresh_state`:
 
 ```text
 refresh_state:
+  attempt_count
+  success_count
+  failure_count
   last_attempt_at
   last_success_at
   last_failure_at
@@ -121,17 +127,20 @@ labels are the final fallback.
 The following configuration is required:
 
 ```yaml
-quota_usage_refresh_seconds: 60
-quota_usage_max_stale_seconds: 900
+quota_usage_refresh_seconds: 900
+quota_usage_max_stale_seconds: 3600
 quota_profile_refresh_seconds: 21600
 quota_refresh_jitter_percent: 20
-quota_refresh_provider_min_interval_ms: 250
+quota_refresh_provider_min_interval_ms: 500
 quota_refresh_provider_concurrency: 1
 ```
 
-Compatibility rule: when `quota_usage_refresh_seconds` is absent, the existing
-`quota_refresh_seconds` value supplies it. The legacy field remains readable
-for at least one release and is not rewritten unless configuration is saved.
+The usage interval is editable in the Bravo administration page. Accepted
+values are 300 through 86400 seconds; the UI warns below 600 seconds. When
+`quota_usage_refresh_seconds` is absent, the existing `quota_refresh_seconds`
+value supplies it. The historical inherited value of 60 seconds is migrated to
+the 900-second safe default. The legacy field remains readable for at least one
+release and is not rewritten unless configuration is saved.
 
 Freshness is derived as follows:
 
@@ -148,7 +157,7 @@ freshness by itself. Pending/in-flight reservations continue to be subtracted
 from LKG during allocation.
 
 An administrator may configure max-stale, but it MUST be at least one usage TTL
-and SHOULD default to 15 minutes. Unlimited stale routing is forbidden.
+and SHOULD default to 60 minutes. Unlimited stale routing is forbidden.
 
 ## 5. Read and refresh algorithm
 
@@ -158,19 +167,20 @@ For every candidate auth, allocation performs these steps without blocking:
 
 1. Read one immutable quota-cache snapshot.
 2. Derive freshness from the injected clock.
-3. If refresh is due and `now >= next_attempt_at`, enqueue a refresh job.
-4. Continue allocation using the snapshot and the rules in section 9.
+3. Continue allocation using the snapshot and the rules in section 9.
 
-The request path MUST NOT wait for the queue, a singleflight result, provider
-limiter, host callback, or state-file write. Initial quota discovery therefore
-does not add quota-endpoint latency to inference.
+The request path publishes the host's already-loaded, secret-free auth view to
+the background scheduler. It MUST NOT evaluate due work, call a quota callback,
+wait for the scheduler, a singleflight result, provider limiter, or state-file
+write. Initial quota discovery therefore does not add quota-endpoint latency to
+inference.
 
 ### 5.2 Management path
 
-`POST /v0/management/bravo/quotas/refresh` schedules work and returns a job
-identifier plus per-auth state (`queued`, `joined`, `deferred`, or `skipped`).
-It SHOULD return `202 Accepted`; the UI polls quota state. It must not hold one
-HTTP request open while every subscription refreshes.
+`GET /v0/management/bravo/subscriptions` is cache-only. It returns the effective
+polling interval, persistent aggregate request counters, and each account's
+refresh state. `POST /v0/management/bravo/quotas/refresh` schedules work and
+returns without waiting for every subscription refresh.
 
 `force=true` means "refresh even when fresh". It does not mean "ignore
 Retry-After" or "start duplicate work". An explicit future emergency override,
@@ -242,9 +252,12 @@ The race detector is part of the acceptance gate.
 Quota discovery uses a dedicated limiter and MUST NOT share capacity with model
 execution.
 
-The default is one in-flight quota HTTP request per provider and at least 250 ms
-between starts for that provider. The limiter is process-wide, not per project
-or per credential. `usage` and `profile` consume the same provider budget.
+The default is one in-flight quota HTTP request per `(provider, egress)` and at
+least 500 ms between starts for that group. Credentials with no proxy share the
+`direct` egress. Credentials with the same effective proxy share one opaque
+host-generated egress fingerprint; credentials on different proxies have
+independent pacing and cooldown. Proxy URLs and credentials never cross the
+host callback boundary. `usage` and `profile` consume the same egress budget.
 
 Scheduled due time is deterministically staggered:
 

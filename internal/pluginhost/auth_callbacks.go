@@ -2,6 +2,8 @@ package pluginhost
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -640,6 +642,7 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 		Name:           name,
 		Type:           strings.TrimSpace(auth.Provider),
 		Provider:       strings.TrimSpace(auth.Provider),
+		EgressID:       h.hostAuthEgressID(auth),
 		Label:          hostAuthDisplayLabel(auth),
 		Status:         string(auth.Status),
 		StatusMessage:  safeHostAuthStatusMessage(auth.StatusMessage),
@@ -715,6 +718,25 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 		entry.Websockets = websockets
 	}
 	return entry
+}
+
+func (h *Host) hostAuthEgressID(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	proxyURL := strings.TrimSpace(auth.ProxyURL)
+	if proxyURL == "" && h != nil {
+		h.mu.Lock()
+		if h.runtimeConfig != nil {
+			proxyURL = strings.TrimSpace(h.runtimeConfig.ProxyURL)
+		}
+		h.mu.Unlock()
+	}
+	if proxyURL == "" || strings.EqualFold(proxyURL, "direct") {
+		return "direct"
+	}
+	digest := sha256.Sum256([]byte(proxyURL))
+	return "proxy-" + hex.EncodeToString(digest[:8])
 }
 
 func (h *Host) resolvedAuthDir() string {
