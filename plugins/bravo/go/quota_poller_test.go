@@ -26,6 +26,26 @@ func TestQuotaPollingDefaultsAndBounds(t *testing.T) {
 	}
 }
 
+func TestDirtyUsageQuotaCannotBypassConfiguredPollingInterval(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	cfg := defaultPluginConfig()
+	cfg.QuotaUsageRefreshSeconds = 15 * 60
+	cfg.QuotaRefreshJitterPercent = 0
+	quota := credentialQuotaState{
+		Confidence:         "confirmed",
+		ConfirmedAt:        now,
+		RefreshedAt:        now,
+		ProfileRefreshedAt: now,
+		Dirty:              true,
+	}
+	if quotaResourceNeedsRefresh(quota, "busy-account", quotaRefreshResourceUsage, cfg, now.Add(14*time.Minute+59*time.Second)) {
+		t.Fatal("dirty usage bypassed the configured 15-minute provider polling floor")
+	}
+	if !quotaResourceNeedsRefresh(quota, "busy-account", quotaRefreshResourceUsage, cfg, now.Add(15*time.Minute)) {
+		t.Fatal("dirty usage was not refreshable after the configured interval")
+	}
+}
+
 func TestQuotaRefreshCountsActualProviderRequests(t *testing.T) {
 	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 	auth := pluginapi.HostAuthFileEntry{AuthIndex: "quota-counter", Provider: "claude"}

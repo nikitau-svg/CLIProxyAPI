@@ -467,9 +467,6 @@ func quotaResourceNeedsRefresh(quota credentialQuotaState, authIndex, resource s
 		observedAt = quota.ProfileRefreshedAt
 		ttl = time.Duration(cfg.QuotaProfileRefreshSeconds) * time.Second
 	} else {
-		if quota.Dirty {
-			return true
-		}
 		observedAt = quotaConfirmedAt(quota)
 		ttl = time.Duration(cfg.QuotaUsageRefreshSeconds) * time.Second
 	}

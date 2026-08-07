@@ -31,6 +31,7 @@ Status: implementation contract for the quota scheduler introduced after 0.8.0.
 2. Scheduling policy
    - an unobserved account is due;
    - a fresh account is not due before its interval plus deterministic jitter;
+   - inference may mark a confirmed quota dirty, but dirty state cannot bypass the configured provider polling interval;
    - usage and profile schedules are independent;
    - `NextAttemptAt` suppresses a scheduled and a manual refresh;
    - repeated wakeups do not duplicate an in-flight `(auth, resource)` request.
