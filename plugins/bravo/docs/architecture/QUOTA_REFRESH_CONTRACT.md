@@ -1,6 +1,6 @@
 # Bravo quota refresh contract
 
-Status: implemented in Bravo 0.8.1
+Status: implemented in Bravo 0.8.2
 Scope: host quota acquisition, Bravo quota cache, allocator eligibility, and management presentation
 Out of scope: model-request cooldown classification, billing reconciliation, and provider credential refresh
 
