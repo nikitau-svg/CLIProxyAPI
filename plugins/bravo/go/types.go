@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.8.3"
+	pluginVersion    = "0.8.4"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.

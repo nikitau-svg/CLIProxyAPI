@@ -137,13 +137,11 @@ func execute(raw []byte) ([]byte, error) {
 		})
 		if errCall != nil {
 			failure := classifyExecutionError(errCall)
-			// Only an explicit host acceptance phase can prove cancellation
-			// happened before provider dispatch. Every absent/ambiguous phase keeps
-			// the reservation conservatively until quota reconciliation.
-			releaseLease(!provenPreProviderCancellation(failure))
+			committed := shouldCommitAdaptiveLeaseForFailure(failure)
+			releaseLease(committed)
 			contextRouting.observeFailure(attempt, failure)
 			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
-			routeTrace.failure(attempt, started, failure.Status, failure)
+			routeTrace.failureWithCommit(attempt, started, failure.Status, failure, committed)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
@@ -155,13 +153,9 @@ func execute(raw []byte) ([]byte, error) {
 			}
 			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
 		}
-		// A host response means the provider accepted the attempt. Keep the
-		// reservation until the next confirmed quota snapshot, even when the
-		// response itself is malformed or unsuccessful.
-		releaseLease(true)
-
 		var response pluginapi.HostModelExecutionResponse
 		if errDecode := json.Unmarshal(responseRaw, &response); errDecode != nil {
+			releaseLease(true)
 			failure := executionFailure{
 				Code:      "bravo_host_response_invalid",
 				Message:   errDecode.Error(),
@@ -169,16 +163,18 @@ func execute(raw []byte) ([]byte, error) {
 				Retryable: true,
 			}
 			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
-			routeTrace.failure(attempt, started, failure.Status, failure)
+			routeTrace.failureWithCommit(attempt, started, failure.Status, failure, true)
 			lastFailure = failure
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
 			failure := classifyHTTPFailure(response.StatusCode, response.Headers, "candidate returned an HTTP error", response.Body)
+			committed := shouldCommitAdaptiveLeaseForFailure(failure)
+			releaseLease(committed)
 			contextRouting.observeFailure(attempt, failure)
 			recordExecutionAttempt(attempt, started, response.StatusCode, false, failure)
-			routeTrace.failure(attempt, started, response.StatusCode, failure)
+			routeTrace.failureWithCommit(attempt, started, response.StatusCode, failure, committed)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, failure)
@@ -191,6 +187,7 @@ func execute(raw []byte) ([]byte, error) {
 			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
 		}
 
+		releaseLease(true)
 		response.Headers.Del("Content-Length")
 		recordExecutionAttempt(attempt, started, response.StatusCode, true, executionFailure{})
 		routeTrace.success(attempt, started, response.StatusCode)
@@ -429,6 +426,17 @@ func provenPreProviderCancellation(failure executionFailure) bool {
 	return strings.TrimSpace(failure.Code) == "request_canceled" &&
 		failure.ProviderStarted != nil && !*failure.ProviderStarted &&
 		!failure.ProviderExecutionAmbiguous
+}
+
+// shouldCommitAdaptiveLeaseForFailure is deliberately narrower than generic
+// retry classification. Ambiguous transport/provider failures retain debt, but
+// a structured context-window rejection proves inference never started and
+// therefore must not consume the project's local quota forecast.
+func shouldCommitAdaptiveLeaseForFailure(failure executionFailure) bool {
+	if provenPreProviderCancellation(failure) {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(failure.Code), "bravo_context_window_exceeded")
 }
 
 func classifyProviderFailureDetail(failure executionFailure, detail providererror.Detail) executionFailure {

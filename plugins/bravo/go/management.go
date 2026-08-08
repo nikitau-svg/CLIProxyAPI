@@ -536,7 +536,7 @@ func quotaExhaustedForModel(authIndex, model string) bool {
 		return false
 	}
 	session, weekly := effectiveQuotaWindows(quota, model)
-	return session.RemainingPercent <= 0 || weekly.RemainingPercent <= 0
+	return quotaWindowExhausted(session) || quotaWindowExhausted(weekly)
 }
 
 func redactedBravoConfig(cfg pluginConfig) map[string]any {

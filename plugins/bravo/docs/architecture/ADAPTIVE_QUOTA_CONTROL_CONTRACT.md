@@ -102,6 +102,11 @@ safe remaining values stay strictly above their configured floors after the new
 lease. A project pool, route priority or sticky assignment may never bypass this
 gate.
 
+A provider window marked `not_applicable` is not a 100-percent quota window. It
+means that class of limit does not exist for the credential and therefore
+contributes no floor, pending, in-flight, demand or exposure guard. Other
+applicable global/model windows continue to gate the attempt normally.
+
 ### Q-A03: admission is atomic per credential
 
 Eligibility recheck and lease acquisition MUST occur in one credential-scoped
@@ -116,12 +121,13 @@ attempt or acceptance is ambiguous. It may be released without pending cost only
 when Bravo proves the provider did not accept the request. HTTP success with an
 invalid downstream response still counts as pending.
 
-For the 0.8.3 host ABI, every validation, capability and rewrite failure that
-Bravo can prove is pre-accept MUST occur before lease acquisition and before the
-host execution callback. Once `callHost` is invoked, any returned error is
-acceptance-ambiguous and MUST become pending; Bravo must not infer
-`accepted=false` from transport text, HTTP class or provider wording. A future
-core may narrow this only with an explicit typed `accepted=false` marker.
+The host ABI carries an explicit provider-start phase for cancellation. Missing
+or ambiguous evidence remains pending. One reviewed provider response is
+deterministically pre-inference: a structured `context_window_exceeded`
+rejection. It MUST release the adaptive lease, create no pending debt and be
+recorded as `committed=false` in the route trace. Bravo must not generalize this
+exception from arbitrary transport text or HTTP class; all other unproven
+provider failures remain conservatively pending.
 
 Pending reservations are cleared only by a confirmed snapshot whose acquisition
 watermark proves that the provider observation includes those attempts. A refresh

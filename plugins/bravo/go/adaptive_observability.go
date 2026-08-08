@@ -175,13 +175,33 @@ func adaptiveSubscriptionRuntimeView(
 			view.QuotaFreshness = freshness
 		}
 	}
-	view.SessionHeadroomBefore = session.RemainingPercent - tariff.SessionFloorPercent
-	view.WeeklyHeadroomBefore = weekly.RemainingPercent - tariff.WeeklyFloorPercent
+	if !quotaWindowApplicable(session) {
+		view.SessionBurnPercentPerMinute = 0
+		view.SessionExposureGuardPercent = 0
+	}
+	if !quotaWindowApplicable(weekly) {
+		view.WeeklyBurnPercentPerMinute = 0
+		view.WeeklyExposureGuardPercent = 0
+	}
 	sharedGuard := view.PendingPercent + view.InFlightPercent + view.ReservationPercent + view.DemandGuardPercent
-	view.SessionAdmissionCutoff = tariff.SessionFloorPercent + sharedGuard + view.SessionExposureGuardPercent
-	view.WeeklyAdmissionCutoff = tariff.WeeklyFloorPercent + sharedGuard + view.WeeklyExposureGuardPercent
-	view.SessionHeadroomAfter = view.SessionHeadroomBefore - sharedGuard - view.SessionExposureGuardPercent
-	view.WeeklyHeadroomAfter = view.WeeklyHeadroomBefore - sharedGuard - view.WeeklyExposureGuardPercent
+	view.SessionHeadroomBefore = quotaWindowSafeSurplus(session, tariff.SessionFloorPercent, 0, 0, 0, 0)
+	view.WeeklyHeadroomBefore = quotaWindowSafeSurplus(weekly, tariff.WeeklyFloorPercent, 0, 0, 0, 0)
+	view.SessionHeadroomAfter = quotaWindowSafeSurplus(
+		session, tariff.SessionFloorPercent,
+		view.PendingPercent+view.InFlightPercent, view.ReservationPercent,
+		view.SessionExposureGuardPercent, view.DemandGuardPercent,
+	)
+	view.WeeklyHeadroomAfter = quotaWindowSafeSurplus(
+		weekly, tariff.WeeklyFloorPercent,
+		view.PendingPercent+view.InFlightPercent, view.ReservationPercent,
+		view.WeeklyExposureGuardPercent, view.DemandGuardPercent,
+	)
+	if quotaWindowApplicable(session) {
+		view.SessionAdmissionCutoff = tariff.SessionFloorPercent + sharedGuard + view.SessionExposureGuardPercent
+	}
+	if quotaWindowApplicable(weekly) {
+		view.WeeklyAdmissionCutoff = tariff.WeeklyFloorPercent + sharedGuard + view.WeeklyExposureGuardPercent
+	}
 	view.Status, view.Reason = adaptiveAllocatorStatus(cfg, quota, view)
 	if view.ReasonMessageRU == "" {
 		view.ReasonMessageRU, view.RecoveryActionRU = adaptiveAllocatorReasonRU(view.Status, view.Reason)

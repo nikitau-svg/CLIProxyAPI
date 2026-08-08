@@ -82,6 +82,48 @@ func TestSubscriptionViewExposesAdaptiveCanarySummary(t *testing.T) {
 	}
 }
 
+func TestSubscriptionViewIgnoresNotApplicableSessionWindow(t *testing.T) {
+	resetAdaptiveReserveForTest()
+	defer resetAdaptiveReserveForTest()
+	now := time.Now().UTC()
+	const authIndex = "codex-observability-not-applicable"
+	auth := pluginapi.HostAuthFileEntry{AuthIndex: authIndex, Provider: "codex"}
+	cfg := defaultPluginConfig()
+	cfg.AllocatorMode = "enforce"
+	tariff := tariffConfig{
+		ID: "x20", SessionFloorPercent: 10, WeeklyFloorPercent: 5,
+		Multiplier: 20, ReservationPercent: 0.05,
+	}
+	quota := credentialQuotaState{
+		Status: "confirmed", Confidence: "confirmed", ConfirmedAt: now,
+		Session: quotaWindowState{
+			RemainingPercent: 100,
+			ResetMode:        pluginapi.HostAuthQuotaResetModeNotApplicable,
+		},
+		Weekly: quotaWindowState{
+			UsedPercent: 26, RemainingPercent: 74,
+			ResetMode: pluginapi.HostAuthQuotaResetModeScheduled, ResetAt: now.Add(7 * 24 * time.Hour),
+		},
+	}
+	allocatorRuntime.Lock()
+	allocatorRuntime.PendingPercent[authIndex] = 66.743
+	allocatorRuntime.Unlock()
+	defer func() {
+		allocatorRuntime.Lock()
+		delete(allocatorRuntime.PendingPercent, authIndex)
+		allocatorRuntime.Unlock()
+	}()
+
+	view := adaptiveSubscriptionRuntimeView(cfg, auth, tariff, quota, now)
+	if view.SessionExposureGuardPercent != 0 || view.SessionAdmissionCutoff != 0 ||
+		view.SessionHeadroomBefore != 100 || view.SessionHeadroomAfter != 100 {
+		t.Fatalf("not_applicable session leaked into management limits: %#v", view)
+	}
+	if view.WeeklyHeadroomAfter <= 0 || view.Status == "red" {
+		t.Fatalf("applicable weekly capacity was hidden by session placeholder: %#v", view)
+	}
+}
+
 func TestSubscriptionViewExposesSaturationWithoutLedgerIdentities(t *testing.T) {
 	restoreUsage := isolateBravoUsageState(t)
 	defer restoreUsage()

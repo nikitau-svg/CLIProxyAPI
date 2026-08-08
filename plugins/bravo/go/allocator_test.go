@@ -583,6 +583,58 @@ func TestConfirmedQuotaAcceptsInactiveAndNotApplicableFullWindows(t *testing.T) 
 	}
 }
 
+func TestNotApplicableSessionCannotBlockCodexSecondary(t *testing.T) {
+	resetAdaptiveReserveForTest()
+	defer resetAdaptiveReserveForTest()
+	now := time.Date(2026, 8, 8, 17, 0, 0, 0, time.UTC)
+	const authIndex = "codex-session-not-applicable"
+	shape := adaptiveRequestShape{
+		Multiplier: 1, Provider: "codex", PhysicalModel: "gpt-5.6-sol",
+		ModelFamily: "codex", EffortBucket: "standard", ContextBucket: "large",
+	}
+	profileKey := adaptiveProfileKey(authIndex, shape)
+	adaptiveReserveRuntime.Lock()
+	adaptiveReserveRuntime.Buckets[profileKey] = &adaptiveReserveProfile{
+		AuthIndex: authIndex, Shape: shape, UpdatedAt: now,
+		Session: adaptiveWindowEstimate{LearnedScale: 1, ObservedBurnPerMin: 9},
+		Weekly:  adaptiveWindowEstimate{LearnedScale: 1, ObservedBurnPerMin: 0.01},
+	}
+	adaptiveReserveRuntime.Unlock()
+	allocatorRuntime.Lock()
+	allocatorRuntime.PendingPercent[authIndex] = 66.743
+	allocatorRuntime.Unlock()
+	defer func() {
+		allocatorRuntime.Lock()
+		delete(allocatorRuntime.PendingPercent, authIndex)
+		allocatorRuntime.Unlock()
+	}()
+
+	cfg := defaultPluginConfig()
+	cfg.AllocatorMode = "enforce"
+	cfg.QuotaUsageRefreshSeconds = 15 * 60
+	tariff := tariffConfig{
+		ID: "x20", SessionFloorPercent: 10, WeeklyFloorPercent: 5,
+		Multiplier: 20, ReservationPercent: 0.05,
+	}
+	quota := credentialQuotaState{
+		Status: "confirmed", Confidence: "confirmed", ConfirmedAt: now.Add(-10 * time.Minute),
+		Session: quotaWindowState{
+			UsedPercent: 0, RemainingPercent: 100,
+			ResetMode: pluginapi.HostAuthQuotaResetModeNotApplicable,
+		},
+		Weekly: quotaWindowState{
+			UsedPercent: 26, RemainingPercent: 74,
+			ResetMode: pluginapi.HostAuthQuotaResetModeScheduled, ResetAt: now.Add(7 * 24 * time.Hour),
+		},
+	}
+	if guard := adaptiveExposureGuard(authIndex, profileKey, quota, adaptiveWindowSession, cfg, now); guard != 0 {
+		t.Fatalf("not_applicable session exposure guard = %.3f, want 0", guard)
+	}
+	if !secondaryQuotaEligibleWithKey(cfg, quota, "gpt-5.6-sol", tariff, authIndex, profileKey, 0.734, 0, now) {
+		t.Fatal("not_applicable session window blocked a Codex secondary whose applicable weekly window still had safe capacity")
+	}
+}
+
 func TestConfirmedQuotaRequiresScheduledResetForActiveWindow(t *testing.T) {
 	window := quotaWindowState{
 		UsedPercent:      10,

@@ -78,10 +78,11 @@ func captureAdaptiveAdmissionDecision(
 		sessionFloor, weeklyFloor = 0, 0
 	}
 	session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
-	decision.sessionBefore = session.RemainingPercent - sessionFloor - pending - inFlight - sessionExposure - demandGuard
-	decision.weeklyBefore = weekly.RemainingPercent - weeklyFloor - pending - inFlight - weeklyExposure - demandGuard
-	decision.sessionAfter = decision.sessionBefore - decision.reservation
-	decision.weeklyAfter = decision.weeklyBefore - decision.reservation
+	reserved := pending + inFlight
+	decision.sessionBefore = quotaWindowSafeSurplus(session, sessionFloor, reserved, 0, sessionExposure, demandGuard)
+	decision.weeklyBefore = quotaWindowSafeSurplus(weekly, weeklyFloor, reserved, 0, weeklyExposure, demandGuard)
+	decision.sessionAfter = quotaWindowSafeSurplus(session, sessionFloor, reserved, decision.reservation, sessionExposure, demandGuard)
+	decision.weeklyAfter = quotaWindowSafeSurplus(weekly, weeklyFloor, reserved, decision.reservation, weeklyExposure, demandGuard)
 	if admitted {
 		if math.Min(decision.sessionAfter, decision.weeklyAfter) <= 5 {
 			decision.decision = "adaptive_amber_admitted"
@@ -99,7 +100,7 @@ func captureAdaptiveAdmissionDecision(
 	case confidence != "confirmed" && !attempt.Primary:
 		decision.rejectionCause = adaptiveRejectionQuotaStale
 		decision.rejection = "adaptive_quota_stale_protected"
-	case attempt.Primary && (session.RemainingPercent <= 0 || weekly.RemainingPercent <= 0):
+	case attempt.Primary && (quotaWindowExhausted(session) || quotaWindowExhausted(weekly)):
 		decision.rejectionCause = adaptiveRejectionPrimaryZero
 		decision.rejection = "adaptive_primary_zero"
 	case decision.sessionBefore > decision.reservation && decision.weeklyBefore > decision.reservation:
