@@ -52,6 +52,7 @@ func TestExecuteModelRootCancellationReturnsRequestCanceled499(t *testing.T) {
 	select {
 	case errMsg := <-result:
 		assertRequestCanceledModelExecutionError(t, errMsg)
+		assertProviderExecutionState(t, errMsg.Error, true, true)
 	case <-time.After(time.Second):
 		t.Fatal("ExecuteModel did not return after root cancellation")
 	}
@@ -66,6 +67,7 @@ func TestCountModelTokensRootCancellationReturnsRequestCanceled499(t *testing.T)
 
 	_, errMsg := handler.CountModelTokens(ctx, cancellationModelExecutionRequest(model, false))
 	assertRequestCanceledModelExecutionError(t, errMsg)
+	assertProviderExecutionState(t, errMsg.Error, false, false)
 }
 
 func TestExecuteModelStreamBootstrapCancellationReturnsRequestCanceled499(t *testing.T) {
@@ -97,8 +99,30 @@ func TestExecuteModelStreamBootstrapCancellationReturnsRequestCanceled499(t *tes
 	select {
 	case errMsg := <-result:
 		assertRequestCanceledModelExecutionError(t, errMsg)
+		assertProviderExecutionState(t, errMsg.Error, true, true)
 	case <-time.After(time.Second):
 		t.Fatal("ExecuteModelStream did not return after bootstrap cancellation")
+	}
+}
+
+func TestExecuteModelCancellationBeforeProviderDispatchIsProven(t *testing.T) {
+	model := "model-execution-pre-dispatch-cancel"
+	var providerCalls int
+	executor := &modelExecutionCaptureExecutor{
+		execute: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+			providerCalls++
+			return coreexecutor.Response{}, nil
+		},
+	}
+	handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, errMsg := handler.ExecuteModel(ctx, cancellationModelExecutionRequest(model, false))
+	assertRequestCanceledModelExecutionError(t, errMsg)
+	assertProviderExecutionState(t, errMsg.Error, false, false)
+	if providerCalls != 0 {
+		t.Fatalf("pre-dispatch cancellation made %d provider calls", providerCalls)
 	}
 }
 
@@ -170,5 +194,19 @@ func assertRequestCanceledModelExecutionError(t *testing.T, errMsg *interfaces.E
 	}
 	if errMsg.StatusCode >= http.StatusInternalServerError {
 		t.Fatalf("cancellation surfaced as server failure: status %d", errMsg.StatusCode)
+	}
+}
+
+func assertProviderExecutionState(t *testing.T, err error, wantStarted, wantAmbiguous bool) {
+	t.Helper()
+	var state interface {
+		ProviderExecutionState() (started, known, ambiguous bool)
+	}
+	if !errors.As(err, &state) || state == nil {
+		t.Fatalf("error does not expose provider execution state: %T %v", err, err)
+	}
+	started, known, ambiguous := state.ProviderExecutionState()
+	if !known || started != wantStarted || ambiguous != wantAmbiguous {
+		t.Fatalf("provider execution state = started %t known %t ambiguous %t, want %t/true/%t", started, known, ambiguous, wantStarted, wantAmbiguous)
 	}
 }

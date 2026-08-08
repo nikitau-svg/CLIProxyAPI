@@ -50,8 +50,8 @@ func TestUsageStateV1MigrationPreservesTotalsQuotasAndBuildsDailyBuckets(t *test
 	if errLoad != nil {
 		t.Fatal(errLoad)
 	}
-	if state.SchemaVersion != 3 {
-		t.Fatalf("schema version = %d, want 3", state.SchemaVersion)
+	if state.SchemaVersion != 4 {
+		t.Fatalf("schema version = %d, want 4", state.SchemaVersion)
 	}
 	if state.AuthTotals["private-auth-index"].Total.TotalTokens != 18 ||
 		state.ProjectTotals["prj_alpha"].Total.TotalTokens != 11 ||
@@ -367,20 +367,23 @@ func TestSubscriptionViewExposesStableAnalyticsJoinID(t *testing.T) {
 	}
 }
 
-func isolateBravoUsageState(t *testing.T) func() {
+func isolateBravoUsageState(t testing.TB) func() {
 	t.Helper()
 	bravoUsageState.mu.Lock()
 	previousPath := bravoUsageState.path
 	previousState := bravoUsageState.state
 	previousTimer := bravoUsageState.saveTimer
+	previousPendingSince := bravoUsageState.savePendingSince
 	if previousTimer != nil {
 		previousTimer.Stop()
 	}
 	bravoUsageState.path = ""
 	bravoUsageState.state = newPersistedUsageState()
 	bravoUsageState.saveTimer = nil
+	bravoUsageState.savePendingSince = time.Time{}
 	bravoUsageState.mu.Unlock()
 	return func() {
+		waitAdaptiveWALIdleForTest(t)
 		bravoUsageState.mu.Lock()
 		if bravoUsageState.saveTimer != nil {
 			bravoUsageState.saveTimer.Stop()
@@ -388,6 +391,7 @@ func isolateBravoUsageState(t *testing.T) func() {
 		bravoUsageState.path = previousPath
 		bravoUsageState.state = previousState
 		bravoUsageState.saveTimer = previousTimer
+		bravoUsageState.savePendingSince = previousPendingSince
 		bravoUsageState.mu.Unlock()
 	}
 }

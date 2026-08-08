@@ -72,13 +72,9 @@ func TestRouteTraceStorePersistsSafeBoundedHistory(t *testing.T) {
 }
 
 func TestRouteTraceManagementFiltersErrorsByProject(t *testing.T) {
-	previous := bravoRouteTraces
 	store := newRouteTraceStore(filepath.Join(t.TempDir(), "bravo-state.json"))
-	bravoRouteTraces = store
-	t.Cleanup(func() {
-		_ = store.flush()
-		bravoRouteTraces = previous
-	})
+	restore := replaceRouteTraceStoreForTest(store)
+	t.Cleanup(restore)
 	now := time.Now().UTC()
 	store.append(routeTrace{TraceID: "trc_ok", StartedAt: now, ProjectID: "prj_alpha", Success: true, Status: 200})
 	store.append(routeTrace{
@@ -134,7 +130,7 @@ func TestRouteTraceManagementFiltersErrorsByProject(t *testing.T) {
 func TestRouteTraceStorePrunesRetentionAndCount(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bravo-state.json")
 	store := newRouteTraceStore(path)
-	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	store.maxEntries = 2
 	store.retention = 24 * time.Hour
 
@@ -153,13 +149,9 @@ func TestRouteTraceStorePrunesRetentionAndCount(t *testing.T) {
 }
 
 func TestRouteTraceRecorderPersistsProviderPathWithoutRawAuthID(t *testing.T) {
-	previous := bravoRouteTraces
 	store := newRouteTraceStore(filepath.Join(t.TempDir(), "bravo-state.json"))
-	bravoRouteTraces = store
-	t.Cleanup(func() {
-		_ = store.flush()
-		bravoRouteTraces = previous
-	})
+	restore := replaceRouteTraceStoreForTest(store)
+	t.Cleanup(restore)
 	const rawAuthID = "claude-secret-auth-id"
 	recorder := newRouteTraceRecorder(rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{Model: "bravo/fable"},
@@ -217,14 +209,10 @@ func TestRouteTraceRecorderPersistsProviderPathWithoutRawAuthID(t *testing.T) {
 }
 
 func TestFailedRouteTraceSurvivesImmediateReload(t *testing.T) {
-	previous := bravoRouteTraces
 	statePath := filepath.Join(t.TempDir(), "bravo-state.json")
 	store := newRouteTraceStore(statePath)
-	bravoRouteTraces = store
-	t.Cleanup(func() {
-		_ = store.flush()
-		bravoRouteTraces = previous
-	})
+	restore := replaceRouteTraceStoreForTest(store)
+	t.Cleanup(restore)
 
 	recorder := newRouteTraceRecorder(rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{Model: "bravo/fable"},
@@ -275,12 +263,7 @@ func TestFailedRouteTracePersistenceFailureDoesNotLoseInMemoryDiagnostic(t *test
 	if len(traces) != 1 || traces[0].TraceID != trace.TraceID {
 		t.Fatalf("in-memory terminal trace = %#v", traces)
 	}
-	store.mu.Lock()
-	if store.saveTimer != nil {
-		store.saveTimer.Stop()
-		store.saveTimer = nil
-	}
-	store.mu.Unlock()
+	_ = store.close()
 }
 
 func TestRouteTraceExplainsModelCreditsBeforeContextFallback(t *testing.T) {

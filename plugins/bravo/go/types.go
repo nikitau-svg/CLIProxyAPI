@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.8.2"
+	pluginVersion    = "0.8.3"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -30,13 +30,15 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code          string                `json:"code"`
-	Message       string                `json:"message"`
-	Retryable     bool                  `json:"retryable,omitempty"`
-	HTTPStatus    int                   `json:"http_status,omitempty"`
-	Headers       http.Header           `json:"headers,omitempty"`
-	RetryAfter    string                `json:"retry_after,omitempty"`
-	ProviderError *providererror.Detail `json:"provider_error,omitempty"`
+	Code                       string                `json:"code"`
+	Message                    string                `json:"message"`
+	Retryable                  bool                  `json:"retryable,omitempty"`
+	HTTPStatus                 int                   `json:"http_status,omitempty"`
+	Headers                    http.Header           `json:"headers,omitempty"`
+	RetryAfter                 string                `json:"retry_after,omitempty"`
+	ProviderError              *providererror.Detail `json:"provider_error,omitempty"`
+	ProviderStarted            *bool                 `json:"provider_started,omitempty"`
+	ProviderExecutionAmbiguous bool                  `json:"provider_execution_ambiguous,omitempty"`
 }
 
 type lifecycleRequest struct {
@@ -189,7 +191,13 @@ type executionAttempt struct {
 	ProjectID                    string
 	Primary                      bool
 	AllocatorManaged             bool
+	AllocatorObserve             bool
 	ReservationPercent           float64
+	AdaptiveReserveKey           string
+	AdaptiveRequestShape         adaptiveRequestShape
+	AdaptiveBaselinePercent      float64
+	DemandGuardPercent           float64
+	AdaptiveTrace                adaptiveRouteDecision
 	TariffID                     string
 	CompactBypass                bool
 	CompactBypassKey             string
@@ -226,13 +234,15 @@ type attemptRecord struct {
 }
 
 type hostCallError struct {
-	Code          string
-	Message       string
-	Retryable     bool
-	HTTPStatus    int
-	Headers       http.Header
-	RetryAfter    string
-	ProviderError *providererror.Detail
+	Code                       string
+	Message                    string
+	Retryable                  bool
+	HTTPStatus                 int
+	Headers                    http.Header
+	RetryAfter                 string
+	ProviderError              *providererror.Detail
+	ProviderStarted            *bool
+	ProviderExecutionAmbiguous bool
 }
 
 func (e *hostCallError) Error() string {

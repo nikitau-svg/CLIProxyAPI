@@ -99,6 +99,27 @@ func normalizeExhaustedRouteFailure(
 	traces []executionFailureTrace,
 	failure executionFailure,
 ) executionFailure {
+	// A context incompatibility remains the terminal client action even when an
+	// adaptive route rejection happened earlier in the path.
+	for index := len(traces) - 1; index >= 0; index-- {
+		if traces[index].Failure.Code == "bravo_context_window_exceeded" {
+			contextFailure := traces[index].Failure
+			// finalExecutionFailure has already built a redacted Russian summary
+			// for the complete path; preserve it while restoring the typed code.
+			contextFailure.Message = failure.Message
+			return contextFailure
+		}
+	}
+	if code := dominantAdaptiveFailureCode(traces); code != "" {
+		failure.Code = code
+		failure.Message = routeTraceMessageRU(code)
+		failure.Status = 503
+		failure.Retryable = code != "bravo_adaptive_ledger_saturated"
+		failure.RouteFallback = false
+		failure.AccountWide = false
+		failure.Provider = nil
+		return failure
+	}
 	for _, trace := range traces {
 		if !executionFailureCanContinueRoute(trace.Failure) {
 			return failure
@@ -117,6 +138,48 @@ func normalizeExhaustedRouteFailure(
 	return failure
 }
 
+func dominantAdaptiveFailureCode(traces []executionFailureTrace) string {
+	bestCode := ""
+	bestPriority := 0
+	allAdaptive := len(traces) > 0
+	for _, trace := range traces {
+		code := strings.TrimSpace(trace.Failure.Code)
+		priority := adaptiveFailureCodePriority(code)
+		if priority == 0 {
+			allAdaptive = false
+			continue
+		}
+		if priority > bestPriority {
+			bestCode, bestPriority = code, priority
+		}
+	}
+	if !allAdaptive {
+		return ""
+	}
+	return bestCode
+}
+
+func adaptiveFailureCodePriority(code string) int {
+	switch strings.TrimSpace(code) {
+	case "bravo_adaptive_durability_unavailable":
+		return 60
+	case "bravo_adaptive_ledger_saturated":
+		return 50
+	case "bravo_adaptive_estimator_saturated":
+		return 40
+	case "bravo_adaptive_demand_saturated":
+		return 30
+	case "bravo_adaptive_quota_stale", "bravo_adaptive_primary_zero":
+		return 25
+	case "bravo_allocator_reserve_floor":
+		return 20
+	case "bravo_adaptive_concurrency_recheck":
+		return 10
+	default:
+		return 0
+	}
+}
+
 func safeExecutionFailureSummary(trace executionFailureTrace) string {
 	model := strings.TrimSpace(trace.Model)
 	if trace.Failure.Provider != nil {
@@ -128,6 +191,20 @@ func safeExecutionFailureSummary(trace executionFailureTrace) string {
 		}
 	}
 	switch trace.Failure.Code {
+	case "bravo_adaptive_durability_unavailable":
+		return failureModelSummary(model, "Bravo не смог надёжно записать резерв на диск; запрос провайдеру не отправлен")
+	case "bravo_adaptive_ledger_saturated":
+		return failureModelSummary(model, "журнал адаптивных резервов Bravo переполнен и требует сверки лимитов")
+	case "bravo_adaptive_estimator_saturated":
+		return failureModelSummary(model, "оценщик расхода Bravo переполнен и требует сверки лимитов")
+	case "bravo_adaptive_demand_saturated":
+		return failureModelSummary(model, "учёт спроса проектов Bravo переполнен и требует сверки лимитов")
+	case "bravo_adaptive_quota_stale":
+		return failureModelSummary(model, "квота подписки устарела или ещё не подтверждена; требуется обновление квот")
+	case "bravo_adaptive_primary_zero":
+		return failureModelSummary(model, "основная подписка достигла подтверждённого нулевого остатка")
+	case "bravo_adaptive_concurrency_recheck":
+		return failureModelSummary(model, "параллельный запрос занял доступный резерв подписки")
 	case "bravo_allocator_reserve_floor":
 		return failureModelSummary(model, "Claude не вызван: подписка достигла внутреннего резервного порога CLIProxyAPI")
 	case "bravo_allocator_withheld":

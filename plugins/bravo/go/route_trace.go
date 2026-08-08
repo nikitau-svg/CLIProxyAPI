@@ -3,74 +3,100 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
+	"math"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	routeTraceSchemaVersion = 1
-	defaultRouteTraceLimit  = 2000
-	defaultRouteTraceTTL    = 30 * 24 * time.Hour
+	routeTraceSchemaVersion        = 1
+	defaultRouteTraceLimit         = 2000
+	defaultRouteTraceTTL           = 30 * 24 * time.Hour
+	maxPersistedRouteTraceAttempts = 64
 )
 
 // routeTrace is a bounded diagnostic record. It deliberately contains no
 // request/response bodies, headers, plaintext keys, OAuth tokens, or raw
 // provider messages.
 type routeTrace struct {
-	TraceID        string              `json:"trace_id"`
-	StartedAt      time.Time           `json:"started_at"`
-	CompletedAt    time.Time           `json:"completed_at,omitempty"`
-	ProjectID      string              `json:"project_id,omitempty"`
-	LogicalModel   string              `json:"logical_model,omitempty"`
-	SourceProtocol string              `json:"source_protocol,omitempty"`
-	Stream         bool                `json:"stream,omitempty"`
-	Status         int                 `json:"status,omitempty"`
-	Success        bool                `json:"success"`
-	Outcome        string              `json:"outcome,omitempty"`
-	FinalCode      string              `json:"final_code,omitempty"`
-	FinalMessage   string              `json:"final_message,omitempty"`
-	ClientAction   string              `json:"client_action,omitempty"`
-	TotalLatencyMS int64               `json:"total_latency_ms,omitempty"`
-	Attempts       []routeTraceAttempt `json:"attempts,omitempty"`
+	TraceID        string                   `json:"trace_id"`
+	StartedAt      time.Time                `json:"started_at"`
+	CompletedAt    time.Time                `json:"completed_at,omitempty"`
+	ProjectID      string                   `json:"project_id,omitempty"`
+	LogicalModel   string                   `json:"logical_model,omitempty"`
+	SourceProtocol string                   `json:"source_protocol,omitempty"`
+	Stream         bool                     `json:"stream,omitempty"`
+	Status         int                      `json:"status,omitempty"`
+	Success        bool                     `json:"success"`
+	Outcome        string                   `json:"outcome,omitempty"`
+	FinalCode      string                   `json:"final_code,omitempty"`
+	FinalMessage   string                   `json:"final_message,omitempty"`
+	ClientAction   string                   `json:"client_action,omitempty"`
+	TotalLatencyMS int64                    `json:"total_latency_ms,omitempty"`
+	Attempts       []routeTraceAttempt      `json:"attempts,omitempty"`
+	AttemptSummary routeTraceAttemptSummary `json:"attempt_summary"`
+}
+
+type routeTraceAttemptSummary struct {
+	Total     int `json:"total"`
+	Persisted int `json:"persisted"`
+	Omitted   int `json:"omitted"`
 }
 
 type routeTraceAttempt struct {
-	Ordinal              int       `json:"ordinal"`
-	At                   time.Time `json:"at,omitempty"`
-	Provider             string    `json:"provider,omitempty"`
-	Model                string    `json:"model,omitempty"`
-	SubscriptionID       string    `json:"subscription_id,omitempty"`
-	SubscriptionLabel    string    `json:"subscription_label,omitempty"`
-	Status               int       `json:"status,omitempty"`
-	Success              bool      `json:"success"`
-	Outcome              string    `json:"outcome,omitempty"`
-	Decision             string    `json:"decision,omitempty"`
-	Committed            bool      `json:"committed"`
-	RequestedEffort      string    `json:"requested_effort,omitempty"`
-	EffectiveEffort      string    `json:"effective_effort,omitempty"`
-	LatencyMS            int64     `json:"latency_ms,omitempty"`
-	TTFBMS               int64     `json:"ttfb_ms,omitempty"`
-	FirstContentMS       int64     `json:"first_content_ms,omitempty"`
-	ErrorCode            string    `json:"error_code,omitempty"`
-	ErrorMessage         string    `json:"error_message,omitempty"`
-	ProviderErrorType    string    `json:"provider_error_type,omitempty"`
-	ProviderErrorCode    string    `json:"provider_error_code,omitempty"`
-	ProviderErrorScope   string    `json:"provider_error_scope,omitempty"`
-	FailureClass         string    `json:"failure_class,omitempty"`
-	RetryAfter           string    `json:"retry_after,omitempty"`
-	RequiredInputTokens  int64     `json:"required_input_tokens,omitempty"`
-	SupportedInputTokens int64     `json:"supported_input_tokens,omitempty"`
+	Ordinal                     int       `json:"ordinal"`
+	At                          time.Time `json:"at,omitempty"`
+	Provider                    string    `json:"provider,omitempty"`
+	Model                       string    `json:"model,omitempty"`
+	SubscriptionID              string    `json:"subscription_id,omitempty"`
+	SubscriptionLabel           string    `json:"subscription_label,omitempty"`
+	Status                      int       `json:"status,omitempty"`
+	Success                     bool      `json:"success"`
+	Outcome                     string    `json:"outcome,omitempty"`
+	Decision                    string    `json:"decision,omitempty"`
+	Committed                   bool      `json:"committed"`
+	RequestedEffort             string    `json:"requested_effort,omitempty"`
+	EffectiveEffort             string    `json:"effective_effort,omitempty"`
+	LatencyMS                   int64     `json:"latency_ms,omitempty"`
+	TTFBMS                      int64     `json:"ttfb_ms,omitempty"`
+	FirstContentMS              int64     `json:"first_content_ms,omitempty"`
+	ErrorCode                   string    `json:"error_code,omitempty"`
+	ErrorMessage                string    `json:"error_message,omitempty"`
+	ProviderErrorType           string    `json:"provider_error_type,omitempty"`
+	ProviderErrorCode           string    `json:"provider_error_code,omitempty"`
+	ProviderErrorScope          string    `json:"provider_error_scope,omitempty"`
+	FailureClass                string    `json:"failure_class,omitempty"`
+	ProviderStarted             *bool     `json:"provider_started,omitempty"`
+	ProviderExecutionAmbiguous  bool      `json:"provider_execution_ambiguous,omitempty"`
+	RetryAfter                  string    `json:"retry_after,omitempty"`
+	RequiredInputTokens         int64     `json:"required_input_tokens,omitempty"`
+	SupportedInputTokens        int64     `json:"supported_input_tokens,omitempty"`
+	ReservationPercent          float64   `json:"reservation_percent,omitempty"`
+	ProjectRole                 string    `json:"project_role,omitempty"`
+	AllocatorMode               string    `json:"allocator_mode,omitempty"`
+	AdaptiveDecision            string    `json:"adaptive_decision,omitempty"`
+	AdaptiveRejection           string    `json:"adaptive_rejection,omitempty"`
+	AdmissionRejectionCause     string    `json:"admission_rejection_cause,omitempty"`
+	AdaptiveFallback            string    `json:"adaptive_fallback,omitempty"`
+	SessionHeadroomBefore       float64   `json:"session_headroom_before_percent,omitempty"`
+	SessionHeadroomAfter        float64   `json:"session_headroom_after_percent,omitempty"`
+	WeeklyHeadroomBefore        float64   `json:"weekly_headroom_before_percent,omitempty"`
+	WeeklyHeadroomAfter         float64   `json:"weekly_headroom_after_percent,omitempty"`
+	SessionExposureGuardPercent float64   `json:"session_exposure_guard_percent,omitempty"`
+	WeeklyExposureGuardPercent  float64   `json:"weekly_exposure_guard_percent,omitempty"`
+	DemandGuardPercent          float64   `json:"demand_guard_percent,omitempty"`
+	PendingGuardPercent         float64   `json:"pending_guard_percent,omitempty"`
+	InFlightGuardPercent        float64   `json:"in_flight_guard_percent,omitempty"`
+	FallbackProvider            string    `json:"fallback_provider,omitempty"`
+	FallbackModel               string    `json:"fallback_model,omitempty"`
 }
 
 type routeTraceSnapshot struct {
 	SchemaVersion int          `json:"schema_version"`
+	Revision      uint64       `json:"revision,omitempty"`
 	UpdatedAt     time.Time    `json:"updated_at,omitempty"`
 	Traces        []routeTrace `json:"traces"`
 }
@@ -82,25 +108,77 @@ type routeTraceQuery struct {
 	Limit      int
 }
 
-type routeTraceStore struct {
-	mu         sync.Mutex
-	path       string
-	loaded     bool
-	traces     []routeTrace
-	maxEntries int
-	retention  time.Duration
-	saveTimer  *time.Timer
-	dirty      bool
-	loadError  string
+type routeTraceStorageStatus struct {
+	QueueDepth          int    `json:"queue_depth"`
+	QueueCapacity       int    `json:"queue_capacity"`
+	PersistenceDrops    uint64 `json:"persistence_drops"`
+	PersistenceFailures uint64 `json:"persistence_failures"`
+	WALRecords          int    `json:"wal_records"`
+	WALBytes            int64  `json:"wal_bytes"`
 }
 
-var bravoRouteTraces = newRouteTraceStore(defaultStatePath)
+type routeTraceStore struct {
+	appendMu             sync.Mutex
+	mu                   sync.Mutex
+	path                 string
+	walPath              string
+	loaded               bool
+	closed               bool
+	traces               []routeTrace
+	maxEntries           int
+	retention            time.Duration
+	loadError            string
+	nextRevision         uint64
+	snapshotRevision     uint64
+	walRecords           int
+	walBytes             int64
+	maxWALRecords        int
+	maxWALBytes          int64
+	compactAfterRecords  int
+	persistQueue         chan routeTracePersistRequest
+	persistDone          chan struct{}
+	persistenceDrops     uint64
+	persistenceFailures  uint64
+	terminalWaitTimeout  time.Duration
+	terminalQueueTimeout time.Duration
+	beforePersist        func()
+	beforeSnapshot       func() error
+	beforeWALReset       func() error
+	memoryOnly           bool
+}
+
+var bravoRouteTraceStores = struct {
+	sync.RWMutex
+	store *routeTraceStore
+}{store: newRouteTraceStore(defaultStatePath)}
+
+var routeTraceConfigureMu sync.Mutex
 
 func newRouteTraceStore(statePath string) *routeTraceStore {
+	store := &routeTraceStore{
+		path:                 routeTracePath(statePath),
+		walPath:              routeTraceWALPath(statePath),
+		maxEntries:           defaultRouteTraceLimit,
+		retention:            defaultRouteTraceTTL,
+		compactAfterRecords:  128,
+		maxWALRecords:        1024,
+		maxWALBytes:          16 << 20,
+		persistQueue:         make(chan routeTracePersistRequest, 128),
+		persistDone:          make(chan struct{}),
+		terminalWaitTimeout:  500 * time.Millisecond,
+		terminalQueueTimeout: 250 * time.Millisecond,
+	}
+	go store.persistenceLoop()
+	return store
+}
+
+func newMemoryRouteTraceStore() *routeTraceStore {
 	return &routeTraceStore{
-		path:       routeTracePath(statePath),
+		loaded:     true,
+		memoryOnly: true,
 		maxEntries: defaultRouteTraceLimit,
 		retention:  defaultRouteTraceTTL,
+		loadError:  "Хранилище трасс переключается; завершённые трассы временно удерживаются в ограниченной памяти.",
 	}
 }
 
@@ -113,10 +191,31 @@ func routeTracePath(statePath string) string {
 	return base + "-route-traces.json"
 }
 
+func routeTraceWALPath(statePath string) string {
+	return routeTracePath(statePath) + ".wal"
+}
+
 func configureRouteTraceStore(statePath string) error {
-	if bravoRouteTraces != nil {
-		if errFlush := bravoRouteTraces.flush(); errFlush != nil {
-			return errFlush
+	routeTraceConfigureMu.Lock()
+	defer routeTraceConfigureMu.Unlock()
+
+	// Publish an in-memory handoff before filesystem I/O. Requests remain
+	// available while the previous store fsyncs or a legacy file is recovered.
+	transition := newMemoryRouteTraceStore()
+	bravoRouteTraceStores.Lock()
+	previous := bravoRouteTraceStores.store
+	bravoRouteTraceStores.store = transition
+	bravoRouteTraceStores.Unlock()
+
+	closeWarning := ""
+	var closeFallback []routeTrace
+	if previous != nil {
+		previous.mu.Lock()
+		_ = previous.loadLocked()
+		closeFallback = cloneRouteTraces(previous.traces)
+		previous.mu.Unlock()
+		if errClose := previous.close(); errClose != nil {
+			closeWarning = "Предыдущее хранилище трасс не удалось полностью сбросить; проверьте доступность каталога состояния."
 		}
 	}
 	store := newRouteTraceStore(statePath)
@@ -124,12 +223,106 @@ func configureRouteTraceStore(statePath string) error {
 		// Observability must never make model execution unavailable. Keep the
 		// reviewed error for the authenticated management response and recover
 		// with a fresh bounded snapshot on the next completed route.
-		store.loadError = "Предыдущий файл трасс повреждён или несовместим; новые трассы записываются в свежий безопасный снимок."
-		store.loaded = true
-		store.traces = nil
+		_ = store.recoverAfterLoadFailure()
 	}
-	bravoRouteTraces = store
+	if closeWarning != "" {
+		store.mu.Lock()
+		store.mergeFallbackTracesLocked(closeFallback)
+		if store.loadError == "" {
+			store.loadError = closeWarning
+		}
+		store.mu.Unlock()
+		_ = store.flush()
+	}
+
+	// Freeze the bounded handoff only for the short in-memory merge and pointer
+	// swap. No filesystem operation runs under the global request barrier.
+	bravoRouteTraceStores.Lock()
+	transition.mu.Lock()
+	transition.closed = true
+	handoff := cloneRouteTraces(transition.traces)
+	transition.mu.Unlock()
+	store.mu.Lock()
+	store.mergeFallbackTracesLocked(handoff)
+	store.mu.Unlock()
+	bravoRouteTraceStores.store = store
+	bravoRouteTraceStores.Unlock()
+	if len(handoff) > 0 {
+		if errFlush := store.flush(); errFlush != nil {
+			store.setPersistenceWarning()
+		}
+	}
 	return nil
+}
+
+func withRouteTraceStore(fn func(*routeTraceStore)) {
+	bravoRouteTraceStores.RLock()
+	defer bravoRouteTraceStores.RUnlock()
+	if store := bravoRouteTraceStores.store; store != nil {
+		fn(store)
+	}
+}
+
+func readRouteTraceStore[T any](fn func(*routeTraceStore) T) (out T) {
+	bravoRouteTraceStores.RLock()
+	defer bravoRouteTraceStores.RUnlock()
+	if store := bravoRouteTraceStores.store; store != nil {
+		return fn(store)
+	}
+	return out
+}
+
+func appendCurrentRouteTrace(trace routeTrace, durable bool) error {
+	bravoRouteTraceStores.RLock()
+	defer bravoRouteTraceStores.RUnlock()
+	store := bravoRouteTraceStores.store
+	if store == nil {
+		return nil
+	}
+	if durable {
+		return store.appendDurable(trace)
+	}
+	store.append(trace)
+	return nil
+}
+
+func listCurrentRouteTraces(query routeTraceQuery, now time.Time) ([]routeTrace, string, error) {
+	bravoRouteTraceStores.RLock()
+	defer bravoRouteTraceStores.RUnlock()
+	store := bravoRouteTraceStores.store
+	if store == nil {
+		return nil, "", nil
+	}
+	traces, errList := store.list(query, now)
+	return traces, store.warning(), errList
+}
+
+func currentRouteTraceStorageStatus() routeTraceStorageStatus {
+	return readRouteTraceStore(func(store *routeTraceStore) routeTraceStorageStatus {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return routeTraceStorageStatus{
+			QueueDepth:          len(store.persistQueue),
+			QueueCapacity:       cap(store.persistQueue),
+			PersistenceDrops:    store.persistenceDrops,
+			PersistenceFailures: store.persistenceFailures,
+			WALRecords:          store.walRecords,
+			WALBytes:            store.walBytes,
+		}
+	})
+}
+
+func replaceRouteTraceStoreForTest(store *routeTraceStore) func() {
+	bravoRouteTraceStores.Lock()
+	previous := bravoRouteTraceStores.store
+	bravoRouteTraceStores.store = store
+	bravoRouteTraceStores.Unlock()
+	return func() {
+		bravoRouteTraceStores.Lock()
+		bravoRouteTraceStores.store = previous
+		bravoRouteTraceStores.Unlock()
+		_ = store.close()
+	}
 }
 
 func (store *routeTraceStore) warning() string {
@@ -157,9 +350,26 @@ func (store *routeTraceStore) appendWithDurability(trace routeTrace, durable boo
 	if store == nil {
 		return nil
 	}
+	// Serialize revision assignment with queue admission so WAL records are
+	// always ordered even when requests complete concurrently.
+	store.appendMu.Lock()
 	store.mu.Lock()
-	defer store.mu.Unlock()
-	_ = store.loadLocked()
+	if store.closed {
+		store.mu.Unlock()
+		store.appendMu.Unlock()
+		return errRouteTraceStoreClosed
+	}
+	if errLoad := store.loadLocked(); errLoad != nil {
+		// Diagnostics remain fail-soft: a broken backing path must not discard
+		// the terminal trace from bounded memory or affect provider execution.
+		store.loaded = true
+		store.traces = nil
+		store.nextRevision = 0
+		store.snapshotRevision = 0
+		store.walRecords = 0
+		store.walBytes = 0
+		store.loadError = "Хранилище трасс недоступно; новые трассы остаются в ограниченной памяти до восстановления диска."
+	}
 	trace = sanitizeRouteTrace(trace)
 	if trace.TraceID == "" {
 		trace.TraceID = newRouteTraceID()
@@ -168,31 +378,45 @@ func (store *routeTraceStore) appendWithDurability(trace routeTrace, durable boo
 		trace.StartedAt = time.Now().UTC()
 	}
 	store.traces = append(store.traces, trace)
-	store.pruneLocked(time.Now().UTC())
-	store.dirty = true
-	if durable {
-		if store.saveTimer != nil {
-			store.saveTimer.Stop()
-			store.saveTimer = nil
-		}
-		if errSave := store.saveLocked(); errSave != nil {
-			store.loadError = "Не удалось сохранить аварийную трассу на диск; она остаётся доступна в памяти до перезапуска."
-			store.scheduleSaveLocked()
-			return errSave
-		}
-		store.dirty = false
+	store.trimCountLocked()
+	store.nextRevision++
+	record := routeTraceWALRecord{SchemaVersion: routeTraceSchemaVersion, Revision: store.nextRevision, Trace: trace}
+	store.mu.Unlock()
+	if store.memoryOnly {
+		store.appendMu.Unlock()
 		return nil
 	}
-	store.scheduleSaveLocked()
-	return nil
-}
 
-func (store *routeTraceStore) scheduleSaveLocked() {
-	if store.saveTimer == nil {
-		store.saveTimer = time.AfterFunc(250*time.Millisecond, func() {
-			_ = store.flush()
-		})
+	request := routeTracePersistRequest{kind: routeTracePersistAppend, record: record}
+	if durable {
+		request.ack = make(chan error, 1)
+		if errQueue := store.enqueueDurable(request); errQueue != nil {
+			store.appendMu.Unlock()
+			store.setPersistenceWarning()
+			return errQueue
+		}
+		store.appendMu.Unlock()
+		select {
+		case errPersist := <-request.ack:
+			if errPersist != nil {
+				store.setPersistenceWarning()
+			}
+			return errPersist
+		case <-time.After(store.terminalWaitTimeout):
+			store.setPersistenceWarning()
+			return errRouteTracePersistenceTimeout
+		}
 	}
+	select {
+	case store.persistQueue <- request:
+	default:
+		store.mu.Lock()
+		store.persistenceDrops++
+		store.loadError = "Очередь сохранения трасс перегружена; часть успешных трасс доступна только в памяти до следующего снимка."
+		store.mu.Unlock()
+	}
+	store.appendMu.Unlock()
+	return nil
 }
 
 func (store *routeTraceStore) list(query routeTraceQuery, now time.Time) ([]routeTrace, error) {
@@ -232,103 +456,23 @@ func (store *routeTraceStore) load() error {
 	return store.loadLocked()
 }
 
-func (store *routeTraceStore) loadLocked() error {
-	if store.loaded {
-		return nil
-	}
-	store.loaded = true
-	raw, errRead := os.ReadFile(store.path)
-	if errors.Is(errRead, os.ErrNotExist) {
-		return nil
-	}
-	if errRead != nil {
-		return fmt.Errorf("read Bravo route traces: %w", errRead)
-	}
-	var snapshot routeTraceSnapshot
-	if errDecode := json.Unmarshal(raw, &snapshot); errDecode != nil {
-		return fmt.Errorf("decode Bravo route traces: %w", errDecode)
-	}
-	if snapshot.SchemaVersion != routeTraceSchemaVersion {
-		return fmt.Errorf("unsupported Bravo route trace schema %d", snapshot.SchemaVersion)
-	}
-	store.traces = make([]routeTrace, 0, len(snapshot.Traces))
-	for _, trace := range snapshot.Traces {
-		store.traces = append(store.traces, sanitizeRouteTrace(trace))
-	}
-	return nil
-}
-
-func (store *routeTraceStore) flush() error {
-	if store == nil {
-		return nil
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if errLoad := store.loadLocked(); errLoad != nil {
-		return errLoad
-	}
-	if store.saveTimer != nil {
-		store.saveTimer.Stop()
-		store.saveTimer = nil
-	}
-	if !store.dirty {
-		return nil
-	}
-	if errSave := store.saveLocked(); errSave != nil {
-		return errSave
-	}
-	store.dirty = false
-	return nil
-}
-
-func (store *routeTraceStore) saveLocked() error {
-	store.pruneLocked(time.Now().UTC())
-	if errMkdir := os.MkdirAll(filepath.Dir(store.path), 0o700); errMkdir != nil {
-		return fmt.Errorf("create Bravo route trace directory: %w", errMkdir)
-	}
-	snapshot := routeTraceSnapshot{
-		SchemaVersion: routeTraceSchemaVersion,
-		UpdatedAt:     time.Now().UTC(),
-		Traces:        store.traces,
-	}
-	raw, errEncode := json.Marshal(snapshot)
-	if errEncode != nil {
-		return fmt.Errorf("encode Bravo route traces: %w", errEncode)
-	}
-	temporary := store.path + ".tmp"
-	if errWrite := os.WriteFile(temporary, raw, 0o600); errWrite != nil {
-		return fmt.Errorf("write Bravo route traces: %w", errWrite)
-	}
-	if errChmod := os.Chmod(temporary, 0o600); errChmod != nil {
-		_ = os.Remove(temporary)
-		return fmt.Errorf("protect Bravo route traces: %w", errChmod)
-	}
-	if errRename := os.Rename(temporary, store.path); errRename != nil {
-		_ = os.Remove(temporary)
-		return fmt.Errorf("replace Bravo route traces: %w", errRename)
-	}
-	return nil
-}
-
-func (store *routeTraceStore) pruneLocked(now time.Time) {
-	cutoff := now.Add(-store.retention)
-	kept := store.traces[:0]
-	for _, trace := range store.traces {
-		if !trace.StartedAt.IsZero() && trace.StartedAt.Before(cutoff) {
-			continue
-		}
-		kept = append(kept, trace)
-	}
-	store.traces = kept
-	sort.SliceStable(store.traces, func(i, j int) bool {
-		return store.traces[i].StartedAt.Before(store.traces[j].StartedAt)
-	})
-	if excess := len(store.traces) - store.maxEntries; excess > 0 {
-		store.traces = append([]routeTrace(nil), store.traces[excess:]...)
-	}
-}
-
 func sanitizeRouteTrace(trace routeTrace) routeTrace {
+	totalAttempts := len(trace.Attempts)
+	if trace.AttemptSummary.Total > totalAttempts {
+		totalAttempts = trace.AttemptSummary.Total
+	}
+	if len(trace.Attempts) > maxPersistedRouteTraceAttempts {
+		last := trace.Attempts[len(trace.Attempts)-1]
+		trace.Attempts = append([]routeTraceAttempt(nil), trace.Attempts[:maxPersistedRouteTraceAttempts-1]...)
+		trace.Attempts = append(trace.Attempts, last)
+	} else {
+		trace.Attempts = append([]routeTraceAttempt(nil), trace.Attempts...)
+	}
+	trace.AttemptSummary = routeTraceAttemptSummary{
+		Total:     totalAttempts,
+		Persisted: len(trace.Attempts),
+		Omitted:   totalAttempts - len(trace.Attempts),
+	}
 	trace.TraceID = safeRouteTraceIdentifier(trace.TraceID)
 	trace.ProjectID = safeRouteTraceIdentifier(trace.ProjectID)
 	trace.LogicalModel = safeRouteTraceModel(trace.LogicalModel)
@@ -344,7 +488,9 @@ func sanitizeRouteTrace(trace routeTrace) routeTrace {
 	}
 	for index := range trace.Attempts {
 		attempt := &trace.Attempts[index]
-		attempt.Ordinal = index + 1
+		if attempt.Ordinal <= 0 {
+			attempt.Ordinal = index + 1
+		}
 		attempt.Provider = safeRouteTraceIdentifier(attempt.Provider)
 		attempt.Model = safeRouteTraceModel(attempt.Model)
 		attempt.SubscriptionID = safeRouteTraceIdentifier(attempt.SubscriptionID)
@@ -363,13 +509,93 @@ func sanitizeRouteTrace(trace routeTrace) routeTrace {
 		attempt.EffectiveEffort = safeRouteTraceIdentifier(attempt.EffectiveEffort)
 		attempt.FailureClass = safeRouteTraceIdentifier(attempt.FailureClass)
 		attempt.RetryAfter = safeRouteTraceIdentifier(attempt.RetryAfter)
+		attempt.ProjectRole = safeRouteTraceIdentifier(attempt.ProjectRole)
+		attempt.AllocatorMode = safeRouteTraceIdentifier(attempt.AllocatorMode)
+		attempt.AdaptiveDecision = safeRouteTraceIdentifier(attempt.AdaptiveDecision)
+		attempt.AdaptiveRejection = safeRouteTraceIdentifier(attempt.AdaptiveRejection)
+		attempt.AdmissionRejectionCause = safeRouteTraceIdentifier(attempt.AdmissionRejectionCause)
+		attempt.AdaptiveFallback = safeRouteTraceIdentifier(attempt.AdaptiveFallback)
+		attempt.FallbackProvider = safeRouteTraceIdentifier(attempt.FallbackProvider)
+		attempt.FallbackModel = safeRouteTraceModel(attempt.FallbackModel)
+		attempt.ReservationPercent = safeRouteTracePercent(attempt.ReservationPercent)
+		attempt.SessionHeadroomBefore = safeRouteTraceSignedPercent(attempt.SessionHeadroomBefore)
+		attempt.SessionHeadroomAfter = safeRouteTraceSignedPercent(attempt.SessionHeadroomAfter)
+		attempt.WeeklyHeadroomBefore = safeRouteTraceSignedPercent(attempt.WeeklyHeadroomBefore)
+		attempt.WeeklyHeadroomAfter = safeRouteTraceSignedPercent(attempt.WeeklyHeadroomAfter)
+		attempt.SessionExposureGuardPercent = safeRouteTracePercent(attempt.SessionExposureGuardPercent)
+		attempt.WeeklyExposureGuardPercent = safeRouteTracePercent(attempt.WeeklyExposureGuardPercent)
+		attempt.DemandGuardPercent = safeRouteTracePercent(attempt.DemandGuardPercent)
+		attempt.PendingGuardPercent = safeRouteTracePercent(attempt.PendingGuardPercent)
+		attempt.InFlightGuardPercent = safeRouteTracePercent(attempt.InFlightGuardPercent)
 		if attempt.LatencyMS < 0 {
 			attempt.LatencyMS = 0
 		}
 	}
+	trace.FinalCode = dominantAdaptiveRouteTraceCode(trace)
 	trace.FinalMessage = routeTraceActionRU(trace)
 	trace.ClientAction = routeTraceClientAction(trace)
 	return trace
+}
+
+func dominantAdaptiveRouteTraceCode(trace routeTrace) string {
+	if trace.Success {
+		return trace.FinalCode
+	}
+	if trace.FinalCode != "" && trace.FinalCode != "bravo_route_temporarily_unavailable" {
+		return trace.FinalCode
+	}
+	for _, attempt := range trace.Attempts {
+		if attempt.ErrorCode == "bravo_context_window_exceeded" {
+			return "bravo_context_window_exceeded"
+		}
+	}
+	bestCode := ""
+	bestPriority := 0
+	allAdaptive := len(trace.Attempts) > 0
+	for _, attempt := range trace.Attempts {
+		code := strings.TrimSpace(attempt.ErrorCode)
+		if code == "" {
+			switch attempt.AdmissionRejectionCause {
+			case "durability_unavailable":
+				code = "bravo_adaptive_durability_unavailable"
+			case "ledger_saturated":
+				code = "bravo_adaptive_ledger_saturated"
+			case "estimator_saturated":
+				code = "bravo_adaptive_estimator_saturated"
+			case "demand_saturated":
+				code = "bravo_adaptive_demand_saturated"
+			case "floor":
+				code = "bravo_allocator_reserve_floor"
+			case "concurrency":
+				code = "bravo_adaptive_concurrency_recheck"
+			}
+		}
+		if priority := adaptiveFailureCodePriority(code); priority > bestPriority {
+			bestCode, bestPriority = code, priority
+		} else if priority == 0 {
+			allAdaptive = false
+		}
+	}
+	if allAdaptive && bestCode != "" {
+		return bestCode
+	}
+	return trace.FinalCode
+}
+
+func safeRouteTracePercent(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	value = math.Min(math.Max(value, 0), 100)
+	return math.Round(value*1000) / 1000
+}
+
+func safeRouteTraceSignedPercent(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	value = math.Min(math.Max(value, -100), 100)
+	return math.Round(value*1000) / 1000
 }
 
 func routeTraceClientAction(trace routeTrace) string {
@@ -385,9 +611,19 @@ func routeTraceClientAction(trace routeTrace) string {
 	switch trace.FinalCode {
 	case "bravo_subscription_quota_exhausted", "bravo_subscription_model_credits_exhausted":
 		return "raise_quota"
+	case "bravo_adaptive_ledger_saturated", "bravo_adaptive_estimator_saturated", "bravo_adaptive_demand_saturated":
+		return "reconcile_limits"
+	case "bravo_adaptive_durability_unavailable":
+		return "check_storage"
+	case "bravo_adaptive_quota_stale":
+		return "refresh_quota"
+	case "bravo_adaptive_primary_zero":
+		return "raise_quota"
+	case "bravo_allocator_reserve_floor":
+		return "adjust_reserve"
 	case "bravo_subscription_auth_unavailable", "authentication_error":
 		return "reauth"
-	case "bravo_route_temporarily_unavailable", "overloaded_error", "server_error":
+	case "bravo_route_temporarily_unavailable", "bravo_adaptive_concurrency_recheck", "overloaded_error", "server_error":
 		return "retry"
 	default:
 		return "none"
@@ -423,6 +659,20 @@ func routeTraceMessageRU(code string) string {
 		return "Для этой модели исчерпан отдельный лимит расходов у провайдера."
 	case "bravo_allocator_reserve_floor":
 		return "Подписка достигла внутреннего резервного порога проекта Bravo."
+	case "bravo_adaptive_ledger_saturated":
+		return adaptiveLedgerSaturatedMessageRU
+	case "bravo_adaptive_estimator_saturated":
+		return "Оценщик расхода Bravo переполнен; выполните сверку лимитов в админке Bravo."
+	case "bravo_adaptive_demand_saturated":
+		return "Учёт спроса проектов Bravo переполнен; выполните сверку лимитов в админке Bravo."
+	case "bravo_adaptive_durability_unavailable":
+		return "Bravo не смог надёжно записать резерв на диск; проверьте каталог состояния."
+	case "bravo_adaptive_concurrency_recheck":
+		return "Параллельный запрос занял доступный резерв; Bravo выберет следующий безопасный маршрут."
+	case "bravo_adaptive_quota_stale":
+		return "Квота подписки устарела или ещё не подтверждена; обновите квоты в админке Bravo."
+	case "bravo_adaptive_primary_zero":
+		return "Основная подписка достигла подтверждённого нулевого остатка."
 	case "bravo_subscription_auth_unavailable", "authentication_error":
 		return "Авторизация подписки недоступна."
 	case "bravo_subscription_access_denied", "permission_error":

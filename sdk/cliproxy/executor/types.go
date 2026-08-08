@@ -118,6 +118,10 @@ type Options struct {
 	Metadata map[string]any
 	// RequestAfterAuthInterceptor runs after credential selection and before executor translation.
 	RequestAfterAuthInterceptor RequestAfterAuthInterceptor
+	// ProviderStartObserver is invoked synchronously immediately before the
+	// selected provider executor is called. Once invoked, cancellation outcome
+	// is conservatively ambiguous because provider work may have started.
+	ProviderStartObserver func() `json:"-"`
 }
 
 // ResponseFormatOrSource returns the response target format for an execution.

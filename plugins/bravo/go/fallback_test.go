@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -459,7 +460,10 @@ func isolateBravoFallbackTestState(t *testing.T) {
 	runtimeState.Cooldowns = make(map[string]cooldownEntry)
 	runtimeState.Attempts = nil
 	runtimeState.Unlock()
+	testTraces := newRouteTraceStore(filepath.Join(t.TempDir(), "bravo-state.json"))
+	restoreTraces := replaceRouteTraceStoreForTest(testTraces)
 	t.Cleanup(func() {
+		restoreTraces()
 		runtimeState.Lock()
 		runtimeState.Cooldowns = previousCooldowns
 		runtimeState.Attempts = previousAttempts

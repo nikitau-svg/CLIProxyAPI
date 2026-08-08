@@ -20,11 +20,9 @@ func textContract() requestCapabilityContract {
 	}
 }
 
-// The allocator is a budget policy, not an authorization boundary. When it
-// withholds every credential the request is still authorized and the account is
-// still alive, so the client must be served rather than dropped — the unprefixed
-// model would have run on the very same subscription.
-func TestAllocatorBypassServesRequestTheAllocatorWithheld(t *testing.T) {
+// U26: an allocator rejection is an execution boundary. Generic planning must
+// never manufacture an unmanaged attempt around unknown quota or reserve debt.
+func TestAllocatorBypassFailsClosedForWithheldCredential(t *testing.T) {
 	isolateBravoCooldowns(t)
 	now := time.Now()
 	model := logicalModel{Candidates: []candidate{
@@ -42,19 +40,8 @@ func TestAllocatorBypassServesRequestTheAllocatorWithheld(t *testing.T) {
 	}}
 
 	plan := allocatorBypassPlan("opus", model, textContract(), auths, rejections, "", now)
-	if len(plan) != 1 {
-		t.Fatalf("bypass plan length = %d, want 1", len(plan))
-	}
-	if plan[0].Auth.ID != "claude-a" {
-		t.Fatalf("bypass used auth %q, want claude-a", plan[0].Auth.ID)
-	}
-	if plan[0].LogicalModel != "opus" {
-		t.Fatalf("bypass attempt logical model = %q, want opus", plan[0].LogicalModel)
-	}
-	// Re-applying the floors that just withheld the credential would withhold it
-	// again in the lease path, turning the bypass into a silent no-op.
-	if plan[0].AllocatorManaged {
-		t.Fatal("bypass attempt stayed allocator-managed")
+	if len(plan) != 0 {
+		t.Fatalf("allocator rejection produced %d unmanaged attempts, want fail-closed", len(plan))
 	}
 }
 
@@ -117,8 +104,8 @@ func TestAllocatorBypassCannotWidenTheAuthorizationBoundary(t *testing.T) {
 			t.Fatal("bypass reached a credential outside the project's allowed_auth_ids")
 		}
 	}
-	if len(plan) != 1 {
-		t.Fatalf("bypass plan length = %d, want 1", len(plan))
+	if len(plan) != 0 {
+		t.Fatalf("authorization-filtered allocator rejection produced %d unmanaged attempts", len(plan))
 	}
 }
 
@@ -166,10 +153,8 @@ func TestAllocatorBypassIsInertWithoutAllocatorRejections(t *testing.T) {
 	}
 }
 
-// Planning keeps every eligible fallback. MaxAttempts is a provider-call
-// budget enforced by the execution loops, so a candidate skipped after the
-// plan was built cannot consume the budget or hide a later provider.
-func TestAllocatorBypassDoesNotSpendProviderCallBudgetWhilePlanning(t *testing.T) {
+// U27: provider call budget cannot revive an allocator-rejected credential.
+func TestAllocatorBypassCannotUseProviderBudgetToReviveRejectedCredential(t *testing.T) {
 	isolateBravoCooldowns(t)
 	now := time.Now()
 	previous := loadedConfig()
@@ -193,8 +178,8 @@ func TestAllocatorBypassDoesNotSpendProviderCallBudgetWhilePlanning(t *testing.T
 		Reason:   "withheld",
 	}}
 	plan := allocatorBypassPlan("opus", model, textContract(), auths, rejections, "", now)
-	if len(plan) != 2 {
-		t.Fatalf("bypass plan length = %d, want both eligible accounts before runtime budgeting", len(plan))
+	if len(plan) != 0 {
+		t.Fatalf("provider budget revived %d allocator-rejected attempts", len(plan))
 	}
 }
 

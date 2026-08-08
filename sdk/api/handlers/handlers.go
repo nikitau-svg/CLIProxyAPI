@@ -938,6 +938,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 		Headers:                     modelExecutionHeaders(ctx, execOptions.Headers),
 		Query:                       modelExecutionQuery(ctx, execOptions.Query),
 		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, execOptions.SkipInterceptorPluginID),
+		ProviderStartObserver:       execOptions.ProviderStartObserver,
 	}
 	opts.Metadata = reqMeta
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
@@ -1001,6 +1002,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 		Headers:                     modelExecutionHeaders(ctx, execOptions.Headers),
 		Query:                       modelExecutionQuery(ctx, execOptions.Query),
 		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, execOptions.SkipInterceptorPluginID),
+		ProviderStartObserver:       execOptions.ProviderStartObserver,
 	}
 	opts.Metadata = reqMeta
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, handlerType, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
@@ -1368,6 +1370,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		Headers:                     modelExecutionHeaders(ctx, execOptions.Headers),
 		Query:                       modelExecutionQuery(ctx, execOptions.Query),
 		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, execOptions.SkipInterceptorPluginID),
+		ProviderStartObserver:       execOptions.ProviderStartObserver,
 	}
 	opts.Metadata = reqMeta
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)

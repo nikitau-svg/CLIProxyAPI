@@ -427,6 +427,7 @@ func installPersistedRouteOverrides(items []routeOverrideConfig) error {
 		return fmt.Errorf("validate persisted route overrides: %w", errNormalize)
 	}
 	currentConfig.Store(cfg)
+	resetAdaptiveStatusRuntime()
 	return nil
 }
 

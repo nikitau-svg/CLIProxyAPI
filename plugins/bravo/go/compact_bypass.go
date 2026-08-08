@@ -16,6 +16,7 @@ import (
 )
 
 const compactBypassWarningRU = "Команда /compact временно использовала резерв Claude ниже внутреннего порога Bravo и могла уменьшить доступный лимит подписки."
+const adaptiveLedgerSaturatedMessageRU = "Защитный журнал Bravo переполнен: часть незавершённого расхода сохранена как общий долг. Вторичные маршруты и /compact заблокированы до сверки лимитов и сброса аварийного состояния."
 
 type claudeRequestMessage struct {
 	Role    string          `json:"role"`
@@ -101,6 +102,7 @@ func compactBypassCandidateAttempts(
 	item candidate,
 	auths []pluginapi.HostAuthFileEntry,
 	sticky string,
+	requestShape adaptiveRequestShape,
 ) []executionAttempt {
 	if cfg.CompactBypassCooldownSeconds <= 0 || normalizeProvider(item.Provider) != "claude" {
 		return nil
@@ -122,14 +124,19 @@ func compactBypassCandidateAttempts(
 		}
 		quota := quotaSnapshot(authIndex)
 		tariff := effectiveTariff(cfg, subscription, firstNonEmpty(auth.Provider, auth.Type), quota)
-		if !compactBypassQuotaEligible(quota, item.Model, authIndex, tariff.ReservationPercent) {
+		reservation := adaptiveReservationForShape(auth, tariff, requestShape, time.Now())
+		if !compactBypassQuotaEligible(quota, item.Model, authIndex, reservation) {
 			continue
 		}
 		attempts = append(attempts, executionAttempt{
 			Candidate:                    item,
 			Auth:                         auth,
 			ProjectID:                    project.ID,
-			ReservationPercent:           tariff.ReservationPercent,
+			AllocatorManaged:             true,
+			ReservationPercent:           reservation,
+			AdaptiveReserveKey:           adaptiveProfileKey(authIndex, requestShape),
+			AdaptiveRequestShape:         requestShape,
+			AdaptiveBaselinePercent:      tariff.ReservationPercent,
 			TariffID:                     tariff.ID,
 			CompactBypass:                true,
 			CompactBypassKey:             key,
@@ -155,7 +162,10 @@ func compactBypassQuotaEligible(
 	model, authIndex string,
 	reservation float64,
 ) bool {
-	if quotaConfidence(quota) != "confirmed" {
+	if adaptiveRoutingSaturated.Load() || adaptiveEstimatorIdentitySaturated(authIndex) {
+		return false
+	}
+	if quotaRoutingConfidenceAt(quota, model, loadedConfig(), time.Now()) != "confirmed" {
 		return false
 	}
 	session, weekly := effectiveQuotaWindows(quota, model)
@@ -168,12 +178,59 @@ func compactBypassQuotaEligible(
 }
 
 func acquireExecutionAttemptLease(attempt executionAttempt) (func(bool), bool, *executionFailure) {
+	release, acquired, failure, _ := acquireExecutionAttemptLeaseDetailed(attempt)
+	return release, acquired, failure
+}
+
+func acquireExecutionAttemptLeaseDetailed(attempt executionAttempt) (func(bool), bool, *executionFailure, executionAttempt) {
+	if attempt.AllocatorObserve && !attempt.CompactBypass {
+		release, effectiveAttempt := acquireObserveShadowLease(attempt)
+		return release, true, nil, effectiveAttempt
+	}
 	if !attempt.CompactBypass {
-		release, acquired := acquireAttemptLease(attempt)
-		return release, acquired, nil
+		release, acquired, effectiveAttempt := acquireAttemptLeaseDetailed(attempt)
+		if !acquired && attempt.AllocatorManaged {
+			decision := effectiveAttempt.AdaptiveTrace
+			if failure := adaptiveAdmissionFailure(decision.rejectionCause); failure != nil {
+				return release, false, failure, effectiveAttempt
+			}
+			message := "Подписка временно удерживается адаптивным резервом Bravo; запрос будет направлен в следующий безопасный маршрут."
+			if decision.rejection == "adaptive_primary_zero" {
+				message = "Основная подписка достигла подтверждённого нулевого остатка; Bravo выбирает следующий безопасный маршрут."
+			}
+			failure := executionFailure{
+				Code:          "bravo_allocator_reserve_floor",
+				Message:       message,
+				Status:        http.StatusServiceUnavailable,
+				Retryable:     true,
+				RouteFallback: true,
+			}
+			return release, false, &failure, effectiveAttempt
+		}
+		return release, acquired, nil, effectiveAttempt
+	}
+	if adaptiveRoutingSaturated.Load() {
+		failure := executionFailure{
+			Code:          "bravo_adaptive_ledger_saturated",
+			Message:       adaptiveLedgerSaturatedMessageRU,
+			Status:        http.StatusServiceUnavailable,
+			Retryable:     false,
+			RouteFallback: true,
+		}
+		return func(bool) {}, false, &failure, attempt
+	}
+	if adaptiveEstimatorIdentitySaturated(attempt.Auth.AuthIndex) {
+		failure := executionFailure{
+			Code:          "bravo_adaptive_estimator_saturated",
+			Message:       "Оценка расхода этой подписки переполнена неопределёнными данными; /compact заблокирован до подтверждённой сверки лимитов.",
+			Status:        http.StatusServiceUnavailable,
+			Retryable:     false,
+			RouteFallback: true,
+		}
+		return func(bool) {}, false, &failure, attempt
 	}
 	cooldown := time.Duration(attempt.CompactBypassCooldownSeconds) * time.Second
-	release, wait, acquired := reserveCompactBypass(attempt.CompactBypassKey, cooldown, time.Now())
+	cooldownRelease, wait, acquired := reserveCompactBypass(attempt.CompactBypassKey, cooldown, time.Now())
 	if !acquired {
 		seconds := int(math.Ceil(wait.Seconds()))
 		if seconds < 1 {
@@ -187,14 +244,76 @@ func acquireExecutionAttemptLease(attempt executionAttempt) (func(bool), bool, *
 			RouteFallback: true,
 			RetryAfter:    strconv.Itoa(seconds),
 		}
-		return func(bool) {}, false, &failure
+		return func(bool) {}, false, &failure, attempt
 	}
-	return func(commit bool) {
-		release(commit, time.Now())
-		if commit {
-			logCompactBypassUsage(attempt)
+	adaptiveRelease, adaptiveAcquired, effectiveAttempt := acquireAttemptLeaseDetailed(attempt)
+	if !adaptiveAcquired {
+		cooldownRelease(false, time.Now())
+		if failure := adaptiveAdmissionFailure(effectiveAttempt.AdaptiveTrace.rejectionCause); failure != nil {
+			return func(bool) {}, false, failure, effectiveAttempt
 		}
-	}, true, nil
+		code := "bravo_compact_adaptive_reserve"
+		message := "Подтверждённого остатка подписки недостаточно для безопасного /compact; Bravo попробует следующий маршрут."
+		if adaptiveRoutingSaturated.Load() {
+			code, message = "bravo_adaptive_ledger_saturated", adaptiveLedgerSaturatedMessageRU
+		} else if adaptiveEstimatorIdentitySaturated(attempt.Auth.AuthIndex) {
+			code = "bravo_adaptive_estimator_saturated"
+			message = "Оценка расхода этой подписки переполнена неопределёнными данными; /compact заблокирован до подтверждённой сверки лимитов."
+		}
+		failure := executionFailure{
+			Code:          code,
+			Message:       message,
+			Status:        http.StatusServiceUnavailable,
+			Retryable:     code == "bravo_compact_adaptive_reserve",
+			RouteFallback: true,
+		}
+		return func(bool) {}, false, &failure, effectiveAttempt
+	}
+	var once sync.Once
+	return func(commit bool) {
+		once.Do(func() {
+			adaptiveRelease(commit)
+			cooldownRelease(commit, time.Now())
+			if commit {
+				logCompactBypassUsage(effectiveAttempt)
+			}
+		})
+	}, true, nil, effectiveAttempt
+}
+
+func adaptiveAdmissionFailure(cause adaptiveAdmissionRejectionCause) *executionFailure {
+	failure := executionFailure{
+		Status:        http.StatusServiceUnavailable,
+		Retryable:     true,
+		RouteFallback: true,
+	}
+	switch cause {
+	case adaptiveRejectionLedgerSaturated:
+		failure.Code = "bravo_adaptive_ledger_saturated"
+		failure.Message = adaptiveLedgerSaturatedMessageRU
+		failure.Retryable = false
+	case adaptiveRejectionEstimatorSaturated:
+		failure.Code = "bravo_adaptive_estimator_saturated"
+		failure.Message = "Оценщик расхода Bravo переполнен и временно закрыл эту подписку для безопасного вторичного маршрута. Выполните сверку лимитов в админке Bravo."
+	case adaptiveRejectionDemandSaturated:
+		failure.Code = "bravo_adaptive_demand_saturated"
+		failure.Message = "Учёт спроса проектов Bravo переполнен и временно защищает подписку от вторичного расхода. Выполните сверку лимитов в админке Bravo."
+	case adaptiveRejectionDurabilityUnavailable:
+		failure.Code = "bravo_adaptive_durability_unavailable"
+		failure.Message = "Bravo не смог надёжно записать резерв запроса на диск и не отправил запрос провайдеру. Проверьте доступность каталога состояния."
+	case adaptiveRejectionQuotaStale:
+		failure.Code = "bravo_adaptive_quota_stale"
+		failure.Message = "Квота подписки устарела или ещё не подтверждена; запрос провайдеру не отправлен. Обновите квоты в админке Bravo."
+	case adaptiveRejectionPrimaryZero:
+		failure.Code = "bravo_adaptive_primary_zero"
+		failure.Message = "Основная подписка достигла подтверждённого нулевого остатка; запрос провайдеру не отправлен. Дождитесь сброса или увеличьте лимит."
+	case adaptiveRejectionConcurrency:
+		failure.Code = "bravo_adaptive_concurrency_recheck"
+		failure.Message = "Параллельный запрос занял доступный резерв подписки раньше текущего; Bravo попробует следующий безопасный маршрут."
+	default:
+		return nil
+	}
+	return &failure
 }
 
 func reserveCompactBypass(

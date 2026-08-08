@@ -21,15 +21,17 @@ import (
 const creditsRequiredMinimumProbeInterval = 15 * time.Minute
 
 type executionFailure struct {
-	Code          string
-	Message       string
-	Status        int
-	Retryable     bool
-	RouteFallback bool
-	AccountWide   bool
-	Headers       http.Header
-	RetryAfter    string
-	Provider      *providererror.Detail
+	Code                       string
+	Message                    string
+	Status                     int
+	Retryable                  bool
+	RouteFallback              bool
+	AccountWide                bool
+	Headers                    http.Header
+	RetryAfter                 string
+	Provider                   *providererror.Detail
+	ProviderStarted            *bool
+	ProviderExecutionAmbiguous bool
 }
 
 func execute(raw []byte) ([]byte, error) {
@@ -62,12 +64,8 @@ func execute(raw []byte) ([]byte, error) {
 	routeTrace := newRouteTraceRecorder(req, logicalModelID, protocol, false)
 	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
 	if errPlan != nil {
-		failure := executionFailure{
-			Code:      "bravo_no_eligible_account",
-			Message:   errPlan.Error(),
-			Status:    http.StatusServiceUnavailable,
-			Retryable: true,
-		}
+		failure, rejections := executionPlanFailure(errPlan)
+		routeTrace.preflight(rejections)
 		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
 
@@ -120,7 +118,8 @@ func execute(raw []byte) ([]byte, error) {
 		if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
 			break
 		}
-		releaseLease, acquired, leaseFailure := acquireExecutionAttemptLease(attempt)
+		releaseLease, acquired, leaseFailure, effectiveAttempt := acquireExecutionAttemptLeaseDetailed(attempt)
+		attempt = effectiveAttempt
 		if leaseFailure != nil {
 			lastFailure = *leaseFailure
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, *leaseFailure)
@@ -137,8 +136,11 @@ func execute(raw []byte) ([]byte, error) {
 			HostCallbackID:            req.HostCallbackID,
 		})
 		if errCall != nil {
-			releaseLease(false)
 			failure := classifyExecutionError(errCall)
+			// Only an explicit host acceptance phase can prove cancellation
+			// happened before provider dispatch. Every absent/ambiguous phase keeps
+			// the reservation conservatively until quota reconciliation.
+			releaseLease(!provenPreProviderCancellation(failure))
 			contextRouting.observeFailure(attempt, failure)
 			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
 			routeTrace.failure(attempt, started, failure.Status, failure)
@@ -343,12 +345,14 @@ func failureEnvelope(failure executionFailure) []byte {
 		retryAfter = strconv.Itoa(defaultRetryAfterSeconds(failure))
 	}
 	return detailedErrorEnvelope(envelopeError{
-		Code:       code,
-		Message:    message,
-		Retryable:  failure.Retryable,
-		HTTPStatus: status,
-		Headers:    cloneHeader(failure.Headers),
-		RetryAfter: retryAfter,
+		Code:                       code,
+		Message:                    message,
+		Retryable:                  failure.Retryable,
+		HTTPStatus:                 status,
+		Headers:                    cloneHeader(failure.Headers),
+		RetryAfter:                 retryAfter,
+		ProviderStarted:            cloneBoolPointer(failure.ProviderStarted),
+		ProviderExecutionAmbiguous: failure.ProviderExecutionAmbiguous,
 	})
 }
 
@@ -376,12 +380,14 @@ func classifyExecutionError(err error) executionFailure {
 			status = http.StatusBadGateway
 		}
 		failure := executionFailure{
-			Code:       firstNonEmpty(hostErr.Code, "bravo_host_call_failed"),
-			Message:    hostErr.Message,
-			Status:     status,
-			Retryable:  hostErr.Retryable || retryableHTTPStatus(status),
-			Headers:    cloneHeader(hostErr.Headers),
-			RetryAfter: firstNonEmpty(hostErr.RetryAfter, hostErr.Headers.Get("Retry-After")),
+			Code:                       firstNonEmpty(hostErr.Code, "bravo_host_call_failed"),
+			Message:                    hostErr.Message,
+			Status:                     status,
+			Retryable:                  hostErr.Retryable || retryableHTTPStatus(status),
+			Headers:                    cloneHeader(hostErr.Headers),
+			RetryAfter:                 firstNonEmpty(hostErr.RetryAfter, hostErr.Headers.Get("Retry-After")),
+			ProviderStarted:            cloneBoolPointer(hostErr.ProviderStarted),
+			ProviderExecutionAmbiguous: hostErr.ProviderExecutionAmbiguous,
 		}
 		if failure.Code == "request_canceled" {
 			// Cancellation belongs to the client request, not to a provider or
@@ -417,6 +423,12 @@ func classifyExecutionError(err error) executionFailure {
 		Message: err.Error(),
 		Status:  http.StatusBadGateway,
 	}
+}
+
+func provenPreProviderCancellation(failure executionFailure) bool {
+	return strings.TrimSpace(failure.Code) == "request_canceled" &&
+		failure.ProviderStarted != nil && !*failure.ProviderStarted &&
+		!failure.ProviderExecutionAmbiguous
 }
 
 func classifyProviderFailureDetail(failure executionFailure, detail providererror.Detail) executionFailure {

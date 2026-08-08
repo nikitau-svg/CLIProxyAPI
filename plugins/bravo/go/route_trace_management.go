@@ -64,7 +64,7 @@ func handleRouteTraceManagement(req rpcManagementRequest) ([]byte, error) {
 			},
 		})
 	}
-	traces, errList := bravoRouteTraces.list(query, time.Now().UTC())
+	traces, warning, errList := listCurrentRouteTraces(query, time.Now().UTC())
 	if errList != nil {
 		return managementJSON(http.StatusInternalServerError, map[string]any{
 			"error": map[string]any{
@@ -78,7 +78,8 @@ func handleRouteTraceManagement(req rpcManagementRequest) ([]byte, error) {
 		"schema_version": routeTraceSchemaVersion,
 		"retention_days": int(defaultRouteTraceTTL / (24 * time.Hour)),
 		"traces":         traces,
-		"warning":        bravoRouteTraces.warning(),
+		"warning":        warning,
+		"storage":        currentRouteTraceStorageStatus(),
 	})
 }
 

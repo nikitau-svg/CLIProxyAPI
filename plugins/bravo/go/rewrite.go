@@ -13,10 +13,14 @@ import (
 )
 
 func executionBody(req rpcExecutorRequest) []byte {
+	return bytes.Clone(executionBodyView(req))
+}
+
+func executionBodyView(req rpcExecutorRequest) []byte {
 	if len(req.OriginalRequest) > 0 {
-		return bytes.Clone(req.OriginalRequest)
+		return req.OriginalRequest
 	}
-	return bytes.Clone(req.Payload)
+	return req.Payload
 }
 
 func candidateModelName(item candidate) string {

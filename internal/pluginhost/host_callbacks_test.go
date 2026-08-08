@@ -29,6 +29,18 @@ type fakeHostModelExecutor struct {
 	countModelTokens   func(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage)
 }
 
+type providerAcceptanceTestError struct {
+	started, ambiguous bool
+}
+
+func (e providerAcceptanceTestError) Error() string     { return "client request was canceled" }
+func (e providerAcceptanceTestError) ErrorCode() string { return "request_canceled" }
+func (e providerAcceptanceTestError) StatusCode() int   { return statusClientClosedRequest }
+func (e providerAcceptanceTestError) Retryable() bool   { return false }
+func (e providerAcceptanceTestError) ProviderExecutionState() (bool, bool, bool) {
+	return e.started, true, e.ambiguous
+}
+
 func (e *fakeHostModelExecutor) ExecuteModel(ctx context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
 	return e.executeModel(ctx, req)
 }
@@ -380,6 +392,93 @@ func TestHostModelExecuteCallbackPreservesTypedErrorMetadata(t *testing.T) {
 		envelope.Error.Headers.Get("X-Request-Id") != "req-typed" ||
 		envelope.Error.RetryAfter != "17" {
 		t.Fatalf("callback error = %#v", envelope.Error)
+	}
+}
+
+func TestHostModelExecuteCallbackSerializesProviderAcceptancePhase(t *testing.T) {
+	for _, testCase := range []struct {
+		name               string
+		started, ambiguous bool
+	}{
+		{name: "proven pre-provider", started: false, ambiguous: false},
+		{name: "ambiguous after start", started: true, ambiguous: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			host := New()
+			host.SetModelExecutor(&fakeHostModelExecutor{
+				executeModel: func(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
+					return handlers.ModelExecutionResponse{}, &interfaces.ErrorMessage{
+						StatusCode: statusClientClosedRequest,
+						Error:      providerAcceptanceTestError{started: testCase.started, ambiguous: testCase.ambiguous},
+					}
+				},
+			})
+			rawReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: "model-1"})
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			_, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostModelExecute, rawReq)
+			if errCall == nil {
+				t.Fatal("callFromPlugin error = nil")
+			}
+			var envelope pluginabi.Envelope
+			if errUnmarshal := json.Unmarshal(marshalHostCallbackError(errCall), &envelope); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			if envelope.Error == nil || envelope.Error.ProviderStarted == nil ||
+				*envelope.Error.ProviderStarted != testCase.started ||
+				envelope.Error.ProviderExecutionAmbiguous != testCase.ambiguous {
+				t.Fatalf("provider acceptance envelope = %#v", envelope.Error)
+			}
+		})
+	}
+}
+
+func TestCanceledActiveHostCallbackScopeSerializesProvenPreProviderRejection(t *testing.T) {
+	host := New()
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	callbackID, closeCallback := host.openCallbackContextForPlugin(parentCtx, "bravo")
+	defer closeCallback()
+	cancelParent()
+
+	providerCalls := 0
+	host.SetModelExecutor(&fakeHostModelExecutor{
+		executeModel: func(context.Context, handlers.ModelExecutionRequest) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
+			providerCalls++
+			return handlers.ModelExecutionResponse{}, nil
+		},
+	})
+	rawReq, errMarshal := json.Marshal(rpcHostModelExecutionRequest{
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: "openai",
+			ExitProtocol:  "openai",
+			Model:         "model-1",
+		},
+		HostCallbackID: callbackID,
+	})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	_, errCall := host.callFromPlugin(
+		withHostCallbackPluginID(context.Background(), "bravo"),
+		pluginabi.MethodHostModelExecute,
+		rawReq,
+	)
+	if errCall == nil {
+		t.Fatal("canceled active callback error = nil")
+	}
+	if providerCalls != 0 {
+		t.Fatalf("canceled active callback made %d provider calls", providerCalls)
+	}
+
+	var envelope pluginabi.Envelope
+	if errUnmarshal := json.Unmarshal(marshalHostCallbackError(errCall), &envelope); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if envelope.Error == nil || envelope.Error.Code != "request_canceled" ||
+		envelope.Error.ProviderStarted == nil || *envelope.Error.ProviderStarted ||
+		envelope.Error.ProviderExecutionAmbiguous {
+		t.Fatalf("canceled active callback envelope = %#v", envelope.Error)
 	}
 }
 

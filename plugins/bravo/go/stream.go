@@ -136,12 +136,8 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 	}
 	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
 	if errPlan != nil {
-		failure := executionFailure{
-			Code:      "bravo_no_eligible_account",
-			Message:   errPlan.Error(),
-			Status:    http.StatusServiceUnavailable,
-			Retryable: true,
-		}
+		failure, rejections := executionPlanFailure(errPlan)
+		routeRecorder.preflight(rejections)
 		routeRecorder.finish(false, failure.Status, failure)
 		closePluginStreamFailure(pluginStreamID, failure)
 		return
@@ -244,7 +240,8 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			callbackID = childID
 			ownsScope = true
 		}
-		releaseLease, acquired, leaseFailure := acquireExecutionAttemptLease(attempt)
+		releaseLease, acquired, leaseFailure, effectiveAttempt := acquireExecutionAttemptLeaseDetailed(attempt)
+		attempt = effectiveAttempt
 		if leaseFailure != nil {
 			if ownsScope {
 				_ = closeHostCallbackScope(callbackID)

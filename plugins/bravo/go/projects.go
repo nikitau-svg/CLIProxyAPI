@@ -850,6 +850,7 @@ func installPersistedSmartKeys(items []smartKeyConfig) error {
 		return fmt.Errorf("validate persisted Bravo projects: %w", errNormalize)
 	}
 	currentConfig.Store(cfg)
+	resetAdaptiveStatusRuntime()
 	return nil
 }
 

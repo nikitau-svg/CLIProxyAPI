@@ -26,6 +26,10 @@ type hostModelCallbackError struct {
 	providerError *providererror.Detail
 }
 
+type providerExecutionStateProvider interface {
+	ProviderExecutionState() (started, known, ambiguous bool)
+}
+
 func (e *hostModelCallbackError) Error() string {
 	if e == nil {
 		return ""
@@ -257,6 +261,15 @@ func marshalHostCallbackError(err error) []byte {
 	}
 	if hasProviderDetail {
 		detail.ProviderError = &providerDetail
+	}
+	var executionState providerExecutionStateProvider
+	if errors.As(err, &executionState) && executionState != nil {
+		started, known, ambiguous := executionState.ProviderExecutionState()
+		if known {
+			detail.ProviderStarted = new(bool)
+			*detail.ProviderStarted = started
+			detail.ProviderExecutionAmbiguous = ambiguous
+		}
 	}
 	raw, _ := json.Marshal(pluginabi.Envelope{OK: false, Error: detail})
 	return raw

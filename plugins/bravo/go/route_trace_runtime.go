@@ -37,7 +37,7 @@ func (recorder *routeTraceRecorder) preflight(rejections []candidateRejection) {
 		return
 	}
 	for _, rejection := range rejections {
-		recorder.appendAttempt(routeTraceAttempt{
+		item := routeTraceAttempt{
 			At:           recorder.trace.StartedAt,
 			Provider:     rejection.Provider,
 			Model:        rejection.Model,
@@ -46,7 +46,30 @@ func (recorder *routeTraceRecorder) preflight(rejections []candidateRejection) {
 			ErrorMessage: rejection.Reason,
 			Outcome:      "skipped",
 			Decision:     "skip",
-		})
+		}
+		if strings.TrimSpace(rejection.AuthIndex) != "" {
+			item.SubscriptionID = analyticsSubscriptionID(rejection.AuthIndex)
+		}
+		if rejection.AdaptiveTrace.mode != "" || rejection.AdaptiveTrace.rejectionCause != adaptiveRejectionNone {
+			applyAdaptiveRouteDecision(&item, executionAttempt{AdaptiveTrace: rejection.AdaptiveTrace})
+		}
+		if rejection.Stage == "allocator" {
+			if item.ProjectRole == "" {
+				item.ProjectRole = "secondary"
+			}
+			if item.AllocatorMode == "" {
+				item.AllocatorMode = firstNonEmpty(strings.TrimSpace(loadedConfig().AllocatorMode), "enforce")
+			}
+			if item.AdaptiveRejection == "" {
+				switch rejection.Code {
+				case "bravo_allocator_reserve_floor":
+					item.AdaptiveRejection = "adaptive_secondary_floor_protected"
+				default:
+					item.AdaptiveRejection = "adaptive_no_compatible_fallback"
+				}
+			}
+		}
+		recorder.appendAttempt(item)
 	}
 }
 
@@ -58,10 +81,22 @@ func (recorder *routeTraceRecorder) appendAttempt(attempt routeTraceAttempt) {
 		previous := &recorder.trace.Attempts[count-1]
 		if previous.Outcome == "failed" && previous.Decision == "" && !previous.Committed {
 			previous.Decision = "fallback"
+			previous.AdaptiveFallback = "adaptive_failover_selected"
+			previous.FallbackProvider = normalizeProvider(attempt.Provider)
+			previous.FallbackModel = strings.TrimSpace(attempt.Model)
 		}
 	}
-	attempt.Ordinal = len(recorder.trace.Attempts) + 1
-	recorder.trace.Attempts = append(recorder.trace.Attempts, attempt)
+	recorder.trace.AttemptSummary.Total++
+	attempt.Ordinal = recorder.trace.AttemptSummary.Total
+	if len(recorder.trace.Attempts) < maxPersistedRouteTraceAttempts {
+		recorder.trace.Attempts = append(recorder.trace.Attempts, attempt)
+	} else {
+		// Preserve the beginning of the route and the true terminal attempt while
+		// keeping per-request memory constant during pathological retry streams.
+		recorder.trace.Attempts[maxPersistedRouteTraceAttempts-1] = attempt
+	}
+	recorder.trace.AttemptSummary.Persisted = len(recorder.trace.Attempts)
+	recorder.trace.AttemptSummary.Omitted = recorder.trace.AttemptSummary.Total - recorder.trace.AttemptSummary.Persisted
 }
 
 func (recorder *routeTraceRecorder) failure(
@@ -88,21 +123,23 @@ func (recorder *routeTraceRecorder) failureWithCommit(
 		decision = "stop_committed"
 	}
 	item := routeTraceAttempt{
-		At:              started.UTC(),
-		Provider:        normalizeProvider(attempt.Candidate.Provider),
-		Model:           strings.TrimSpace(attempt.Candidate.Model),
-		SubscriptionID:  analyticsSubscriptionID(stableAuthIndex(attempt.Auth)),
-		Status:          status,
-		Success:         false,
-		Outcome:         "failed",
-		Decision:        decision,
-		Committed:       committed,
-		RequestedEffort: strings.TrimSpace(attempt.RequestedEffort),
-		EffectiveEffort: strings.TrimSpace(attempt.EffectiveEffort),
-		LatencyMS:       time.Since(started).Milliseconds(),
-		ErrorCode:       failure.Code,
-		ErrorMessage:    failure.Message,
-		RetryAfter:      failure.RetryAfter,
+		At:                         started.UTC(),
+		Provider:                   normalizeProvider(attempt.Candidate.Provider),
+		Model:                      strings.TrimSpace(attempt.Candidate.Model),
+		SubscriptionID:             analyticsSubscriptionID(stableAuthIndex(attempt.Auth)),
+		Status:                     status,
+		Success:                    false,
+		Outcome:                    "failed",
+		Decision:                   decision,
+		Committed:                  committed,
+		RequestedEffort:            strings.TrimSpace(attempt.RequestedEffort),
+		EffectiveEffort:            strings.TrimSpace(attempt.EffectiveEffort),
+		LatencyMS:                  time.Since(started).Milliseconds(),
+		ErrorCode:                  failure.Code,
+		ErrorMessage:               failure.Message,
+		RetryAfter:                 failure.RetryAfter,
+		ProviderStarted:            cloneBoolPointer(failure.ProviderStarted),
+		ProviderExecutionAmbiguous: failure.ProviderExecutionAmbiguous,
 	}
 	if failure.Provider != nil {
 		item.ProviderErrorType = failure.Provider.Type
@@ -112,6 +149,7 @@ func (recorder *routeTraceRecorder) failureWithCommit(
 		item.RequiredInputTokens = failure.Provider.RequiredTokens
 		item.SupportedInputTokens = failure.Provider.LimitTokens
 	}
+	applyAdaptiveRouteDecision(&item, attempt)
 	recorder.appendAttempt(item)
 }
 
@@ -123,7 +161,7 @@ func (recorder *routeTraceRecorder) success(
 	if recorder == nil || recorder.finished {
 		return
 	}
-	recorder.appendAttempt(routeTraceAttempt{
+	item := routeTraceAttempt{
 		At:              started.UTC(),
 		Provider:        normalizeProvider(attempt.Candidate.Provider),
 		Model:           strings.TrimSpace(attempt.Candidate.Model),
@@ -136,14 +174,16 @@ func (recorder *routeTraceRecorder) success(
 		RequestedEffort: strings.TrimSpace(attempt.RequestedEffort),
 		EffectiveEffort: strings.TrimSpace(attempt.EffectiveEffort),
 		LatencyMS:       time.Since(started).Milliseconds(),
-	})
+	}
+	applyAdaptiveRouteDecision(&item, attempt)
+	recorder.appendAttempt(item)
 }
 
 func (recorder *routeTraceRecorder) superseded(attempt executionAttempt, started time.Time) {
 	if recorder == nil || recorder.finished {
 		return
 	}
-	recorder.appendAttempt(routeTraceAttempt{
+	item := routeTraceAttempt{
 		At:              started.UTC(),
 		Provider:        normalizeProvider(attempt.Candidate.Provider),
 		Model:           strings.TrimSpace(attempt.Candidate.Model),
@@ -155,7 +195,9 @@ func (recorder *routeTraceRecorder) superseded(attempt executionAttempt, started
 		EffectiveEffort: strings.TrimSpace(attempt.EffectiveEffort),
 		LatencyMS:       time.Since(started).Milliseconds(),
 		ErrorCode:       "bravo_attempt_superseded",
-	})
+	}
+	applyAdaptiveRouteDecision(&item, attempt)
+	recorder.appendAttempt(item)
 }
 
 func (recorder *routeTraceRecorder) finish(success bool, status int, failure executionFailure) string {
@@ -196,11 +238,11 @@ func (recorder *routeTraceRecorder) finish(success bool, status int, failure exe
 		recorder.trace.FinalMessage = localized.Message
 	}
 	if success {
-		bravoRouteTraces.append(recorder.trace)
+		_ = appendCurrentRouteTrace(recorder.trace, false)
 	} else {
 		// Terminal failures must survive an immediate process restart so the
 		// management UI can explain the exact route that failed.
-		_ = bravoRouteTraces.appendDurable(recorder.trace)
+		_ = appendCurrentRouteTrace(recorder.trace, true)
 	}
 	return recorder.trace.TraceID
 }
