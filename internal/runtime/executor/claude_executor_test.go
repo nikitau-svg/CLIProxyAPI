@@ -3162,6 +3162,170 @@ func TestRemapOAuthToolNames_Lowercase_ReverseApplied(t *testing.T) {
 	}
 }
 
+func TestRemapOAuthToolNames_OpenClawConflictPairsUseStableAliases(t *testing.T) {
+	pairs := [][2]string{
+		{"memory_get", "memory_search"},
+		{"message", "sessions_list"},
+		{"message", "sessions_spawn"},
+		{"sessions_list", "subagents"},
+		{"sessions_spawn", "subagents"},
+	}
+
+	aliases := make(map[string]string)
+	for _, pair := range pairs {
+		body := []byte(fmt.Sprintf(`{"tools":[{"name":%q,"description":"d","input_schema":{"type":"object"}},{"name":%q,"description":"d","input_schema":{"type":"object"}}]}`, pair[0], pair[1]))
+		out, reverseMap := remapOAuthToolNames(body)
+
+		for i, original := range pair {
+			alias := gjson.GetBytes(out, fmt.Sprintf("tools.%d.name", i)).String()
+			if alias == original || !strings.HasPrefix(alias, "mcp__bravo__tool_") {
+				t.Fatalf("pair %v tool %q alias = %q, want opaque Bravo MCP alias", pair, original, alias)
+			}
+			if len(alias) > 64 {
+				t.Fatalf("alias %q is %d bytes, want <= 64", alias, len(alias))
+			}
+			if got := reverseMap[alias]; got != original {
+				t.Fatalf("reverseMap[%q] = %q, want %q", alias, got, original)
+			}
+			if prior, ok := aliases[original]; ok && prior != alias {
+				t.Fatalf("alias for %q changed from %q to %q", original, prior, alias)
+			}
+			aliases[original] = alias
+		}
+		if aliases[pair[0]] == aliases[pair[1]] {
+			t.Fatalf("pair %v collapsed to alias %q", pair, aliases[pair[0]])
+		}
+	}
+
+	reordered := []byte(`{"tools":[{"name":"subagents","input_schema":{"type":"object"}},{"name":"memory_get","input_schema":{"type":"object"}}]}`)
+	out, _ := remapOAuthToolNames(reordered)
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != aliases["subagents"] {
+		t.Fatalf("subagents alias = %q, want stable %q", got, aliases["subagents"])
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != aliases["memory_get"] {
+		t.Fatalf("memory_get alias = %q, want stable %q", got, aliases["memory_get"])
+	}
+}
+
+func TestRemapOAuthToolNames_CustomAliasCoversChoiceHistoryAndResponses(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"memory_search","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"memory_search"},"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"memory_search","input":{}},{"type":"tool_reference","tool_name":"memory_search"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":[{"type":"tool_reference","tool_name":"memory_search"}]}]}]}`)
+	out, reverseMap := remapOAuthToolNames(body)
+	alias := gjson.GetBytes(out, "tools.0.name").String()
+	if alias == "" || alias == "memory_search" {
+		t.Fatalf("tools alias = %q, want transformed name", alias)
+	}
+	for _, path := range []string{
+		"tool_choice.name",
+		"messages.0.content.0.name",
+		"messages.0.content.1.tool_name",
+		"messages.1.content.0.content.0.tool_name",
+	} {
+		if got := gjson.GetBytes(out, path).String(); got != alias {
+			t.Fatalf("%s = %q, want %q", path, got, alias)
+		}
+	}
+
+	resp := []byte(fmt.Sprintf(`{"content":[{"type":"tool_use","id":"toolu_02","name":%q,"input":{}},{"type":"tool_reference","tool_name":%q}]}`, alias, alias))
+	restored := reverseRemapOAuthToolNames(resp, reverseMap)
+	if got := gjson.GetBytes(restored, "content.0.name").String(); got != "memory_search" {
+		t.Fatalf("non-stream tool_use name = %q, want memory_search", got)
+	}
+	if got := gjson.GetBytes(restored, "content.1.tool_name").String(); got != "memory_search" {
+		t.Fatalf("non-stream tool_reference name = %q, want memory_search", got)
+	}
+
+	line := []byte(fmt.Sprintf(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_03","name":%q,"input":{}}}`, alias))
+	streamed := reverseRemapOAuthToolNamesFromStreamLine(line, reverseMap)
+	if got := gjson.GetBytes(helps.JSONPayload(streamed), "content_block.name").String(); got != "memory_search" {
+		t.Fatalf("stream tool_use name = %q, want memory_search; line=%s", got, streamed)
+	}
+}
+
+func TestRemapOAuthToolNames_PreservesClaudeCodeAndTypedBuiltins(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"Bash","input_schema":{"type":"object"}},{"type":"web_search_20250305","name":"web_search"}]}`)
+	out, reverseMap := remapOAuthToolNames(body)
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "Bash" {
+		t.Fatalf("Claude Code tool name = %q, want Bash", got)
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); got != "web_search" {
+		t.Fatalf("typed builtin name = %q, want web_search", got)
+	}
+	if len(reverseMap) != 0 {
+		t.Fatalf("reverseMap = %v, want empty", reverseMap)
+	}
+}
+
+func TestClaudeExecutor_OAuthCustomToolAliasesRoundTripNonStream(t *testing.T) {
+	var upstreamNames []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		for _, tool := range gjson.GetBytes(body, "tools").Array() {
+			upstreamNames = append(upstreamNames, tool.Get("name").String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"msg_alias","type":"message","model":"claude-sonnet-5","role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":%q,"input":{}}],"usage":{"input_tokens":1,"output_tokens":1}}`, upstreamNames[1])
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-oat-test",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"claude-sonnet-5","max_tokens":64,"tools":[{"name":"memory_get","description":"d","input_schema":{"type":"object"}},{"name":"memory_search","description":"d","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"ok"}]}`)
+
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "claude-sonnet-5", Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(upstreamNames) != 2 || upstreamNames[0] == "memory_get" || upstreamNames[1] == "memory_search" || upstreamNames[0] == upstreamNames[1] {
+		t.Fatalf("upstream tool names = %v, want two distinct aliases", upstreamNames)
+	}
+	if got := gjson.GetBytes(resp.Payload, "content.0.name").String(); got != "memory_search" {
+		t.Fatalf("response tool name = %q, want memory_search; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestClaudeExecutor_OAuthCustomToolAliasesRoundTripStream(t *testing.T) {
+	var upstreamAlias string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upstreamAlias = gjson.GetBytes(body, "tools.0.name").String()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_alias\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":%q,\"input\":{}}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", upstreamAlias)
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "sk-ant-oat-test",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"claude-sonnet-5","max_tokens":64,"stream":true,"tools":[{"name":"sessions_spawn","description":"d","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"ok"}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "claude-sonnet-5", Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var output strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		output.Write(chunk.Payload)
+	}
+	if upstreamAlias == "" || upstreamAlias == "sessions_spawn" {
+		t.Fatalf("upstream alias = %q, want transformed name", upstreamAlias)
+	}
+	if !strings.Contains(output.String(), `"name":"sessions_spawn"`) || strings.Contains(output.String(), upstreamAlias) {
+		t.Fatalf("stream response was not restored: %s", output.String())
+	}
+}
+
 // TestRemapOAuthToolNames_MixedCase_OnlyRenamedToolsReversed is the regression
 // test for a case where a single request contains both a TitleCase tool (which
 // must pass through unchanged) and a lowercase tool that we forward-rename.
