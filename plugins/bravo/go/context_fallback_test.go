@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,128 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+func TestContextOverflowDoesNotCreateAdaptivePendingDebt(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		stream       bool
+		hostResponse bool
+	}{
+		{name: "nonstream host error"},
+		{name: "nonstream HTTP response", hostResponse: true},
+		{name: "stream host error", stream: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			restoreUsage := isolateBravoUsageState(t)
+			defer restoreUsage()
+			isolateBravoFallbackTestState(t)
+			resetAdaptiveReserveForTest()
+			defer resetAdaptiveReserveForTest()
+			statePath := filepath.Join(t.TempDir(), "context-pending-state.json")
+			if errConfigure := configureUsageState(statePath); errConfigure != nil {
+				t.Fatal(errConfigure)
+			}
+
+			const authIndex = "context-pending-auth"
+			cfg := defaultPluginConfig()
+			cfg.Enabled = true
+			cfg.AllocatorMode = "enforce"
+			cfg.FallbackHedgeDelaySeconds = 0
+			cfg.Tariffs = []tariffConfig{{
+				ID: "x1", SessionFloorPercent: 0, WeeklyFloorPercent: 0,
+				Multiplier: 1, ReservationPercent: 1,
+			}}
+			cfg.Subscriptions = []subscriptionConfig{{AuthIndex: authIndex, Tariff: "x1"}}
+			cfg.SmartKeys = []smartKeyConfig{{
+				ID: "context-pending-project", Name: "Context pending project", SHA256: strings.Repeat("c", 64),
+				Enabled: boolPointer(true), Status: projectStatusActive, Models: []string{"*"},
+			}}
+			cfg.Models = map[string]logicalModel{"context-pending": {Candidates: []candidate{{
+				Provider: "codex", Model: "gpt-5.6-sol", Priority: 100,
+				Capabilities: []string{capabilityText, capabilityStream},
+			}}}}
+			if errNormalize := normalizeConfig(&cfg); errNormalize != nil {
+				t.Fatal(errNormalize)
+			}
+			previousConfig := loadedConfig()
+			currentConfig.Store(cfg)
+			defer currentConfig.Store(previousConfig)
+			setAdaptivePersistenceQuota(t, authIndex, 90)
+
+			providerCalls := 0
+			var streamClose rpcStreamCloseRequest
+			installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+				switch method {
+				case pluginabi.MethodHostAuthList:
+					return mustBravoJSON(t, hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{{
+						ID: "context-pending-id", AuthIndex: authIndex, Provider: "codex",
+					}}}), nil
+				case pluginabi.MethodHostModelExecute, pluginabi.MethodHostModelExecuteStream:
+					providerCalls++
+					if testCase.hostResponse {
+						return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
+							StatusCode: http.StatusBadRequest,
+							Body:       []byte("Your input exceeds the context window of this model. Please adjust your input and try again."),
+						}), nil
+					}
+					return nil, &hostCallError{
+						Code:       "model_execution_failed",
+						Message:    "Your input exceeds the context window of this model. Please adjust your input and try again.",
+						HTTPStatus: http.StatusBadRequest,
+					}
+				case pluginabi.MethodHostStreamClose:
+					decodeBravoPayload(t, payload, &streamClose)
+					return json.RawMessage(`{}`), nil
+				case pluginabi.MethodHostLog:
+					return json.RawMessage(`{}`), nil
+				default:
+					return json.RawMessage(`{}`), nil
+				}
+			})
+
+			body := []byte(`{"model":"bravo/context-pending","messages":[{"role":"user","content":"large history"}]}`)
+			request := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				Model: "bravo/context-pending", Format: protocolClaude, SourceFormat: protocolClaude,
+				OriginalRequest: body, Metadata: compactProjectMetadata("context-pending-project"),
+			}, HostCallbackID: "context-pending-callback"}
+			if testCase.stream {
+				request.OriginalRequest = []byte(`{"model":"bravo/context-pending","messages":[{"role":"user","content":"large history"}],"stream":true}`)
+				runBravoStream(request, "context-pending-stream")
+				if streamClose.ErrorCode != "bravo_context_window_exceeded" {
+					t.Fatalf("stream close = %#v", streamClose)
+				}
+			} else {
+				raw, errExecute := execute(mustJSONValue(t, request))
+				if errExecute != nil {
+					t.Fatal(errExecute)
+				}
+				var env envelope
+				if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil || env.Error == nil || env.Error.Code != "bravo_context_window_exceeded" {
+					t.Fatalf("context response = %s error=%v", raw, errUnmarshal)
+				}
+			}
+			if providerCalls != 1 {
+				t.Fatalf("provider calls = %d, want 1", providerCalls)
+			}
+			if got := pendingReservationPercent(authIndex); got != 0 {
+				t.Fatalf("context rejection created pending debt %.3f, want 0", got)
+			}
+			traces, _, errList := listCurrentRouteTraces(routeTraceQuery{ProjectID: "context-pending-project", ErrorsOnly: true, Limit: 2}, time.Now().UTC())
+			if errList != nil || len(traces) != 1 || len(traces[0].Attempts) != 1 {
+				t.Fatalf("context traces = %#v error=%v", traces, errList)
+			}
+			if traces[0].Attempts[0].Committed {
+				t.Fatalf("context trace marked rejected inference committed: %#v", traces[0].Attempts[0])
+			}
+
+			resetAdaptiveReserveForTest()
+			simulateFreshBravoProcess(t, statePath)
+			if got := pendingReservationPercent(authIndex); got != 0 {
+				t.Fatalf("context debt resurrected after restart: %.3f", got)
+			}
+		})
+	}
+}
 
 func TestBravoFinalErrorPreservesCreditsAndContextFailures(t *testing.T) {
 	isolateBravoFallbackTestState(t)

@@ -292,8 +292,9 @@ func acquireObserveShadowLease(attempt executionAttempt) (func(bool), executionA
 		if attempt.Primary {
 			sessionFloor, weeklyFloor = 0, 0
 		}
-		wouldAdmit = session.RemainingPercent-inFlight-pending-attempt.ReservationPercent-sessionGuard-demandGuard > sessionFloor &&
-			weekly.RemainingPercent-inFlight-pending-attempt.ReservationPercent-weeklyGuard-demandGuard > weeklyFloor
+		reserved := inFlight + pending
+		wouldAdmit = quotaWindowSafeSurplus(session, sessionFloor, reserved, attempt.ReservationPercent, sessionGuard, demandGuard) > 0 &&
+			quotaWindowSafeSurplus(weekly, weeklyFloor, reserved, attempt.ReservationPercent, weeklyGuard, demandGuard) > 0
 	}
 	cause := adaptiveAdmissionRejectionForState(attempt, authIndex, confidence, !wouldAdmit)
 	if !trackable {
@@ -407,8 +408,8 @@ func allocatorSafeSurplus(cfg pluginConfig, attempt executionAttempt, now time.T
 	allocatorRuntime.Unlock()
 	sessionGuard := adaptiveExposureGuard(authIndex, attempt.AdaptiveReserveKey, quota, adaptiveWindowSession, cfg, now)
 	weeklyGuard := adaptiveExposureGuard(authIndex, attempt.AdaptiveReserveKey, quota, adaptiveWindowWeekly, cfg, now)
-	sessionSurplus := session.RemainingPercent - tariff.SessionFloorPercent - reserved - attempt.ReservationPercent - sessionGuard - attempt.DemandGuardPercent
-	weeklySurplus := weekly.RemainingPercent - tariff.WeeklyFloorPercent - reserved - attempt.ReservationPercent - weeklyGuard - attempt.DemandGuardPercent
+	sessionSurplus := quotaWindowSafeSurplus(session, tariff.SessionFloorPercent, reserved, attempt.ReservationPercent, sessionGuard, attempt.DemandGuardPercent)
+	weeklySurplus := quotaWindowSafeSurplus(weekly, tariff.WeeklyFloorPercent, reserved, attempt.ReservationPercent, weeklyGuard, attempt.DemandGuardPercent)
 	return math.Min(sessionSurplus, weeklySurplus)
 }
 
@@ -522,8 +523,8 @@ func secondaryQuotaEligibleWithKey(
 	allocatorRuntime.Unlock()
 	sessionGuard := adaptiveExposureGuard(authIndex, profileKey, quota, adaptiveWindowSession, cfg, now)
 	weeklyGuard := adaptiveExposureGuard(authIndex, profileKey, quota, adaptiveWindowWeekly, cfg, now)
-	return session.RemainingPercent-reserved-reservation-sessionGuard-demandGuard > tariff.SessionFloorPercent &&
-		weekly.RemainingPercent-reserved-reservation-weeklyGuard-demandGuard > tariff.WeeklyFloorPercent
+	return quotaWindowSafeSurplus(session, tariff.SessionFloorPercent, reserved, reservation, sessionGuard, demandGuard) > 0 &&
+		quotaWindowSafeSurplus(weekly, tariff.WeeklyFloorPercent, reserved, reservation, weeklyGuard, demandGuard) > 0
 }
 
 func allocatorStress(cfg pluginConfig, attempt executionAttempt) float64 {
@@ -532,8 +533,14 @@ func allocatorStress(cfg pluginConfig, attempt executionAttempt) float64 {
 	session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
 	minHeadroom := 1.0
 	if quotaRoutingConfidenceAt(quota, attempt.Candidate.Model, cfg, time.Now()) == "confirmed" {
-		sessionHeadroom := normalizedHeadroom(session.RemainingPercent, tariff.SessionFloorPercent)
-		weeklyHeadroom := normalizedHeadroom(weekly.RemainingPercent, tariff.WeeklyFloorPercent)
+		sessionHeadroom := 1.0
+		if quotaWindowApplicable(session) {
+			sessionHeadroom = normalizedHeadroom(session.RemainingPercent, tariff.SessionFloorPercent)
+		}
+		weeklyHeadroom := 1.0
+		if quotaWindowApplicable(weekly) {
+			weeklyHeadroom = normalizedHeadroom(weekly.RemainingPercent, tariff.WeeklyFloorPercent)
+		}
 		minHeadroom = math.Min(sessionHeadroom, weeklyHeadroom)
 	}
 	usage := authUsageSummary(attempt.Auth.AuthIndex, time.Now())
@@ -612,8 +619,8 @@ func acquireAttemptLeaseDetailed(attempt executionAttempt) (func(bool), bool, ex
 		if attempt.Primary || attempt.CompactBypass {
 			sessionFloor, weeklyFloor = 0, 0
 		}
-		if session.RemainingPercent-reserved-attempt.ReservationPercent-sessionGuard-demandGuard <= sessionFloor ||
-			weekly.RemainingPercent-reserved-attempt.ReservationPercent-weeklyGuard-demandGuard <= weeklyFloor {
+		if quotaWindowSafeSurplus(session, sessionFloor, reserved, attempt.ReservationPercent, sessionGuard, demandGuard) <= 0 ||
+			quotaWindowSafeSurplus(weekly, weeklyFloor, reserved, attempt.ReservationPercent, weeklyGuard, demandGuard) <= 0 {
 			rejected = true
 		}
 	}

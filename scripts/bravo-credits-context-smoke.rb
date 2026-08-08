@@ -83,12 +83,14 @@ class BravoCreditsContextSmoke
           first_code: "bravo_subscription_model_credits_exhausted",
           second_code: "bravo_context_window_exceeded"
         )
+        assert_allocator_pending(codex, expected: 0.0, label: "Codex context rejection")
         assert_safe_management_surfaces
       end
 
       check("persisted effort-qualified Fable limit survives a Bravo restart") do
         provider_cursor = current_provider_sequence
         restart_canary
+        assert_allocator_pending(codex, expected: 0.0, label: "Codex context rejection after restart")
         started = Time.now.utc - 1
         status, body = anthropic_request(
           context_project.fetch(:key),
@@ -539,6 +541,22 @@ class BravoCreditsContextSmoke
       raise CreditsContextSmokeFailure, "canary must contain exactly four Claude and one Codex subscriptions"
     end
     [claude[0], claude[1], claude[2], claude[3], codex[0]]
+  end
+
+  def assert_allocator_pending(subscription, expected:, label:)
+    response = management_json(:get, "/v0/management/bravo/subscriptions")
+    current = Array(response["subscriptions"]).find do |item|
+      item["auth_index"] == subscription.fetch("auth_index")
+    end
+    raise CreditsContextSmokeFailure, "#{label}: subscription disappeared" unless current
+
+    pending = Float(current.dig("allocator", "pending_percent") || 0)
+    return if (pending - expected).abs <= 0.000_001
+
+    raise CreditsContextSmokeFailure,
+          "#{label}: pending #{pending.round(6)}%, expected #{expected.round(6)}%"
+  rescue ArgumentError, TypeError
+    raise CreditsContextSmokeFailure, "#{label}: pending percent is invalid"
   end
 
   def cleanup_stale_canary_projects

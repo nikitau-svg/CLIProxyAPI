@@ -173,8 +173,8 @@ func compactBypassQuotaEligible(
 	reserved := allocatorRuntime.InFlightPercent[strings.TrimSpace(authIndex)] +
 		allocatorRuntime.PendingPercent[strings.TrimSpace(authIndex)]
 	allocatorRuntime.Unlock()
-	return session.RemainingPercent-reserved-reservation > 0 &&
-		weekly.RemainingPercent-reserved-reservation > 0
+	return quotaWindowSafeSurplus(session, 0, reserved, reservation, 0, 0) > 0 &&
+		quotaWindowSafeSurplus(weekly, 0, reserved, reservation, 0, 0) > 0
 }
 
 func acquireExecutionAttemptLease(attempt executionAttempt) (func(bool), bool, *executionFailure) {

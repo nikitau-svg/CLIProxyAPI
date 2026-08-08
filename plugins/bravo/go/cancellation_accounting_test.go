@@ -123,6 +123,9 @@ func TestProviderAcceptanceCancellationControlsDurableLeaseAccounting(t *testing
 				attempt.ProviderExecutionAmbiguous != testCase.ambiguous {
 				t.Fatalf("cancellation trace attempt = %#v", attempt)
 			}
+			if attempt.Committed != testCase.retainDebt {
+				t.Fatalf("cancellation trace committed=%t, pending retained=%t", attempt.Committed, testCase.retainDebt)
+			}
 
 			resetAdaptiveReserveForTest()
 			simulateFreshBravoProcess(t, path)

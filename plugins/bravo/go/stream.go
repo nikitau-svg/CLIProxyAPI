@@ -152,14 +152,14 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 	attempted := make(map[int]bool, len(plan))
 	hedgeUsed := false
 
-	rememberFailure := func(run *bravoStreamAttemptRun, failure executionFailure) {
+	rememberFailure := func(run *bravoStreamAttemptRun, failure executionFailure, committed bool) {
 		lastFailure = failure
 		if run == nil {
 			return
 		}
 		contextRouting.observeFailure(run.attempt, failure)
 		failureTraces = appendExecutionFailureTrace(failureTraces, run.attempt, failure)
-		routeRecorder.failure(run.attempt, run.started, failure.Status, failure)
+		routeRecorder.failureWithCommit(run.attempt, run.started, failure.Status, failure, committed)
 	}
 	closeTerminalFailure := func(failure executionFailure) {
 		final := finalExecutionFailure(failureTraces, failure)
@@ -395,7 +395,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 						return
 					}
 					if winnerFailure != nil {
-						rememberFailure(primary, *winnerFailure)
+						rememberFailure(primary, *winnerFailure, true)
 						if !canContinueStreamingRoute(*winnerFailure) {
 							if hedgeResults != nil {
 								settleBravoCompetingAttempt(hedge, hedgeResults, winnerFailure)
@@ -420,7 +420,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 					}
 				}
 				finishBravoStreamAttemptFailure(primary, *result.failure, result.accepted)
-				rememberFailure(primary, *result.failure)
+				rememberFailure(primary, *result.failure, result.accepted)
 				if !canContinueStreamingRoute(*result.failure) {
 					stopHedgeTimer()
 					if hedgeResults != nil {
@@ -469,7 +469,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 						return
 					}
 					if winnerFailure != nil {
-						rememberFailure(hedge, *winnerFailure)
+						rememberFailure(hedge, *winnerFailure, true)
 						if !canContinueStreamingRoute(*winnerFailure) {
 							if winnerFailure.Code == "request_canceled" {
 								if primaryResults != nil {
@@ -499,7 +499,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 					}
 				}
 				finishBravoStreamAttemptFailure(hedge, *result.failure, result.accepted)
-				rememberFailure(hedge, *result.failure)
+				rememberFailure(hedge, *result.failure, result.accepted)
 				if !canContinueStreamingRoute(*result.failure) {
 					if result.failure.Code == "request_canceled" {
 						if primaryResults != nil {

@@ -112,6 +112,8 @@ Assertions:
 | AQC-U30 | Oversized legacy snapshot/WAL | bounded retained entries plus a durable saturation marker block every secondary and `/compact` after restart |
 | AQC-U31 | Saturation recovery | authenticated explicit reconciliation is rejected while retained/runtime/in-flight debt exists and durably clears only after all preconditions hold |
 | AQC-U32 | v3 state migration and v4 rollback guard | v3 loads as v4; an older v3 binary rejects the v4 schema rather than saving over adaptive debt |
+| AQC-U33 | Provider rejects an oversized context before inference | non-stream and stream create no pending/prepared debt; trace reports `committed=false`; restart keeps debt at zero |
+| AQC-U34 | Codex has no session quota window | `not_applicable` session contributes no floor, pending or exposure guard; the applicable weekly/model-weekly window alone governs admission |
 
 ## 5. Concurrency and lease tests
 
@@ -136,9 +138,10 @@ double completion callback changes nothing.
 
 Invalid JSON, contract/capability validation and deterministic request rewrite
 fail before lease acquisition: zero provider calls and zero pending/prepared
-cost. Under the 0.8.3 ABI there is no generic proven-rejection signal after the
-host callback boundary; such errors are covered by C05 until the core exposes an
-explicit typed `accepted=false` marker.
+cost. The host ABI preserves an explicit provider-start phase for cancellation.
+A structured `context_window_exceeded` response is also a reviewed deterministic
+pre-inference rejection and releases the lease without pending debt. Every other
+missing or ambiguous acceptance phase remains covered by C05.
 
 ### AQC-C05: ambiguous transport failure
 

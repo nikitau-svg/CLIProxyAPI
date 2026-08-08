@@ -773,6 +773,30 @@ func effectiveQuotaWindows(quota credentialQuotaState, model string) (quotaWindo
 	return session, weekly
 }
 
+// quotaWindowApplicable distinguishes a real provider limit from the
+// normalized 100% placeholder used when that class of limit does not exist.
+// A not_applicable window must not receive floors, pending debt or estimator
+// exposure: another applicable window remains responsible for admission.
+func quotaWindowApplicable(window quotaWindowState) bool {
+	return normalizeQuotaWindow(window).ResetMode != pluginapi.HostAuthQuotaResetModeNotApplicable
+}
+
+func quotaWindowSafeSurplus(
+	window quotaWindowState,
+	floor, reserved, reservation, exposure, demand float64,
+) float64 {
+	window = normalizeQuotaWindow(window)
+	if !quotaWindowApplicable(window) {
+		return 100
+	}
+	return window.RemainingPercent - floor - reserved - reservation - exposure - demand
+}
+
+func quotaWindowExhausted(window quotaWindowState) bool {
+	window = normalizeQuotaWindow(window)
+	return quotaWindowApplicable(window) && window.RemainingPercent <= 0
+}
+
 func quotaModelMatches(requested, quotaModel string) bool {
 	quotaModel = strings.ToLower(strings.TrimSpace(quotaModel))
 	if quotaModel == "" {

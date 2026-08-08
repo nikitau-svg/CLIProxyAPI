@@ -856,6 +856,19 @@ func positiveQuotaDrop(previous, current float64) float64 {
 // scheduled provider refresh. It is local-only and applies at every headroom;
 // near-floor routing is not the switch that turns safety on.
 func adaptiveExposureGuard(authIndex, profileKey string, quota credentialQuotaState, window string, cfg pluginConfig, now time.Time) float64 {
+	shape := adaptiveShapeFromProfileKey(profileKey)
+	model := strings.TrimSpace(shape.PhysicalModel)
+	if model == "" {
+		model = strings.TrimSpace(shape.ModelFamily)
+	}
+	session, weekly := effectiveQuotaWindows(quota, model)
+	selected := session
+	if window == adaptiveWindowWeekly {
+		selected = weekly
+	}
+	if !quotaWindowApplicable(selected) {
+		return 0
+	}
 	adaptiveReserveRuntime.Lock()
 	authIndex = strings.TrimSpace(authIndex)
 	if adaptiveReserveRuntime.SaturationGlobal {
