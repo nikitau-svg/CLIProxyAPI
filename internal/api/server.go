@@ -55,6 +55,7 @@ const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authe
 
 var corsExposedResponseHeaders = []string{
 	logging.CPATraceIDHeader,
+	"X-Bravo-Trace-Id",
 	"X-CPA-VERSION",
 	"X-CPA-COMMIT",
 	"X-CPA-BUILD-DATE",

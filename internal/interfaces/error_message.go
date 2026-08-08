@@ -17,4 +17,10 @@ type ErrorMessage struct {
 
 	// Addon contains additional headers to be added to the response.
 	Addon http.Header
+
+	// ExecutorPluginID identifies the trusted executor plugin that produced the
+	// error. It is intentionally internal-only and lets protocol handlers expose
+	// proxy-authored control headers without trusting similarly named upstream
+	// headers from ordinary providers.
+	ExecutorPluginID string
 }

@@ -89,12 +89,16 @@ type handlerDirectExecutorRouteHost struct {
 	lastPluginID string
 	lastRequest  coreexecutor.Request
 	lastOptions  coreexecutor.Options
+	executeErr   error
 }
 
 func (h *handlerDirectExecutorRouteHost) ExecutePluginExecutor(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
 	h.lastPluginID = pluginID
 	h.lastRequest = req
 	h.lastOptions = opts
+	if h.executeErr != nil {
+		return coreexecutor.Response{}, h.executeErr
+	}
 	return coreexecutor.Response{Payload: []byte("direct-ok")}, nil
 }
 
@@ -106,6 +110,39 @@ func (h *handlerDirectExecutorRouteHost) ExecutePluginExecutorStream(ctx context
 	chunks <- coreexecutor.StreamChunk{Payload: []byte("direct-stream")}
 	close(chunks)
 	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+type handlerPluginTraceError struct {
+	headers http.Header
+}
+
+func (handlerPluginTraceError) Error() string     { return "invalid tool parameters" }
+func (handlerPluginTraceError) ErrorCode() string { return "invalid_function_parameters" }
+func (handlerPluginTraceError) StatusCode() int   { return http.StatusBadRequest }
+func (e handlerPluginTraceError) Headers() http.Header {
+	return e.headers.Clone()
+}
+
+func TestHandlerModelRouterMarksBravoExecutorErrorsAsTrusted(t *testing.T) {
+	host := &handlerDirectExecutorRouteHost{executeErr: handlerPluginTraceError{headers: http.Header{
+		"X-Bravo-Trace-Id": {"trc_0123456789abcdef01234567"},
+	}}}
+	host.hasRouters = true
+	host.route = func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+		return pluginapi.ModelRouteResponse{
+			Handled: true, TargetKind: pluginapi.ModelRouteTargetExecutor, Target: "bravo",
+		}, true
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	handler.SetModelRouterHost(host)
+
+	_, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "anthropic", "bravo/sol", []byte(`{"model":"bravo/sol"}`), "")
+	if errMsg == nil {
+		t.Fatal("ExecuteWithAuthManager() succeeded")
+	}
+	if errMsg.ExecutorPluginID != "bravo" || errMsg.Addon.Get("X-Bravo-Trace-Id") != "trc_0123456789abcdef01234567" {
+		t.Fatalf("plugin error provenance = %#v", errMsg)
+	}
 }
 
 func (h *handlerDirectExecutorRouteHost) CountPluginExecutor(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {

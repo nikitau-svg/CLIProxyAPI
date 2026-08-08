@@ -227,3 +227,40 @@ func TestClaudeWriteErrorResponseEmitsBravoTraceID(t *testing.T) {
 		t.Fatalf("trace id = %q", got)
 	}
 }
+
+func TestClaudeWriteErrorResponseEmitsTrustedBravoTraceForProviderInvalidRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	handler := &ClaudeCodeAPIHandler{BaseAPIHandler: &basehandlers.BaseAPIHandler{}}
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode:       http.StatusBadRequest,
+		Error:            codedClaudeHandlerError{message: "invalid tool", code: "invalid_function_parameters"},
+		Addon:            http.Header{"X-Bravo-Trace-Id": {"trc_0123456789abcdef01234567"}},
+		ExecutorPluginID: "bravo",
+	})
+
+	if got := recorder.Header().Get("X-Bravo-Trace-Id"); got != "trc_0123456789abcdef01234567" {
+		t.Fatalf("trace id = %q", got)
+	}
+}
+
+func TestClaudeWriteErrorResponseRejectsProviderControlledBravoTrace(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	handler := &ClaudeCodeAPIHandler{BaseAPIHandler: &basehandlers.BaseAPIHandler{}}
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      codedClaudeHandlerError{message: "invalid tool", code: "invalid_function_parameters"},
+		Addon:      http.Header{"X-Bravo-Trace-Id": {"trc_0123456789abcdef01234567"}},
+	})
+
+	if got := recorder.Header().Get("X-Bravo-Trace-Id"); got != "" {
+		t.Fatalf("untrusted trace id escaped: %q", got)
+	}
+}

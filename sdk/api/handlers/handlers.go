@@ -1032,7 +1032,7 @@ func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryPro
 	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	resp, errExecute := host.ExecutePluginExecutor(ctx, executorPluginID, req, opts)
 	if errExecute != nil {
-		return nil, nil, executionErrorMessage(errExecute)
+		return nil, nil, pluginExecutionErrorMessage(executorPluginID, errExecute)
 	}
 	rawResponseHeaders := cloneHeader(resp.Headers)
 	responseHeaders := downstreamPluginHeadersFromExecutor(executorPluginID, rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
@@ -1051,7 +1051,7 @@ func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerTyp
 	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, handlerType, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	resp, errCount := host.CountPluginExecutor(ctx, executorPluginID, req, opts)
 	if errCount != nil {
-		return nil, nil, executionErrorMessage(errCount)
+		return nil, nil, pluginExecutionErrorMessage(executorPluginID, errCount)
 	}
 	rawResponseHeaders := cloneHeader(resp.Headers)
 	responseHeaders := downstreamPluginHeadersFromExecutor(executorPluginID, rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
@@ -1124,6 +1124,12 @@ func executionErrorMessage(err error) *interfaces.ErrorMessage {
 	return &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: ErrorResponseAddon(err)}
 }
 
+func pluginExecutionErrorMessage(pluginID string, err error) *interfaces.ErrorMessage {
+	message := executionErrorMessage(err)
+	message.ExecutorPluginID = strings.TrimSpace(pluginID)
+	return message
+}
+
 // ErrorResponseAddon returns the upstream response headers an error carries, or
 // nil when it has none. These stay subject to passthrough-headers: they are
 // verbatim upstream data, not headers the proxy authored.
@@ -1188,7 +1194,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	streamResult, errStream := host.ExecutePluginExecutorStream(ctx, executorPluginID, req, opts)
 	if errStream != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- executionErrorMessage(errStream)
+		errChan <- pluginExecutionErrorMessage(executorPluginID, errStream)
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -1260,7 +1266,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			}
 			if chunk.Err != nil {
 				select {
-				case errChan <- executionErrorMessage(chunk.Err):
+				case errChan <- pluginExecutionErrorMessage(executorPluginID, chunk.Err):
 				case <-done:
 				}
 				return
@@ -2440,7 +2446,8 @@ func WriteBravoTraceHeader(c *gin.Context, msg *interfaces.ErrorMessage) {
 		return
 	}
 	code := PreservedErrorCode(msg.StatusCode, msg.Error)
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(code)), "bravo_") {
+	trustedBravoPlugin := strings.EqualFold(strings.TrimSpace(msg.ExecutorPluginID), "bravo")
+	if !trustedBravoPlugin && !strings.HasPrefix(strings.ToLower(strings.TrimSpace(code)), "bravo_") {
 		return
 	}
 	traceID := strings.TrimSpace(msg.Addon.Get("X-Bravo-Trace-Id"))
