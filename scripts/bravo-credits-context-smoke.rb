@@ -87,6 +87,27 @@ class BravoCreditsContextSmoke
         assert_safe_management_surfaces
       end
 
+      check("streamed context rejection before content creates no Codex pending debt") do
+        provider_cursor = current_provider_sequence
+        status, body = anthropic_request(
+          context_project.fetch(:key),
+          "bravo/fable",
+          "BRAVO_CONTEXT_OVERFLOW",
+          stream: true
+        )
+        raise CreditsContextSmokeFailure, "streamed context scenario unexpectedly succeeded" if status.between?(200, 299)
+        assert_includes(body, "bravo_context_window_exceeded")
+        assert_redacted(body)
+        assert_allocator_pending(codex, expected: 0.0, label: "streamed Codex context rejection")
+
+        observed = provider_events.select { |event| event["sequence"].to_i > provider_cursor }
+        unless observed.length == 1 && observed.first["type"] == "codex_context_stream_error" &&
+               observed.first["model"] == "gpt-5.6-sol" && observed.first["stream"] == true
+          raise CreditsContextSmokeFailure,
+                "streamed context provider calls #{observed.map { |event| event["type"] }.inspect}"
+        end
+      end
+
       check("persisted effort-qualified Fable limit survives a Bravo restart") do
         provider_cursor = current_provider_sequence
         restart_canary
@@ -286,7 +307,8 @@ class BravoCreditsContextSmoke
         types = provider_events.map { |event| event["type"] }
         expected = %w[
           claude_credits_http
-          codex_context_error
+          codex_context_stream_error
+          codex_context_stream_error
           codex_fallback_success
           claude_sibling_success
           claude_credits_stream

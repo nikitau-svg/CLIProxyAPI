@@ -351,6 +351,38 @@ def write_codex_server_error_stream(client, model)
   client.flush
 end
 
+def write_codex_context_error_stream(client, model)
+  created = {
+    "type" => "response.created",
+    "sequence_number" => 0,
+    "response" => {
+      "id" => "resp_bravo_context_prelude",
+      "object" => "response",
+      "created_at" => Time.now.to_i,
+      "status" => "in_progress",
+      "model" => model,
+      "output" => []
+    }
+  }
+  terminal = {
+    "type" => "error",
+    "sequence_number" => 1,
+    "error" => CONTEXT_ERROR.fetch("error")
+  }
+
+  client.write("HTTP/1.1 200 OK\r\n")
+  client.write("Content-Type: text/event-stream\r\n")
+  client.write("Transfer-Encoding: chunked\r\n")
+  client.write("Cache-Control: no-store\r\n")
+  client.write("Connection: close\r\n\r\n")
+  client.flush
+  write_http_chunk(client, "event: response.created\ndata: #{JSON.generate(created)}\n\n")
+  sleep(CREDITS_STREAM_DELAY_SECONDS)
+  write_http_chunk(client, "event: error\ndata: #{JSON.generate(terminal)}\n\n")
+  client.write("0\r\n\r\n")
+  client.flush
+end
+
 events = CanaryEventStore.new
 server = TCPServer.new(options[:bind], options[:port])
 server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
@@ -440,8 +472,12 @@ until stopping
               )
             end
           elsif body.include?(options[:context_marker])
-            events.record("codex_context_error", model: model, stream: stream)
-            json_response(client, 400, CONTEXT_ERROR)
+            events.record(stream ? "codex_context_stream_error" : "codex_context_error", model: model, stream: stream)
+            if stream
+              write_codex_context_error_stream(client, model)
+            else
+              json_response(client, 400, CONTEXT_ERROR)
+            end
           else
             events.record("codex_fallback_success", model: model, stream: stream)
             marker = options[:fallback_marker]
