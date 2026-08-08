@@ -363,7 +363,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 				primaryResults = nil
 				if result.response != nil {
 					stopHedgeTimer()
-					finished, winnerFailure := forwardBravoStreamWinner(
+					finished, winnerFailure, leaseCommitted := forwardBravoStreamWinner(
 						primary,
 						result.response,
 						pluginStreamID,
@@ -389,13 +389,13 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 							lastFailure = *winnerFailure
 							contextRouting.observeFailure(primary.attempt, *winnerFailure)
 							failureTraces = appendExecutionFailureTrace(failureTraces, primary.attempt, *winnerFailure)
-							routeRecorder.failureWithCommit(primary.attempt, primary.started, winnerFailure.Status, *winnerFailure, true)
+							routeRecorder.failureWithCommit(primary.attempt, primary.started, winnerFailure.Status, *winnerFailure, leaseCommitted)
 							routeRecorder.finish(false, winnerFailure.Status, *winnerFailure)
 						}
 						return
 					}
 					if winnerFailure != nil {
-						rememberFailure(primary, *winnerFailure, true)
+						rememberFailure(primary, *winnerFailure, leaseCommitted)
 						if !canContinueStreamingRoute(*winnerFailure) {
 							if hedgeResults != nil {
 								settleBravoCompetingAttempt(hedge, hedgeResults, winnerFailure)
@@ -437,7 +437,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			case result := <-hedgeResults:
 				hedgeResults = nil
 				if result.response != nil {
-					finished, winnerFailure := forwardBravoStreamWinner(
+					finished, winnerFailure, leaseCommitted := forwardBravoStreamWinner(
 						hedge,
 						result.response,
 						pluginStreamID,
@@ -463,13 +463,13 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 							lastFailure = *winnerFailure
 							contextRouting.observeFailure(hedge.attempt, *winnerFailure)
 							failureTraces = appendExecutionFailureTrace(failureTraces, hedge.attempt, *winnerFailure)
-							routeRecorder.failureWithCommit(hedge.attempt, hedge.started, winnerFailure.Status, *winnerFailure, true)
+							routeRecorder.failureWithCommit(hedge.attempt, hedge.started, winnerFailure.Status, *winnerFailure, leaseCommitted)
 							routeRecorder.finish(false, winnerFailure.Status, *winnerFailure)
 						}
 						return
 					}
 					if winnerFailure != nil {
-						rememberFailure(hedge, *winnerFailure, true)
+						rememberFailure(hedge, *winnerFailure, leaseCommitted)
 						if !canContinueStreamingRoute(*winnerFailure) {
 							if winnerFailure.Code == "request_canceled" {
 								if primaryResults != nil {
@@ -569,7 +569,7 @@ func forwardBravoStreamWinner(
 	response *pluginapi.HostModelStreamResponse,
 	pluginStreamID, protocol, logicalModelID string,
 	onCommit func() error,
-) (bool, *executionFailure) {
+) (bool, *executionFailure, bool) {
 	if run == nil || response == nil {
 		failure := executionFailure{
 			Code:      "bravo_host_stream_invalid",
@@ -577,7 +577,7 @@ func forwardBravoStreamWinner(
 			Status:    http.StatusBadGateway,
 			Retryable: true,
 		}
-		return false, &failure
+		return false, &failure, true
 	}
 	committed, streamFailure := forwardCandidateStream(
 		context.Background(),
@@ -603,14 +603,18 @@ func forwardBravoStreamWinner(
 	}
 	_ = closeHostModelStream(response.StreamID, run.callbackID)
 	run.closeScope()
-	run.release(true)
+	leaseCommitted := true
+	if streamFailure != nil && !committed {
+		leaseCommitted = shouldCommitAdaptiveLeaseForFailure(*streamFailure)
+	}
+	run.release(leaseCommitted)
 	if !run.finalized.CompareAndSwap(false, true) {
-		return true, nil
+		return true, nil, true
 	}
 	if streamFailure == nil {
 		recordExecutionAttempt(run.attempt, run.started, http.StatusOK, true, executionFailure{})
 		closePluginStream(pluginStreamID, "")
-		return true, nil
+		return true, nil, true
 	}
 	recordExecutionAttempt(run.attempt, run.started, streamFailure.Status, false, *streamFailure)
 	if shouldCommitBravoCoreAccounting(*streamFailure) {
@@ -621,9 +625,9 @@ func forwardBravoStreamWinner(
 		// unrelated streams. Fail closed and let the caller retry explicitly.
 		localized := clientExecutionFailureRU(*streamFailure)
 		closePluginStream(pluginStreamID, localized.Code+": "+localized.Message)
-		return true, streamFailure
+		return true, streamFailure, true
 	}
-	return false, streamFailure
+	return false, streamFailure, leaseCommitted
 }
 
 func forwardCandidateStream(

@@ -14,13 +14,15 @@ import (
 
 func TestContextOverflowDoesNotCreateAdaptivePendingDebt(t *testing.T) {
 	for _, testCase := range []struct {
-		name         string
-		stream       bool
-		hostResponse bool
+		name               string
+		stream             bool
+		hostResponse       bool
+		streamReadResponse bool
 	}{
 		{name: "nonstream host error"},
 		{name: "nonstream HTTP response", hostResponse: true},
 		{name: "stream host error", stream: true},
+		{name: "stream read HTTP response", stream: true, streamReadResponse: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			restoreUsage := isolateBravoUsageState(t)
@@ -69,6 +71,12 @@ func TestContextOverflowDoesNotCreateAdaptivePendingDebt(t *testing.T) {
 					}}}), nil
 				case pluginabi.MethodHostModelExecute, pluginabi.MethodHostModelExecuteStream:
 					providerCalls++
+					if testCase.streamReadResponse {
+						return mustBravoJSON(t, pluginapi.HostModelStreamResponse{
+							StatusCode: http.StatusOK,
+							StreamID:   "context-pending-provider-stream",
+						}), nil
+					}
 					if testCase.hostResponse {
 						return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
 							StatusCode: http.StatusBadRequest,
@@ -80,6 +88,14 @@ func TestContextOverflowDoesNotCreateAdaptivePendingDebt(t *testing.T) {
 						Message:    "Your input exceeds the context window of this model. Please adjust your input and try again.",
 						HTTPStatus: http.StatusBadRequest,
 					}
+				case pluginabi.MethodHostModelStreamRead:
+					return mustBravoJSON(t, pluginapi.HostModelStreamReadResponse{
+						ErrorDetail: &pluginapi.HostModelExecutionError{
+							Code:       "model_execution_failed",
+							Message:    "Your input exceeds the context window of this model. Please adjust your input and try again.",
+							HTTPStatus: http.StatusBadRequest,
+						},
+					}), nil
 				case pluginabi.MethodHostStreamClose:
 					decodeBravoPayload(t, payload, &streamClose)
 					return json.RawMessage(`{}`), nil
