@@ -137,6 +137,57 @@ var oauthToolRenameMap = map[string]string{
 	"notebookedit": "NotebookEdit",
 }
 
+// claudeOAuthNativeToolNames are first-party Claude Code names that must keep
+// their exact spelling. Every other untyped client-defined tool is exposed to
+// Claude OAuth through a deterministic MCP-shaped alias and restored at the
+// response boundary. This prevents arbitrary client tool suites from becoming
+// a provider-visible fingerprint while preserving the client's tool contract.
+var claudeOAuthNativeToolNames = map[string]struct{}{
+	"Agent":           {},
+	"AskUserQuestion": {},
+	"Bash":            {},
+	"Edit":            {},
+	"EnterPlanMode":   {},
+	"ExitPlanMode":    {},
+	"Glob":            {},
+	"Grep":            {},
+	"KillShell":       {},
+	"LS":              {},
+	"NotebookEdit":    {},
+	"Question":        {},
+	"Read":            {},
+	"Skill":           {},
+	"Task":            {},
+	"TaskOutput":      {},
+	"TaskStop":        {},
+	"TodoRead":        {},
+	"TodoWrite":       {},
+	"WebFetch":        {},
+	"WebSearch":       {},
+	"Write":           {},
+}
+
+const claudeOAuthCustomToolAliasPrefix = "mcp__bravo__tool_"
+
+func claudeOAuthUpstreamToolName(name string) (string, bool) {
+	if name == "" {
+		return name, false
+	}
+	if renamed, ok := oauthToolRenameMap[name]; ok {
+		return renamed, renamed != name
+	}
+	if _, ok := claudeOAuthNativeToolNames[name]; ok {
+		return name, false
+	}
+
+	// A 128-bit digest keeps the alias deterministic across requests, ordering,
+	// history replay and process restarts while remaining well below Anthropic's
+	// 64-character tool-name limit. The original semantic description/schema is
+	// left untouched and the exact client name is restored on the way back.
+	sum := sha256.Sum256([]byte(name))
+	return claudeOAuthCustomToolAliasPrefix + hex.EncodeToString(sum[:16]), true
+}
+
 // The reverse map is now computed per-request in remapOAuthToolNames so that
 // only names the client actually caused us to rewrite are restored on the
 // response. A global reverse map — as used previously — corrupted responses
@@ -1826,8 +1877,8 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 			name := tool.Get("name").String()
 			toolsNeedRewrite = oauthToolsToRemove[name]
 			if !toolsNeedRewrite {
-				newName, ok := oauthToolRenameMap[name]
-				toolsNeedRewrite = ok && newName != name
+				newName, renamed := claudeOAuthUpstreamToolName(name)
+				toolsNeedRewrite = renamed && newName != name
 			}
 			return !toolsNeedRewrite
 		})
@@ -1853,7 +1904,7 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 			}
 
 			toolJSON := tool.Raw
-			if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
+			if newName, renamed := claudeOAuthUpstreamToolName(name); renamed && newName != name {
 				updatedTool, err := sjson.Set(toolJSON, "name", newName)
 				if err == nil {
 					toolJSON = updatedTool
@@ -1880,7 +1931,7 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 			// The chosen tool was removed from the tools array, so drop tool_choice to
 			// keep the payload internally consistent and fall back to normal auto tool use.
 			body, _ = sjson.DeleteBytes(body, "tool_choice")
-		} else if newName, ok := oauthToolRenameMap[tcName]; ok && newName != tcName {
+		} else if newName, renamed := claudeOAuthUpstreamToolName(tcName); renamed && newName != tcName {
 			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
 			recordRename(tcName, newName)
 		}
@@ -1899,14 +1950,14 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 				switch partType {
 				case "tool_use":
 					name := part.Get("name").String()
-					if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
+					if newName, renamed := claudeOAuthUpstreamToolName(name); renamed && newName != name {
 						path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
 						body, _ = sjson.SetBytes(body, path, newName)
 						recordRename(name, newName)
 					}
 				case "tool_reference":
 					toolName := part.Get("tool_name").String()
-					if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
+					if newName, renamed := claudeOAuthUpstreamToolName(toolName); renamed && newName != toolName {
 						path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
 						body, _ = sjson.SetBytes(body, path, newName)
 						recordRename(toolName, newName)
@@ -1920,7 +1971,7 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
 							if nestedPart.Get("type").String() == "tool_reference" {
 								nestedToolName := nestedPart.Get("tool_name").String()
-								if newName, ok := oauthToolRenameMap[nestedToolName]; ok && newName != nestedToolName {
+								if newName, renamed := claudeOAuthUpstreamToolName(nestedToolName); renamed && newName != nestedToolName {
 									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
 									body, _ = sjson.SetBytes(body, nestedPath, newName)
 									recordRename(nestedToolName, newName)
