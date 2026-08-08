@@ -330,6 +330,62 @@ func TestCooldownPersistenceReassertsBarrierAfterStoreMutexInterleaving(t *testi
 	}
 }
 
+func TestCooldownPersistenceRejectsInvertedStaleSameKeyWriteAcrossRestart(t *testing.T) {
+	restoreUsage := isolateBravoUsageState(t)
+	defer restoreUsage()
+	isolateBravoFallbackTestState(t)
+
+	path := filepath.Join(t.TempDir(), "inverted-cooldown-state.json")
+	if err := configureUsageState(path); err != nil {
+		t.Fatal(err)
+	}
+	generation := bravoUsageState.generation.Load()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	newer := cooldownEntry{
+		Provider:   "claude",
+		AuthID:     "same-key-auth",
+		Model:      "claude-fable-5",
+		Reason:     "newer-observation",
+		ObservedAt: now,
+		Until:      now.Add(2 * time.Hour),
+	}
+	older := cooldownEntry{
+		Provider:   newer.Provider,
+		AuthID:     newer.AuthID,
+		Model:      newer.Model,
+		Reason:     "older-observation",
+		ObservedAt: now.Add(-time.Minute),
+		Until:      now.Add(time.Hour),
+	}
+
+	// Reproduce the completion inversion directly: the newer setter reaches
+	// durable state first, then the older waiter obtains store.mu and receives a
+	// higher snapshot sequence. The latter must become an idempotent snapshot of
+	// the newer barrier, not a shortening write.
+	restoreRuntimeCooldowns(
+		map[string]*persistedCooldownEntry{
+			cooldownKey(newer.Provider, newer.AuthID, newer.Model): persistedCooldownFromRuntime(newer),
+		},
+		now,
+		false,
+	)
+	persistRuntimeCooldown(newer, generation)
+	persistRuntimeCooldown(older, generation)
+
+	simulateFreshBravoProcess(t, path)
+	key := cooldownKey(newer.Provider, newer.AuthID, newer.Model)
+	runtimeState.RLock()
+	restored, ok := runtimeState.Cooldowns[key]
+	runtimeState.RUnlock()
+	if !ok {
+		t.Fatal("same-key cooldown was lost after restart")
+	}
+	if !restored.Until.Equal(newer.Until) || !restored.ObservedAt.Equal(newer.ObservedAt) ||
+		restored.Reason != newer.Reason {
+		t.Fatalf("restart restored stale cooldown %#v, want newer %#v", restored, newer)
+	}
+}
+
 func TestStaleExpiryCleanupKeepsRefreshedSameKeyBarrier(t *testing.T) {
 	restoreUsage := isolateBravoUsageState(t)
 	defer restoreUsage()
@@ -479,6 +535,7 @@ func simulateFreshBravoProcess(t *testing.T, path string) {
 	bravoUsageState.path = ""
 	bravoUsageState.state = newPersistedUsageState()
 	bravoUsageState.saveTimer = nil
+	bravoUsageState.savePendingSince = time.Time{}
 	bravoUsageState.mu.Unlock()
 
 	if errConfigure := configureUsageState(path); errConfigure != nil {

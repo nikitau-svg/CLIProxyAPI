@@ -46,12 +46,20 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 	if errUnmarshal := json.Unmarshal(raw, &authResp); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode host auth list: %w", errUnmarshal)
 	}
+	// The background quota daemon owns the trusted host-wide credential catalog.
+	// Project pools are an execution/trace authorization boundary, not a reason
+	// to drop other accounts from global limit/reset tracking. This only updates
+	// the daemon's in-memory catalog; provider I/O stays asynchronous,
+	// cadence-bound, and singleflight-coalesced.
 	observeQuotaPolling(req.HostCallbackID, authResp.Files)
-
 	sticky := executionStickyKey(req.ExecutorRequest)
 	now := time.Now()
 	cfg := loadedConfig()
 	project, authenticatedProject := authenticatedExecutionProject(req, cfg)
+	requestFeatures := adaptiveRequestFeatures{}
+	if authenticatedProject && cfg.AllocatorMode != "off" {
+		requestFeatures = buildAdaptiveRequestFeatures(executionBodyView(req))
+	}
 	if authenticatedProject {
 		// allowed_auth_ids is an authorization boundary, not an allocator hint.
 		// Apply it before provider eligibility, quota observation, primary
@@ -67,7 +75,7 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 	for _, item := range model.Candidates {
 		resolved, errContract := resolveCandidateContract(item, contract)
 		if errContract != nil {
-			rejections = append(rejections, candidateRejection{
+			rejections = appendBoundedCandidateRejections(rejections, candidateRejection{
 				Provider: normalizeProvider(item.Provider),
 				Model:    item.Model,
 				Stage:    "contract",
@@ -78,7 +86,7 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		}
 		eligible := eligibleAuths(resolved, authResp.Files, now)
 		if len(eligible) == 0 {
-			rejections = append(rejections, candidateRejection{
+			rejections = appendBoundedCandidateRejections(rejections, candidateRejection{
 				Provider: normalizeProvider(resolved.Provider),
 				Model:    resolved.Model,
 				Stage:    "eligibility",
@@ -90,18 +98,19 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		orderAuths(eligible, sticky, resolved)
 		attempts := make([]executionAttempt, 0, len(eligible))
 		if authenticatedProject && cfg.AllocatorMode != "off" {
-			allocated := allocateCandidateAuths(req, cfg, project, resolved, eligible, sticky)
+			requestShape := adaptiveRequestShapeFromFeatures(requestFeatures, resolved)
+			allocated := allocateCandidateAuthsForShape(
+				cfg, project, resolved, eligible, sticky, requestShape,
+			)
 			if cfg.AllocatorMode == "enforce" {
 				attempts = allocated
 				if len(attempts) == 0 {
-					attempts = compactBypassCandidateAttempts(req, cfg, project, resolved, eligible, sticky)
+					attempts = compactBypassCandidateAttempts(req, cfg, project, resolved, eligible, sticky, requestShape)
 				}
 			} else {
 				// Observe mode executes the pre-v0.4 order while still refreshing
 				// quota and calculating the allocation decision.
-				for _, auth := range eligible {
-					attempts = append(attempts, executionAttempt{Candidate: resolved, Auth: auth})
-				}
+				attempts = observeAllocatorAttempts(cfg, project, resolved, eligible, allocated, requestShape)
 			}
 		} else {
 			for _, auth := range eligible {
@@ -112,14 +121,8 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 			// Eligible credentials existed, so the allocator withheld all of
 			// them: quota below the tariff floor, a disabled subscription, or an
 			// unknown snapshot under a deny policy.
-			code, reason := allocatorCandidateRejection(cfg, project, resolved, eligible)
-			rejections = append(rejections, candidateRejection{
-				Provider: normalizeProvider(resolved.Provider),
-				Model:    resolved.Model,
-				Stage:    "allocator",
-				Code:     code,
-				Reason:   reason,
-			})
+			rejections = appendBoundedCandidateRejections(rejections,
+				allocatorCandidateRejections(cfg, project, resolved, eligible, requestFeatures)...)
 			continue
 		}
 		for _, allocated := range attempts {
@@ -130,16 +133,13 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		}
 	}
 	if len(plan) == 0 {
-		// The allocator is a budget policy, not an authorization boundary. When it
-		// withholds every credential the request is still authorized and the
-		// account is still alive, so refusing outright drops a client that the
-		// unprefixed model would have served from the very same subscription.
-		// Degrade to the authorized, healthy pool instead of answering 503.
-		if fallback := allocatorBypassPlan(logicalName, model, contract, authResp.Files, rejections, sticky, now); len(fallback) > 0 {
-			logAllocatorBypass(logicalName, rejections)
-			return fallback, nil
-		}
-		return nil, noEligibleCandidateError(logicalName, contract, rejections)
+		// Every compatible candidate has already been considered. Primary
+		// subscriptions were allowed down to 0%; a secondary rejected here is
+		// protected by the operator's hard floor. Silently rebuilding an
+		// unmanaged plan would turn that floor into a display-only preference.
+		// /compact has its own explicit, rate-limited exception path.
+		cause := noEligibleCandidateError(logicalName, contract, rejections)
+		return nil, &executionPlanError{Cause: cause, Rejections: append([]candidateRejection(nil), rejections...)}
 	}
 	if len(rejections) > 0 {
 		plan[0].PreflightRejections = append([]candidateRejection(nil), rejections...)
@@ -147,64 +147,96 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 	return plan, nil
 }
 
-func allocatorCandidateRejection(
+func allocatorCandidateRejections(
 	cfg pluginConfig,
 	project smartKeyConfig,
 	item candidate,
 	auths []pluginapi.HostAuthFileEntry,
-) (string, string) {
+	requestFeatures adaptiveRequestFeatures,
+) []candidateRejection {
+	requestShape := adaptiveRequestShapeFromFeatures(requestFeatures, item)
+	now := time.Now()
 	primaryIndexes := resolvedPrimaryAuthIndexes(project.PrimaryAuthIDs, auths)
-	reserveFloorOnly := len(auths) > 0
+	rejections := make([]candidateRejection, 0, min(len(auths), maxPersistedRouteTraceAttempts))
 	for _, auth := range auths {
-		authIndex := strings.TrimSpace(auth.AuthIndex)
+		authIndex := stableAuthIndex(auth)
 		subscription := subscriptionPolicy(cfg, authIndex)
 		if !subscriptionEnabled(subscription) {
-			reserveFloorOnly = false
-			break
+			rejections = appendBoundedCandidateRejections(rejections, candidateRejection{
+				Provider: normalizeProvider(item.Provider), Model: item.Model, Stage: "allocator",
+				Code: "bravo_allocator_withheld", Reason: "Подписка выключена политикой Bravo.",
+				AuthIndex: authIndex,
+			})
+			continue
 		}
-		if _, primary := primaryIndexes[authIndex]; primary {
-			reserveFloorOnly = false
-			break
-		}
-		quota := quotaSnapshot(authIndex)
-		if quotaRoutingConfidenceAt(quota, item.Model, cfg, time.Now()) != "confirmed" {
-			reserveFloorOnly = false
-			break
-		}
+		quota := normalizedQuotaState(quotaSnapshot(authIndex))
 		tariff := effectiveTariff(cfg, subscription, firstNonEmpty(auth.Provider, auth.Type), quota)
-		session, weekly := effectiveQuotaWindows(quota, item.Model)
-		if session.RemainingPercent <= 0 || weekly.RemainingPercent <= 0 ||
-			secondaryQuotaEligible(cfg, quota, item.Model, tariff, authIndex, tariff.ReservationPercent) {
-			reserveFloorOnly = false
-			break
+		reservation := adaptiveReservationForShape(auth, tariff, requestShape, now)
+		_, primary := primaryIndexes[authIndex]
+		attempt := executionAttempt{
+			Candidate: item, Auth: auth, ProjectID: project.ID, Primary: primary,
+			AllocatorManaged: true, ReservationPercent: reservation,
+			AdaptiveReserveKey:   adaptiveProfileKey(authIndex, requestShape),
+			AdaptiveRequestShape: requestShape, AdaptiveBaselinePercent: tariff.ReservationPercent,
+			TariffID: tariff.ID,
 		}
+		attempt.AdaptiveTrace = captureObserveAdaptiveDecision(cfg, attempt, false, now)
+		attempt.AdaptiveTrace.mode = "enforce"
+		code := adaptivePlanRejectionCode(attempt.AdaptiveTrace.rejectionCause)
+		if code == "" {
+			code = "bravo_allocator_withheld"
+		}
+		reason := routeTraceMessageRU(code)
+		if code == "bravo_allocator_withheld" {
+			reason = "Внутренний распределитель Bravo не выпустил подписку: проверьте подтверждение квоты и резервные пороги."
+		}
+		rejections = appendBoundedCandidateRejections(rejections, candidateRejection{
+			Provider: normalizeProvider(item.Provider), Model: item.Model, Stage: "allocator",
+			Code: code, Reason: reason, AuthIndex: authIndex, AdaptiveTrace: attempt.AdaptiveTrace,
+		})
 	}
-	if reserveFloorOnly {
-		return "bravo_allocator_reserve_floor", fmt.Sprintf(
-			"внутренний резерв CLIProxyAPI удержал все доступные подписки (%d): подтверждённый остаток положительный, но ниже настроенного порога тарифа",
-			len(auths),
-		)
-	}
-	return "bravo_allocator_withheld", fmt.Sprintf(
-		"внутренний распределитель CLIProxyAPI не выпустил ни одну из доступных подписок (%d): проверьте включение подписок, подтверждение квоты и резервные пороги",
-		len(auths),
-	)
+	return rejections
 }
 
-// allocatorBypassPlan rebuilds a plan from credentials that passed provider
-// eligibility and health but that the allocator declined to release.
-//
-// It deliberately re-runs eligibleAuths over the already project-filtered list:
-// allowed_auth_ids has been applied to authResp.Files by the caller, so this
-// cannot widen the authorization boundary. Only allocator verdicts — quota
-// floors, tariff reservations, unknown-snapshot policy — are bypassed, and only
-// for candidates whose sole rejection was the allocator. A candidate rejected on
-// contract or eligibility grounds stays rejected: the request genuinely cannot
-// run there.
-//
-// Attempts are marked AllocatorManaged=false so the lease path does not re-apply
-// the floors that just withheld them, while usage accounting still records the
-// spend against the credential.
+func adaptivePlanRejectionCode(cause adaptiveAdmissionRejectionCause) string {
+	switch cause {
+	case adaptiveRejectionLedgerSaturated:
+		return "bravo_adaptive_ledger_saturated"
+	case adaptiveRejectionEstimatorSaturated:
+		return "bravo_adaptive_estimator_saturated"
+	case adaptiveRejectionDemandSaturated:
+		return "bravo_adaptive_demand_saturated"
+	case adaptiveRejectionDurabilityUnavailable:
+		return "bravo_adaptive_durability_unavailable"
+	case adaptiveRejectionQuotaStale:
+		return "bravo_adaptive_quota_stale"
+	case adaptiveRejectionPrimaryZero:
+		return "bravo_adaptive_primary_zero"
+	case adaptiveRejectionConcurrency:
+		return "bravo_adaptive_concurrency_recheck"
+	case adaptiveRejectionFloor:
+		return "bravo_allocator_reserve_floor"
+	default:
+		return ""
+	}
+}
+
+func appendBoundedCandidateRejections(dst []candidateRejection, values ...candidateRejection) []candidateRejection {
+	remaining := maxPersistedRouteTraceAttempts - len(dst)
+	if remaining <= 0 {
+		return dst
+	}
+	if len(values) > remaining {
+		values = values[:remaining]
+	}
+	return append(dst, values...)
+}
+
+// allocatorBypassPlan is retained as a compatibility seam for older tests and
+// call sites, but generic allocator rejection is now always fail-closed. An
+// unmanaged attempt would bypass unknown-quota policy, adaptive uncertainty,
+// pending debt and hard secondary floors. The explicit /compact path has its
+// own narrow, cooldown-controlled policy and does not use this helper.
 func allocatorBypassPlan(
 	logicalName string,
 	model logicalModel,
@@ -214,43 +246,7 @@ func allocatorBypassPlan(
 	sticky string,
 	now time.Time,
 ) []executionAttempt {
-	withheld := make(map[string]struct{}, len(rejections))
-	for _, rejection := range rejections {
-		if rejection.Stage == "allocator" {
-			withheld[normalizeProvider(rejection.Provider)+"\x00"+rejection.Model] = struct{}{}
-		}
-	}
-	if len(withheld) == 0 {
-		return nil
-	}
-	plan := make([]executionAttempt, 0, len(withheld))
-	for _, item := range model.Candidates {
-		resolved, errContract := resolveCandidateContract(item, contract)
-		if errContract != nil {
-			continue
-		}
-		if _, ok := withheld[normalizeProvider(resolved.Provider)+"\x00"+resolved.Model]; !ok {
-			continue
-		}
-		eligible := eligibleAuths(resolved, auths, now)
-		if len(eligible) == 0 {
-			continue
-		}
-		orderAuths(eligible, sticky, resolved)
-		for _, auth := range eligible {
-			plan = append(plan, executionAttempt{
-				LogicalModel:    logicalName,
-				Candidate:       resolved,
-				Auth:            auth,
-				RequestedEffort: requestedEffortValue(contract.Effort),
-				EffectiveEffort: normalizeEffort(resolved.Effort),
-				// AllocatorManaged stays false: the allocator already declined
-				// these, and re-checking its floors here would withhold them again.
-				AllocatorManaged: false,
-			})
-		}
-	}
-	return plan
+	return nil
 }
 
 // logAllocatorBypass records that budget policy was overridden to keep a request
@@ -275,15 +271,68 @@ func logAllocatorBypass(logicalName string, rejections []candidateRejection) {
 
 // candidateRejection records why one candidate of a logical model dropped out.
 type candidateRejection struct {
-	Provider string
-	Model    string
-	Stage    string
-	Code     string
-	Reason   string
+	Provider      string
+	Model         string
+	Stage         string
+	Code          string
+	Reason        string
+	AuthIndex     string
+	AdaptiveTrace adaptiveRouteDecision
 }
 
 func (r candidateRejection) String() string {
 	return fmt.Sprintf("%s/%s %s(%s): %s", r.Provider, r.Model, r.Stage, r.Code, r.Reason)
+}
+
+type executionPlanError struct {
+	Cause      error
+	Rejections []candidateRejection
+}
+
+func (e *executionPlanError) Error() string {
+	if e == nil || e.Cause == nil {
+		return "Bravo has no eligible execution plan"
+	}
+	return e.Cause.Error()
+}
+
+func (e *executionPlanError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func executionPlanFailure(err error) (executionFailure, []candidateRejection) {
+	failure := executionFailure{
+		Code: "bravo_no_eligible_account", Message: err.Error(), Status: http.StatusServiceUnavailable, Retryable: true,
+	}
+	var planErr *executionPlanError
+	if !errors.As(err, &planErr) || planErr == nil {
+		return failure, nil
+	}
+	var contractErr *capabilityContractError
+	if errors.As(planErr.Cause, &contractErr) {
+		return contractFailure(contractErr), planErr.Rejections
+	}
+	bestCode, bestPriority := "", 0
+	allAdaptive := len(planErr.Rejections) > 0
+	for _, rejection := range planErr.Rejections {
+		priority := adaptiveFailureCodePriority(rejection.Code)
+		if priority == 0 {
+			allAdaptive = false
+			continue
+		}
+		if priority > bestPriority {
+			bestCode, bestPriority = rejection.Code, priority
+		}
+	}
+	if allAdaptive && bestCode != "" {
+		failure.Code = bestCode
+		failure.Message = routeTraceMessageRU(bestCode)
+		failure.Retryable = bestCode != "bravo_adaptive_ledger_saturated"
+	}
+	return failure, planErr.Rejections
 }
 
 func capabilityContractCode(err error) string {

@@ -41,25 +41,26 @@ type subscriptionQuotaView struct {
 }
 
 type subscriptionView struct {
-	AuthIndex         string                       `json:"auth_index"`
-	AnalyticsID       string                       `json:"analytics_id"`
-	AuthID            string                       `json:"auth_id,omitempty"`
-	Provider          string                       `json:"provider,omitempty"`
-	Label             string                       `json:"label,omitempty"`
-	DisplayName       string                       `json:"display_name,omitempty"`
-	Note              string                       `json:"note,omitempty"`
-	Email             string                       `json:"email,omitempty"`
-	Workspace         string                       `json:"workspace,omitempty"`
-	Plan              string                       `json:"plan,omitempty"`
-	Tariff            string                       `json:"tariff"`
-	EffectiveTariff   string                       `json:"effective_tariff"`
-	Enabled           bool                         `json:"enabled"`
-	Health            string                       `json:"health"`
-	ModelIssues       []subscriptionModelIssueView `json:"model_issues,omitempty"`
-	PrimaryProjectIDs []string                     `json:"primary_project_ids"`
-	Quota             subscriptionQuotaView        `json:"quota"`
-	ProfileRefresh    quotaRefreshState            `json:"profile_refresh"`
-	Usage             usageSummaryView             `json:"usage"`
+	AuthIndex         string                           `json:"auth_index"`
+	AnalyticsID       string                           `json:"analytics_id"`
+	AuthID            string                           `json:"auth_id,omitempty"`
+	Provider          string                           `json:"provider,omitempty"`
+	Label             string                           `json:"label,omitempty"`
+	DisplayName       string                           `json:"display_name,omitempty"`
+	Note              string                           `json:"note,omitempty"`
+	Email             string                           `json:"email,omitempty"`
+	Workspace         string                           `json:"workspace,omitempty"`
+	Plan              string                           `json:"plan,omitempty"`
+	Tariff            string                           `json:"tariff"`
+	EffectiveTariff   string                           `json:"effective_tariff"`
+	Enabled           bool                             `json:"enabled"`
+	Health            string                           `json:"health"`
+	ModelIssues       []subscriptionModelIssueView     `json:"model_issues,omitempty"`
+	PrimaryProjectIDs []string                         `json:"primary_project_ids"`
+	Quota             subscriptionQuotaView            `json:"quota"`
+	ProfileRefresh    quotaRefreshState                `json:"profile_refresh"`
+	Usage             usageSummaryView                 `json:"usage"`
+	Allocator         subscriptionAllocatorRuntimeView `json:"allocator"`
 }
 
 type subscriptionModelIssueView struct {
@@ -132,9 +133,84 @@ func handleAllocatorManagement(req rpcManagementRequest) ([]byte, error) {
 		return patchTariff(req)
 	case path == "/v0/management/bravo/quotas/refresh" && req.Method == http.MethodPost:
 		return refreshQuotas(req)
+	case path == "/v0/management/bravo/allocator/reconcile" && req.Method == http.MethodPost:
+		return reconcileAdaptiveAllocator(req)
 	default:
 		return nil, nil
 	}
+}
+
+type reconcileAdaptiveAllocatorRequest struct {
+	Confirmed bool `json:"confirmed"`
+}
+
+var reconcileAdaptiveAfterLedgerClearHook func()
+
+func reconcileAdaptiveAllocator(req rpcManagementRequest) ([]byte, error) {
+	var input reconcileAdaptiveAllocatorRequest
+	if failure := decodeAllocatorBody(req.Body, &input, false); failure != nil {
+		return projectFailureJSON(*failure)
+	}
+	if !input.Confirmed {
+		return projectFailureJSON(projectFailure{
+			Code:    "bravo_adaptive_reconciliation_confirmation_required",
+			Message: "Подтвердите сверку лимитов всех подписок перед сбросом аварийного состояния Bravo.",
+			Status:  http.StatusBadRequest,
+		})
+	}
+	adaptiveAdmissionMu.Lock()
+	admissionLocked := true
+	defer func() {
+		if admissionLocked {
+			adaptiveAdmissionMu.Unlock()
+		}
+	}()
+	if errEstimator := adaptiveEstimatorReadyForReset(); errEstimator != nil {
+		return projectFailureJSON(projectFailure{
+			Code:    "bravo_adaptive_reconciliation_incomplete",
+			Message: "Сброс отклонён: в адаптивной оценке остаётся неподтверждённый расход. Обновите лимиты и повторите сверку.",
+			Status:  http.StatusConflict,
+		})
+	}
+	if errDemand := bravoProjectDemand.readyForSaturationReset(); errDemand != nil {
+		return projectFailureJSON(projectFailure{
+			Code:    "bravo_adaptive_reconciliation_incomplete",
+			Message: "Сброс отклонён: распределение проектов всё ещё содержит выполняющиеся запросы. Дождитесь их завершения и повторите сверку.",
+			Status:  http.StatusConflict,
+		})
+	}
+	if errClear := clearAdaptiveRoutingSaturationAfterReconciliationLocked(time.Now().UTC()); errClear != nil {
+		return projectFailureJSON(projectFailure{
+			Code:    "bravo_adaptive_reconciliation_incomplete",
+			Message: "Сброс отклонён: в Bravo остаются незавершённые или выполняющиеся запросы. Обновите лимиты и повторите сверку.",
+			Status:  http.StatusConflict,
+		})
+	}
+	if reconcileAdaptiveAfterLedgerClearHook != nil {
+		reconcileAdaptiveAfterLedgerClearHook()
+	}
+	resetAdaptiveEstimatorSaturationAfterReconciliation()
+	resetAdaptiveStatusRuntime()
+	if errDemand := bravoProjectDemand.resetSaturationAfterReconciliation(); errDemand != nil {
+		return projectFailureJSON(projectFailure{
+			Code:    "bravo_adaptive_reconciliation_incomplete",
+			Message: "Журнал сверён, но новые запросы появились до сброса распределения проектов. Дождитесь их завершения и повторите сверку.",
+			Status:  http.StatusConflict,
+		})
+	}
+	adaptiveAdmissionMu.Unlock()
+	admissionLocked = false
+	_, _ = callHost(pluginabi.MethodHostLog, map[string]any{
+		"level":   "warn",
+		"message": "Bravo: оператор завершил сверку и сбросил аварийное состояние адаптивного журнала",
+	})
+	return managementJSON(http.StatusOK, map[string]any{
+		"status":              "reconciled",
+		"message_ru":          "Сверка завершена. Вторичные маршруты Bravo снова доступны.",
+		"adaptive_saturated":  adaptiveRoutingSaturated.Load(),
+		"estimator_saturated": false,
+		"demand_saturated":    false,
+	})
 }
 
 func quotaPollingSummary() quotaPollingView {
@@ -272,6 +348,7 @@ func buildSubscriptionView(
 		},
 		ProfileRefresh: profileRefresh,
 		Usage:          authUsageSummary(auth.AuthIndex, time.Now()),
+		Allocator:      adaptiveSubscriptionRuntimeView(cfg, auth, tariff, quota, now),
 	}
 }
 
@@ -819,6 +896,7 @@ func installPersistedSubscriptions(items []json.RawMessage) error {
 		return errNormalize
 	}
 	currentConfig.Store(cfg)
+	resetAdaptiveStatusRuntime()
 	return nil
 }
 
@@ -841,6 +919,7 @@ func installPersistedTariffs(items []json.RawMessage) error {
 		return errNormalize
 	}
 	currentConfig.Store(cfg)
+	resetAdaptiveStatusRuntime()
 	return nil
 }
 

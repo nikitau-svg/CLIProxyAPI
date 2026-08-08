@@ -291,10 +291,14 @@ func callHostABI(method string, payload any) (json.RawMessage, error) {
 	if response.ptr != nil {
 		C.free_host_buffer(response.ptr, response.len)
 	}
+	return decodeHostABIResponse(method, int(callCode), rawResponse)
+}
+
+func decodeHostABIResponse(method string, callCode int, rawResponse []byte) (json.RawMessage, error) {
 	if len(rawResponse) == 0 {
 		return nil, &hostCallError{
 			Code:       "host_callback_empty",
-			Message:    fmt.Sprintf("host callback %s returned no response, code=%d", method, int(callCode)),
+			Message:    fmt.Sprintf("host callback %s returned no response, code=%d", method, callCode),
 			Retryable:  true,
 			HTTPStatus: http.StatusBadGateway,
 		}
@@ -307,13 +311,15 @@ func callHostABI(method string, payload any) (json.RawMessage, error) {
 	if !env.OK {
 		if env.Error != nil {
 			return nil, &hostCallError{
-				Code:          env.Error.Code,
-				Message:       env.Error.Message,
-				Retryable:     env.Error.Retryable,
-				HTTPStatus:    env.Error.HTTPStatus,
-				Headers:       cloneHeader(env.Error.Headers),
-				RetryAfter:    strings.TrimSpace(env.Error.RetryAfter),
-				ProviderError: sanitizedProviderErrorPointer(env.Error.ProviderError),
+				Code:                       env.Error.Code,
+				Message:                    env.Error.Message,
+				Retryable:                  env.Error.Retryable,
+				HTTPStatus:                 env.Error.HTTPStatus,
+				Headers:                    cloneHeader(env.Error.Headers),
+				RetryAfter:                 strings.TrimSpace(env.Error.RetryAfter),
+				ProviderError:              sanitizedProviderErrorPointer(env.Error.ProviderError),
+				ProviderStarted:            cloneBoolPointer(env.Error.ProviderStarted),
+				ProviderExecutionAmbiguous: env.Error.ProviderExecutionAmbiguous,
 			}
 		}
 		return nil, &hostCallError{Code: "host_callback_failed", Message: "host callback failed", HTTPStatus: http.StatusBadGateway}
@@ -321,12 +327,20 @@ func callHostABI(method string, payload any) (json.RawMessage, error) {
 	if callCode != 0 {
 		return nil, &hostCallError{
 			Code:       "host_callback_code",
-			Message:    fmt.Sprintf("host callback %s returned code=%d", method, int(callCode)),
+			Message:    fmt.Sprintf("host callback %s returned code=%d", method, callCode),
 			Retryable:  true,
 			HTTPStatus: http.StatusBadGateway,
 		}
 	}
 	return append(json.RawMessage(nil), env.Result...), nil
+}
+
+func cloneBoolPointer(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
 }
 
 func cloneHeader(source http.Header) http.Header {

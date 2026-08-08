@@ -58,6 +58,13 @@ func TestProjectAllowedPoolIsHardBoundaryInEveryAllocatorMode(t *testing.T) {
 			previousConfig := loadedConfig()
 			currentConfig.Store(cfg)
 			t.Cleanup(func() { currentConfig.Store(previousConfig) })
+			if mode == "enforce" {
+				// Enforce is fail-closed for unknown secondary quota even when a
+				// legacy config says allow. This test is about the authorization pool,
+				// so install confirmed snapshots instead of relying on async polling.
+				installAdaptiveTestQuota(t, claudeAllowed, 90, 90)
+				installAdaptiveTestQuota(t, codexAllowed, 90, 90)
+			}
 
 			installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
 				switch method {

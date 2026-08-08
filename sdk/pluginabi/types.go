@@ -108,4 +108,10 @@ type Error struct {
 	Headers       http.Header           `json:"headers,omitempty"`
 	RetryAfter    string                `json:"retry_after,omitempty"`
 	ProviderError *providererror.Detail `json:"provider_error,omitempty"`
+	// ProviderStarted is present for host model callback cancellation. False is
+	// a proven pre-provider rejection; true means provider work may have begun.
+	ProviderStarted *bool `json:"provider_started,omitempty"`
+	// ProviderExecutionAmbiguous is true when cancellation happened after the
+	// provider start boundary and accounting must be retained conservatively.
+	ProviderExecutionAmbiguous bool `json:"provider_execution_ambiguous,omitempty"`
 }

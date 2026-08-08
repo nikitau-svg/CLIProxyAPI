@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -61,7 +63,10 @@ func TestQuotaRefreshCountsActualProviderRequests(t *testing.T) {
 		if fail.Load() {
 			return credentialQuotaState{}, &quotaRefreshFailure{Code: "timeout", Retryable: true}
 		}
-		return confirmedQuotaForTest(now), nil
+		// Usage evidence must be acquired during this refresh. Reusing the test's
+		// earlier timestamp models a cached pre-fetch observation and correctly
+		// cannot rejuvenate the polling watermark.
+		return confirmedQuotaForTest(quotaRefreshNow().UTC()), nil
 	})
 	installQuotaRefreshClock(t, now)
 
@@ -127,11 +132,13 @@ func TestQuotaPollingRunsOutsideAllocatorAndDeduplicatesFreshCycle(t *testing.T)
 		if resource == quotaRefreshResourceProfile {
 			return credentialQuotaState{ProfileRefreshedAt: now}, nil
 		}
-		return confirmedQuotaForTest(now), nil
+		return confirmedQuotaForTest(quotaRefreshNow().UTC()), nil
 	})
 	quotaPollingConfigured.Store(true)
 	observeQuotaPolling("callback", []pluginapi.HostAuthFileEntry{auth})
-	runQuotaPollingCycle()
+	// observeQuotaPolling wakes the scheduler itself. Calling a second cycle here
+	// races that wake and can legitimately start a duplicate cycle before the
+	// first refresh has published its fresh watermark under -race.
 	for count := 0; count < 2; count++ {
 		select {
 		case <-entered:
@@ -160,6 +167,77 @@ func TestQuotaPollingRunsOutsideAllocatorAndDeduplicatesFreshCycle(t *testing.T)
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("removed auth was still polled; calls=%d", got)
 	}
+}
+
+func TestQuotaPollingCatalogRemainsGlobalAcrossDisjointProjectPools(t *testing.T) {
+	resetQuotaPollingForTest()
+	now := time.Now().UTC()
+	personal := pluginapi.HostAuthFileEntry{ID: "poll-personal", AuthIndex: "poll-personal", Provider: "claude"}
+	work := pluginapi.HostAuthFileEntry{ID: "poll-work", AuthIndex: "poll-work", Provider: "claude"}
+	installQuotaRefreshTestState(t, personal.AuthIndex, credentialQuotaState{})
+	installQuotaRefreshTestState(t, work.AuthIndex, credentialQuotaState{})
+	installQuotaRefreshFetch(t, func(_ string, _ pluginapi.HostAuthFileEntry, resource string) (credentialQuotaState, error) {
+		if resource == quotaRefreshResourceProfile {
+			return credentialQuotaState{ProfileRefreshedAt: now}, nil
+		}
+		return confirmedQuotaForTest(time.Now().UTC()), nil
+	})
+	t.Cleanup(resetQuotaPollingForTest)
+
+	cfg := defaultPluginConfig()
+	cfg.AllocatorMode = "off"
+	cfg.Models = map[string]logicalModel{"catalog-route": {Candidates: []candidate{{Provider: "claude", Model: "claude-sonnet-5", Capabilities: []string{capabilityText}}}}}
+	cfg.SmartKeys = []smartKeyConfig{
+		{ID: "personal-project", Name: "Personal", SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: projectStatusActive, Enabled: boolPointer(true), Models: []string{"*"}, AllowedAuthIDs: []string{personal.AuthIndex}},
+		{ID: "work-project", Name: "Work", SHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Status: projectStatusActive, Enabled: boolPointer(true), Models: []string{"*"}, AllowedAuthIDs: []string{work.AuthIndex}},
+	}
+	if errNormalize := normalizeConfig(&cfg); errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	previousConfig := loadedConfig()
+	currentConfig.Store(cfg)
+	t.Cleanup(func() { currentConfig.Store(previousConfig) })
+	auths := []pluginapi.HostAuthFileEntry{personal, work}
+	installBravoHostCall(t, func(method string, _ any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostAuthList {
+			return json.RawMessage(`{}`), nil
+		}
+		return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+	})
+	quotaPollingConfigured.Store(true)
+
+	for _, testCase := range []struct {
+		projectID string
+		wantAuth  string
+	}{
+		{projectID: "personal-project", wantAuth: personal.AuthIndex},
+		{projectID: "work-project", wantAuth: work.AuthIndex},
+	} {
+		req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+			Model: "bravo/catalog-route", Metadata: compactProjectMetadata(testCase.projectID),
+		}, HostCallbackID: "global-catalog-test"}
+		plan, errPlan := buildExecutionPlan(req, "catalog-route", cfg.Models["catalog-route"], textContract())
+		if errPlan != nil {
+			t.Fatal(errPlan)
+		}
+		if len(plan) != 1 || plan[0].Auth.AuthIndex != testCase.wantAuth {
+			t.Fatalf("project %s execution plan = %#v", testCase.projectID, plan)
+		}
+		quotaPollingRuntime.Lock()
+		_, hasPersonal := quotaPollingRuntime.auths[personal.AuthIndex]
+		_, hasWork := quotaPollingRuntime.auths[work.AuthIndex]
+		catalogSize := len(quotaPollingRuntime.auths)
+		quotaPollingRuntime.Unlock()
+		if catalogSize != 2 || !hasPersonal || !hasWork {
+			t.Fatalf("global poller catalog after %s = size %d personal=%t work=%t", testCase.projectID, catalogSize, hasPersonal, hasWork)
+		}
+	}
+	// Stop the scheduler and drain refresh workers before test seams are
+	// restored; otherwise an asynchronous catalog refresh could leak into the
+	// next quota test.
+	stopQuotaPolling()
+	waitQuotaRefreshIdle(t)
+	resetQuotaPollingForTest()
 }
 
 func TestAllocatorConsumesQuotaCacheWithoutProviderCall(t *testing.T) {

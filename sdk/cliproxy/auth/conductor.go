@@ -1870,6 +1870,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		execOpts := opts
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+		if errCtx := providerDispatchGate(ctx, execOpts); errCtx != nil {
+			return nil, errCtx
+		}
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -1879,6 +1882,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
+					if errCtx := providerDispatchGate(ctx, execOpts); errCtx != nil {
+						return nil, errCtx
+					}
 					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					if errStream != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
@@ -1911,6 +1917,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					discardStreamChunks(streamResult.Chunks)
 					auth = refreshed
 					didRefreshOnUnauthorized = true
+					if errCtx := providerDispatchGate(ctx, execOpts); errCtx != nil {
+						return nil, errCtx
+					}
 					retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					if retryErr != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
@@ -2641,6 +2650,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			if errCtx := providerDispatchGate(execCtx, execOpts); errCtx != nil {
+				return cliproxyexecutor.Response{}, errCtx
+			}
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -2650,6 +2662,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 						auth = refreshed
 						didRefreshOnUnauthorized = true
+						if errCtx := providerDispatchGate(execCtx, execOpts); errCtx != nil {
+							return cliproxyexecutor.Response{}, errCtx
+						}
 						resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 						if errExec != nil {
 							if errCtx := execCtx.Err(); errCtx != nil {
@@ -2769,6 +2784,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			if errCtx := providerDispatchGate(execCtx, execOpts); errCtx != nil {
+				return cliproxyexecutor.Response{}, errCtx
+			}
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
@@ -2778,6 +2796,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 						auth = refreshed
 						didRefreshOnUnauthorized = true
+						if errCtx := providerDispatchGate(execCtx, execOpts); errCtx != nil {
+							return cliproxyexecutor.Response{}, errCtx
+						}
 						resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
 						if errExec != nil {
 							if errCtx := execCtx.Err(); errCtx != nil {
@@ -3229,6 +3250,18 @@ func singleAttemptFromMetadata(meta map[string]any) bool {
 	default:
 		return false
 	}
+}
+
+func providerDispatchGate(ctx context.Context, opts cliproxyexecutor.Options) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if opts.ProviderStartObserver != nil {
+		opts.ProviderStartObserver()
+	}
+	return nil
 }
 
 func disallowFreeAuthFromMetadata(meta map[string]any) bool {

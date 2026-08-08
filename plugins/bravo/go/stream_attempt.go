@@ -93,7 +93,7 @@ func (r *bravoStreamAttemptRun) execute(req rpcExecutorRequest, protocol string)
 	if errCall != nil {
 		failure := classifyExecutionError(errCall)
 		completed = true
-		r.results <- bravoStreamBootstrapResult{failure: &failure}
+		r.results <- bravoStreamBootstrapResult{failure: &failure, accepted: !provenPreProviderCancellation(failure)}
 		return
 	}
 

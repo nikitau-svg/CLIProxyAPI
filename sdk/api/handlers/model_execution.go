@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -23,7 +24,8 @@ const (
 )
 
 type modelExecutionCanceledError struct {
-	cause error
+	cause           error
+	providerStarted bool
 }
 
 func (e *modelExecutionCanceledError) Error() string {
@@ -56,6 +58,30 @@ func (e *modelExecutionCanceledError) IsRequestScoped() bool {
 	return true
 }
 
+// ProviderExecutionState is carried across the plugin host ABI. A cancellation
+// before providerStarted is a proven pre-provider rejection; once the start
+// observer fired, cancellation is conservatively ambiguous.
+func (e *modelExecutionCanceledError) ProviderExecutionState() (started, known, ambiguous bool) {
+	if e == nil {
+		return false, false, false
+	}
+	return e.providerStarted, true, e.providerStarted
+}
+
+type providerExecutionAcceptance struct {
+	started atomic.Bool
+}
+
+func (a *providerExecutionAcceptance) markStarted() {
+	if a != nil {
+		a.started.Store(true)
+	}
+}
+
+func (a *providerExecutionAcceptance) providerStarted() bool {
+	return a != nil && a.started.Load()
+}
+
 type modelExecutionOptions struct {
 	Headers                 http.Header
 	Query                   url.Values
@@ -67,6 +93,7 @@ type modelExecutionOptions struct {
 	SingleAttempt           bool
 	AuthSelectionModel      string
 	UsageAlias              string
+	ProviderStartObserver   func()
 }
 
 // ProtocolExecutionRequest describes a route-level model execution request with explicit protocols.
@@ -164,10 +191,11 @@ func (e *ModelExecutionStreamError) ProviderErrorDetail() (providererror.Detail,
 // skip plugin IDs are set, that plugin's interceptors and router are skipped
 // for the nested model execution while other plugins may still run.
 func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionRequest) (ModelExecutionResponse, *interfaces.ErrorMessage) {
+	acceptance := &providerExecutionAcceptance{}
 	if req.Stream {
 		return ModelExecutionResponse{}, modelExecutionModeError("ExecuteModel requires Stream=false")
 	}
-	if errMsg := canceledModelExecutionError(ctx); errMsg != nil {
+	if errMsg := canceledModelExecutionError(ctx, acceptance); errMsg != nil {
 		return ModelExecutionResponse{}, errMsg
 	}
 	body, headers, errMsg := h.executeWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, req.AllowImageModel, modelExecutionOptions{
@@ -180,9 +208,10 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 		UsageAlias:              req.UsageAlias,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
 		SkipRouterPluginID:      req.SkipRouterPluginID,
+		ProviderStartObserver:   acceptance.markStarted,
 	})
 	if errMsg != nil {
-		return ModelExecutionResponse{}, normalizeCanceledModelExecutionError(ctx, errMsg)
+		return ModelExecutionResponse{}, normalizeCanceledModelExecutionError(ctx, errMsg, acceptance)
 	}
 	return ModelExecutionResponse{
 		StatusCode: http.StatusOK,
@@ -194,10 +223,11 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 // CountModelTokens counts tokens for an internal model request using the same
 // provider and auth execution controls as ExecuteModel.
 func (h *BaseAPIHandler) CountModelTokens(ctx context.Context, req ModelExecutionRequest) (ModelExecutionResponse, *interfaces.ErrorMessage) {
+	acceptance := &providerExecutionAcceptance{}
 	if req.Stream {
 		return ModelExecutionResponse{}, modelExecutionModeError("CountModelTokens requires Stream=false")
 	}
-	if errMsg := canceledModelExecutionError(ctx); errMsg != nil {
+	if errMsg := canceledModelExecutionError(ctx, acceptance); errMsg != nil {
 		return ModelExecutionResponse{}, errMsg
 	}
 	body, headers, errMsg := h.executeCountWithAuthManager(ctx, req.EntryProtocol, req.Model, cloneBytes(req.Body), req.Alt, modelExecutionOptions{
@@ -210,9 +240,10 @@ func (h *BaseAPIHandler) CountModelTokens(ctx context.Context, req ModelExecutio
 		UsageAlias:              req.UsageAlias,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
 		SkipRouterPluginID:      req.SkipRouterPluginID,
+		ProviderStartObserver:   acceptance.markStarted,
 	})
 	if errMsg != nil {
-		return ModelExecutionResponse{}, normalizeCanceledModelExecutionError(ctx, errMsg)
+		return ModelExecutionResponse{}, normalizeCanceledModelExecutionError(ctx, errMsg, acceptance)
 	}
 	return ModelExecutionResponse{
 		StatusCode: http.StatusOK,
@@ -226,10 +257,11 @@ func (h *BaseAPIHandler) CountModelTokens(ctx context.Context, req ModelExecutio
 // skip plugin IDs are set, that plugin's interceptors and router are skipped
 // for the nested model execution while other plugins may still run.
 func (h *BaseAPIHandler) ExecuteModelStream(ctx context.Context, req ModelExecutionRequest) (ModelExecutionStream, *interfaces.ErrorMessage) {
+	acceptance := &providerExecutionAcceptance{}
 	if !req.Stream {
 		return ModelExecutionStream{}, modelExecutionModeError("ExecuteModelStream requires Stream=true")
 	}
-	if errMsg := canceledModelExecutionError(ctx); errMsg != nil {
+	if errMsg := canceledModelExecutionError(ctx, acceptance); errMsg != nil {
 		return ModelExecutionStream{}, errMsg
 	}
 	dataChan, headers, errChan := h.executeStreamWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, req.AllowImageModel, modelExecutionOptions{
@@ -242,10 +274,11 @@ func (h *BaseAPIHandler) ExecuteModelStream(ctx context.Context, req ModelExecut
 		UsageAlias:              req.UsageAlias,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
 		SkipRouterPluginID:      req.SkipRouterPluginID,
+		ProviderStartObserver:   acceptance.markStarted,
 	})
 	chunks, errMsg := prepareModelExecutionStream(ctx, dataChan, errChan)
 	if errMsg != nil {
-		return ModelExecutionStream{}, normalizeCanceledModelExecutionError(ctx, errMsg)
+		return ModelExecutionStream{}, normalizeCanceledModelExecutionError(ctx, errMsg, acceptance)
 	}
 	return ModelExecutionStream{
 		StatusCode: http.StatusOK,
@@ -305,18 +338,22 @@ func modelExecutionModeError(message string) *interfaces.ErrorMessage {
 	return &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: errors.New(message)}
 }
 
-func canceledModelExecutionError(ctx context.Context) *interfaces.ErrorMessage {
+func canceledModelExecutionError(ctx context.Context, acceptance ...*providerExecutionAcceptance) *interfaces.ErrorMessage {
 	if ctx == nil || ctx.Err() == nil {
 		return nil
 	}
+	providerStarted := false
+	if len(acceptance) > 0 {
+		providerStarted = acceptance[0].providerStarted()
+	}
 	return &interfaces.ErrorMessage{
 		StatusCode: modelExecutionCanceledStatus,
-		Error:      &modelExecutionCanceledError{cause: ctx.Err()},
+		Error:      &modelExecutionCanceledError{cause: ctx.Err(), providerStarted: providerStarted},
 	}
 }
 
-func normalizeCanceledModelExecutionError(ctx context.Context, errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
-	if canceled := canceledModelExecutionError(ctx); canceled != nil {
+func normalizeCanceledModelExecutionError(ctx context.Context, errMsg *interfaces.ErrorMessage, acceptance ...*providerExecutionAcceptance) *interfaces.ErrorMessage {
+	if canceled := canceledModelExecutionError(ctx, acceptance...); canceled != nil {
 		return canceled
 	}
 	return errMsg

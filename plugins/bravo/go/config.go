@@ -297,6 +297,7 @@ func configure(raw []byte) error {
 		return fmt.Errorf("configure Bravo route traces: %w", errTraces)
 	}
 	currentConfig.Store(cfg)
+	resetAdaptiveStatusRuntime()
 	quotaPollingConfigured.Store(true)
 	wakeQuotaPolling()
 	return nil

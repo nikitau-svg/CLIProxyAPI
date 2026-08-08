@@ -54,7 +54,11 @@ var (
 	quotaRefreshNow       = func() time.Time { return time.Now().UTC() }
 	quotaRefreshSleep     = time.Sleep
 	quotaRefreshRuntimeWG sync.WaitGroup
-	quotaRefreshRuntime   = struct {
+	// Usage and profile refreshes intentionally run concurrently, but both
+	// update one credentialQuotaState value. Serialize their read-modify-write
+	// sections so one resource cannot erase the other's fresh watermark.
+	quotaRefreshApplyMu sync.Mutex
+	quotaRefreshRuntime = struct {
 		sync.Mutex
 		calls         map[string]*quotaRefreshCall
 		gates         map[string]*quotaProviderGate
@@ -283,7 +287,9 @@ func runQuotaRefresh(hostCallbackID string, auth pluginapi.HostAuthFileEntry, re
 	}
 
 	markQuotaRefreshAttempt(authIndex, resource, now)
-	pendingAtStart := pendingReservationPercent(authIndex)
+	adaptiveAtStart := captureAdaptiveRefreshWatermark(authIndex)
+	pendingAtStart := adaptiveAtStart.PendingPercent
+	adaptiveAtStart.CapturedAt = now
 	refreshed, errFetch := fetchQuotaSnapshot(hostCallbackID, auth, resource)
 	completedAt := quotaRefreshNow().UTC()
 	if errFetch != nil {
@@ -291,7 +297,7 @@ func runQuotaRefresh(hostCallbackID string, auth pluginapi.HostAuthFileEntry, re
 		applyQuotaRefreshFailure(authIndex, resource, provider, egressKey, failure, completedAt)
 		return
 	}
-	applyQuotaRefreshSuccess(authIndex, resource, provider, refreshed, pendingAtStart, completedAt)
+	applyQuotaRefreshSuccess(authIndex, resource, provider, refreshed, pendingAtStart, completedAt, adaptiveAtStart)
 }
 
 func quotaProviderRefreshGate(egressKey string, concurrency int) *quotaProviderGate {
@@ -310,6 +316,8 @@ func quotaProviderRefreshGate(egressKey string, concurrency int) *quotaProviderG
 }
 
 func markQuotaRefreshAttempt(authIndex, resource string, at time.Time) {
+	quotaRefreshApplyMu.Lock()
+	defer quotaRefreshApplyMu.Unlock()
 	quota := quotaSnapshot(authIndex)
 	state := quotaResourceRefreshState(quota, resource)
 	state.AttemptCount++
@@ -318,7 +326,15 @@ func markQuotaRefreshAttempt(authIndex, resource string, at time.Time) {
 	storeQuotaSnapshot(authIndex, quota)
 }
 
-func applyQuotaRefreshSuccess(authIndex, resource, provider string, refreshed credentialQuotaState, pendingAtStart float64, completedAt time.Time) {
+func applyQuotaRefreshSuccess(
+	authIndex, resource, provider string,
+	refreshed credentialQuotaState,
+	pendingAtStart float64,
+	completedAt time.Time,
+	adaptiveAtStart ...adaptiveRefreshWatermark,
+) {
+	quotaRefreshApplyMu.Lock()
+	defer quotaRefreshApplyMu.Unlock()
 	current := quotaSnapshot(authIndex)
 	state := quotaResourceRefreshState(current, resource)
 	state.SuccessCount++
@@ -342,7 +358,11 @@ func applyQuotaRefreshSuccess(authIndex, resource, provider string, refreshed cr
 	if confirmedAt.IsZero() {
 		confirmedAt = completedAt.UTC()
 	}
-	if !quotaConfirmedAt(current).IsZero() && confirmedAt.Before(quotaConfirmedAt(current)) {
+	currentConfirmedAt := quotaConfirmedAt(current)
+	if !currentConfirmedAt.IsZero() && !confirmedAt.After(currentConfirmedAt) {
+		// Equal observations are the same provider generation, not new evidence.
+		// They may update refresh health, but must not learn from or reconcile a
+		// pending watermark captured after that snapshot was produced.
 		current.UsageRefresh = state
 		storeQuotaSnapshot(authIndex, current)
 		return
@@ -367,11 +387,115 @@ func applyQuotaRefreshSuccess(authIndex, resource, provider string, refreshed cr
 	if refreshed.WorkspaceLabel == "" {
 		refreshed.WorkspaceLabel = current.WorkspaceLabel
 	}
+	watermarkCovered := true
+	if len(adaptiveAtStart) > 0 && !adaptiveAtStart[0].CapturedAt.IsZero() {
+		watermarkCovered = !confirmedAt.Before(adaptiveAtStart[0].CapturedAt)
+	}
+	reconciled := watermarkCovered && quotaRefreshProvesPendingCoverage(current, refreshed, confirmedAt)
+	if reconciled {
+		observeAdaptiveQuotaRefresh(authIndex, current, refreshed, pendingAtStart, completedAt, adaptiveAtStart...)
+	} else {
+		// Merge each window independently: a real decrease is immediately useful
+		// safety evidence, while an unexplained increase cannot create capacity.
+		// Since window timestamps are not yet stored independently, retain the old
+		// global observation time whenever any window remains unproven; otherwise
+		// the old LKG would be falsely rejuvenated by a partially unsafe refresh.
+		refreshed.Session = conservativeQuotaWindow(current.Session, refreshed.Session)
+		refreshed.Weekly = conservativeQuotaWindow(current.Weekly, refreshed.Weekly)
+		refreshed.ModelWeekly = conservativeModelQuotaWindows(current.ModelWeekly, refreshed.ModelWeekly)
+		refreshed.ConfirmedAt = currentConfirmedAt
+		refreshed.RefreshedAt = current.RefreshedAt
+	}
 	storeQuotaSnapshot(authIndex, refreshed)
-	clearPendingReservation(authIndex, pendingAtStart)
+	if reconciled {
+		clearPendingReservation(authIndex, pendingAtStart, adaptiveAtStart...)
+		if len(adaptiveAtStart) > 0 {
+			reconcileAllocatorObservePending(authIndex, adaptiveAtStart[0].ObservePendingPercent, confirmedAt)
+		}
+	}
+}
+
+func conservativeQuotaWindow(previous, refreshed quotaWindowState) quotaWindowState {
+	if normalizeQuotaWindow(refreshed).RemainingPercent <= normalizeQuotaWindow(previous).RemainingPercent {
+		return refreshed
+	}
+	return previous
+}
+
+func conservativeModelQuotaWindows(previous, refreshed []modelQuotaWindowState) []modelQuotaWindowState {
+	merged := append([]modelQuotaWindowState(nil), refreshed...)
+	for _, oldWindow := range previous {
+		found := false
+		for index := range merged {
+			if !quotaModelMatches(oldWindow.Model, merged[index].Model) {
+				continue
+			}
+			merged[index].quotaWindowState = conservativeQuotaWindow(oldWindow.quotaWindowState, merged[index].quotaWindowState)
+			found = true
+			break
+		}
+		if !found {
+			merged = append(merged, oldWindow)
+		}
+	}
+	return merged
+}
+
+func quotaRefreshProvesPendingCoverage(previous, refreshed credentialQuotaState, observedAt time.Time) bool {
+	if quotaConfidence(refreshed) != pluginapi.HostAuthQuotaConfidenceConfirmed {
+		return false
+	}
+	if quotaConfidence(previous) != pluginapi.HostAuthQuotaConfidenceConfirmed {
+		// First confirmed discovery establishes the baseline. The snapshot was
+		// fetched after the pending watermark and therefore covers that work even
+		// though there is no prior provider generation to compare.
+		return true
+	}
+	if !quotaWindowProvesPendingCoverage(previous.Session, refreshed.Session, observedAt) ||
+		!quotaWindowProvesPendingCoverage(previous.Weekly, refreshed.Weekly, observedAt) {
+		return false
+	}
+	// Every previously known physical-model window is a limiting generation.
+	// Increasing or omitting it can widen admission back to the global weekly
+	// window, so it must independently prove coverage/reset before debt clears.
+	for _, oldWindow := range previous.ModelWeekly {
+		matched := false
+		for _, newWindow := range refreshed.ModelWeekly {
+			if !quotaModelMatches(oldWindow.Model, newWindow.Model) {
+				continue
+			}
+			matched = true
+			if !quotaWindowProvesPendingCoverage(oldWindow.quotaWindowState, newWindow.quotaWindowState, observedAt) {
+				return false
+			}
+			break
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+func quotaWindowProvesPendingCoverage(previous, refreshed quotaWindowState, observedAt time.Time) bool {
+	previous = normalizeQuotaWindow(previous)
+	refreshed = normalizeQuotaWindow(refreshed)
+	if refreshed.RemainingPercent <= previous.RemainingPercent {
+		return true
+	}
+	// An increase is ambiguous (rounding, provider correction, or reset) unless
+	// the scheduled reset generation actually passed and the provider returned
+	// a strictly newer generation. Only that is proof that the pre-reset
+	// watermark is covered by the new snapshot.
+	return previous.ResetMode == pluginapi.HostAuthQuotaResetModeScheduled &&
+		refreshed.ResetMode == pluginapi.HostAuthQuotaResetModeScheduled &&
+		!previous.ResetAt.IsZero() && !observedAt.Before(previous.ResetAt) &&
+		refreshed.ResetAt.After(previous.ResetAt)
 }
 
 func applyQuotaRefreshFailure(authIndex, resource, provider, egressKey string, failure *quotaRefreshFailure, at time.Time) {
+	quotaRefreshApplyMu.Lock()
+	defer quotaRefreshApplyMu.Unlock()
 	current := quotaSnapshot(authIndex)
 	state := quotaResourceRefreshState(current, resource)
 	state.FailureCount++

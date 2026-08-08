@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -124,6 +125,175 @@ func TestCompactBypassRequiresConfirmedPositiveQuota(t *testing.T) {
 				t.Fatal("compact bypass accepted quota that is unknown or exhausted")
 			}
 		})
+	}
+}
+
+func TestCompactBypassSaturationFailsBeforeProviderLease(t *testing.T) {
+	adaptiveRoutingSaturated.Store(true)
+	t.Cleanup(func() { adaptiveRoutingSaturated.Store(false) })
+	quota := credentialQuotaState{
+		Confidence: "confirmed",
+		Session:    quotaWindowState{RemainingPercent: 100},
+		Weekly:     quotaWindowState{RemainingPercent: 100},
+	}
+	if compactBypassQuotaEligible(quota, "claude-fable-5", "compact-auth", 0.5) {
+		t.Fatal("saturation allowed compact candidate admission")
+	}
+	release, acquired, failure := acquireExecutionAttemptLease(executionAttempt{
+		CompactBypass:                true,
+		CompactBypassKey:             "project\x00session",
+		CompactBypassCooldownSeconds: 900,
+	})
+	if acquired || failure == nil || failure.Code != "bravo_adaptive_ledger_saturated" {
+		t.Fatalf("compact lease = acquired %t failure %#v", acquired, failure)
+	}
+	// Executor calls a provider only after acquired=true. Calling the inert
+	// release here also proves no cooldown/provider-side lease was installed.
+	release(false)
+	compactBypassRuntime.Lock()
+	inFlight := len(compactBypassRuntime.InFlight)
+	compactBypassRuntime.Unlock()
+	if inFlight != 0 {
+		t.Fatalf("compact saturation left %d provider leases", inFlight)
+	}
+}
+
+func TestCompactBypassEstimatorSaturationFailsBeforeProviderLease(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		global bool
+	}{
+		{name: "credential"},
+		{name: "global", global: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			resetAdaptiveReserveForTest()
+			isolateCompactBypassState(t)
+			authIndex := "compact-estimator-" + testCase.name
+			adaptiveReserveRuntime.Lock()
+			if testCase.global {
+				adaptiveReserveRuntime.SaturationGlobal = true
+			} else {
+				adaptiveReserveRuntime.Saturated[authIndex] = time.Now().UTC()
+			}
+			adaptiveReserveRuntime.Unlock()
+
+			release, acquired, failure := acquireExecutionAttemptLease(executionAttempt{
+				Auth:                         pluginapi.HostAuthFileEntry{AuthIndex: authIndex},
+				AllocatorManaged:             true,
+				CompactBypass:                true,
+				CompactBypassKey:             "project\x00session",
+				CompactBypassCooldownSeconds: 900,
+			})
+			if acquired || failure == nil || failure.Code != "bravo_adaptive_estimator_saturated" {
+				t.Fatalf("compact lease = acquired %t failure %#v", acquired, failure)
+			}
+			release(false)
+			compactBypassRuntime.Lock()
+			inFlight := len(compactBypassRuntime.InFlight)
+			compactBypassRuntime.Unlock()
+			if inFlight != 0 {
+				t.Fatalf("estimator saturation installed %d compact leases", inFlight)
+			}
+		})
+	}
+}
+
+func TestCompactBypassUsesAtomicAdaptiveQuotaLeaseAndDurablePending(t *testing.T) {
+	resetAdaptiveReserveForTest()
+	isolateCompactBypassState(t)
+	authIndex := "compact-atomic-auth"
+	now := time.Now().UTC()
+	installCompactQuotaState(t, map[string]*credentialQuotaState{
+		authIndex: {
+			Provider: "claude", Confidence: "confirmed", ConfirmedAt: now, RefreshedAt: now,
+			Session: quotaWindowState{RemainingPercent: 1}, Weekly: quotaWindowState{RemainingPercent: 1},
+		},
+	})
+	previousConfig := loadedConfig()
+	cfg := defaultPluginConfig()
+	cfg.AllocatorMode = "enforce"
+	cfg.QuotaRefreshSeconds = 3600
+	currentConfig.Store(cfg)
+	t.Cleanup(func() { currentConfig.Store(previousConfig) })
+	shape := adaptiveRequestShape{Provider: "claude", PhysicalModel: "claude-fable-5", ModelFamily: "fable", Multiplier: 1}
+	base := executionAttempt{
+		Candidate: candidate{Provider: "claude", Model: "claude-fable-5"},
+		Auth:      pluginapi.HostAuthFileEntry{AuthIndex: authIndex, Provider: "claude"},
+		ProjectID: "compact-atomic-project", AllocatorManaged: true,
+		ReservationPercent: 0.6, AdaptiveReserveKey: adaptiveProfileKey(authIndex, shape),
+		AdaptiveRequestShape: shape, AdaptiveBaselinePercent: 0.6,
+		TariffID: "x1", CompactBypass: true, CompactBypassCooldownSeconds: 900,
+	}
+	first := base
+	first.CompactBypassKey = "project\x00session-a"
+	releaseFirst, acquiredFirst, failureFirst := acquireExecutionAttemptLease(first)
+	if !acquiredFirst || failureFirst != nil {
+		t.Fatalf("first compact lease = acquired %t failure %#v", acquiredFirst, failureFirst)
+	}
+	second := base
+	second.CompactBypassKey = "project\x00session-b"
+	releaseSecond, acquiredSecond, failureSecond := acquireExecutionAttemptLease(second)
+	if acquiredSecond || failureSecond == nil || failureSecond.Code != "bravo_compact_adaptive_reserve" {
+		t.Fatalf("second compact lease = acquired %t failure %#v", acquiredSecond, failureSecond)
+	}
+	releaseSecond(false)
+	releaseFirst(true)
+	if pending := pendingReservationPercent(authIndex); pending < 0.6 {
+		t.Fatalf("committed compact pending = %.3f, want at least 0.6", pending)
+	}
+}
+
+func TestCompactBypassAmbiguousCommitSurvivesRestartUntilQuotaReconciliation(t *testing.T) {
+	restoreUsage := isolateBravoUsageState(t)
+	defer restoreUsage()
+	resetAdaptiveReserveForTest()
+	defer resetAdaptiveReserveForTest()
+	isolateCompactBypassState(t)
+	previousTracker := bravoProjectDemand
+	bravoProjectDemand = newProjectDemandTracker(time.Minute)
+	defer func() { bravoProjectDemand = previousTracker }()
+
+	path := filepath.Join(t.TempDir(), "compact-ambiguous-state.json")
+	if errConfigure := configureUsageState(path); errConfigure != nil {
+		t.Fatal(errConfigure)
+	}
+	authIndex := "compact-ambiguous-auth"
+	setAdaptivePersistenceQuota(t, authIndex, 80)
+	shape := adaptiveRequestShape{Provider: "claude", PhysicalModel: "claude-fable-5", ModelFamily: "fable", Multiplier: 1}
+	attempt := adaptivePersistenceAttempt(authIndex, 1)
+	attempt.ProjectID = "compact-ambiguous-project"
+	attempt.Candidate = candidate{Provider: "claude", Model: "claude-fable-5"}
+	attempt.AdaptiveRequestShape = shape
+	attempt.AdaptiveReserveKey = adaptiveProfileKey(authIndex, shape)
+	attempt.AdaptiveBaselinePercent = 1
+	attempt.CompactBypass = true
+	attempt.CompactBypassKey = "compact-ambiguous-project\x00session"
+	attempt.CompactBypassCooldownSeconds = 900
+
+	release, acquired, failure := acquireExecutionAttemptLease(attempt)
+	if !acquired || failure != nil {
+		t.Fatalf("compact ambiguous lease = acquired %t failure %#v", acquired, failure)
+	}
+	// A request that may have reached the provider is committed even when its
+	// final transport outcome is ambiguous.
+	release(true)
+	pendingBeforeRestart := pendingReservationPercent(authIndex)
+	if pendingBeforeRestart <= 0 {
+		t.Fatal("ambiguous compact completion did not create durable pending debt")
+	}
+
+	resetAdaptiveReserveForTest()
+	simulateFreshBravoProcess(t, path)
+	if pendingAfterRestart := pendingReservationPercent(authIndex); pendingAfterRestart != pendingBeforeRestart {
+		t.Fatalf("pending after restart = %.3f, want %.3f", pendingAfterRestart, pendingBeforeRestart)
+	}
+	watermark := captureAdaptiveRefreshWatermark(authIndex)
+	completedAt := time.Now().UTC().Add(time.Second)
+	applyQuotaRefreshSuccess(authIndex, quotaRefreshResourceUsage, "claude",
+		adaptivePersistenceQuota(79, completedAt), pendingBeforeRestart, completedAt, watermark)
+	if pendingAfterRefresh := pendingReservationPercent(authIndex); pendingAfterRefresh != 0 {
+		t.Fatalf("confirmed quota reconciliation retained compact pending %.3f", pendingAfterRefresh)
 	}
 }
 

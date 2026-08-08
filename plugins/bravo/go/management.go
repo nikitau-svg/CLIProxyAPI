@@ -94,6 +94,7 @@ func registerManagement() ([]byte, error) {
 			{Method: http.MethodPatch, Path: "/bravo/subscriptions", Description: "Update one subscription policy by auth_index."},
 			{Method: http.MethodPatch, Path: "/bravo/tariffs", Description: "Update one allocator tariff."},
 			{Method: http.MethodPost, Path: "/bravo/quotas/refresh", Description: "Refresh confirmed subscription quotas."},
+			{Method: http.MethodPost, Path: "/bravo/allocator/reconcile", Description: "Clear adaptive ledger saturation after operator-confirmed quota reconciliation."},
 		},
 		Resources: []pluginapi.ResourceRoute{{
 			Path:        "/dashboard",
