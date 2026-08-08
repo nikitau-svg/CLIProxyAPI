@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -30,6 +31,59 @@ func newRouteTraceRecorder(
 		SourceProtocol: normalizeContractProtocol(protocol),
 		Stream:         stream,
 	}}
+}
+
+func (recorder *routeTraceRecorder) setLogicalModel(logicalModel string) {
+	if recorder == nil || recorder.finished {
+		return
+	}
+	recorder.trace.LogicalModel = strings.TrimSpace(logicalModel)
+}
+
+func (recorder *routeTraceRecorder) preflightFailure(
+	stage string,
+	failure executionFailure,
+	source error,
+) {
+	if recorder == nil || recorder.finished {
+		return
+	}
+	capability := ""
+	var typed *capabilityContractError
+	if errors.As(source, &typed) && typed != nil {
+		capability = strings.TrimSpace(typed.Capability)
+	}
+	recorder.appendAttempt(routeTraceAttempt{
+		At:                 time.Now().UTC(),
+		Status:             failure.Status,
+		Success:            false,
+		Outcome:            "rejected",
+		Decision:           "stop",
+		Committed:          false,
+		ErrorCode:          failure.Code,
+		ErrorMessage:       failure.Message,
+		DiagnosticStage:    stage,
+		RequiredCapability: capability,
+		ParameterPath:      capabilityParameterPath(capability),
+	})
+}
+
+func capabilityParameterPath(capability string) string {
+	switch strings.TrimSpace(capability) {
+	case capabilityTools, capabilityProviderTool, capabilityWebSearch,
+		capabilityWebSearchFilters, capabilityImageGeneration:
+		return "$.tools"
+	case capabilityToolResult, capabilityVision, capabilityFileInput:
+		return "$.messages"
+	case capabilityReasoning:
+		return "$.thinking"
+	case capabilityStream:
+		return "$.stream"
+	case capabilityStructuredOutput:
+		return "$.output_config"
+	default:
+		return "$"
+	}
 }
 
 func (recorder *routeTraceRecorder) preflight(rejections []candidateRejection) {
@@ -107,6 +161,7 @@ func (recorder *routeTraceRecorder) failureWithCommit(
 	if failure.Provider != nil {
 		item.ProviderErrorType = failure.Provider.Type
 		item.ProviderErrorCode = failure.Provider.Code
+		item.ProviderErrorParam = failure.Provider.Parameter
 		item.ProviderErrorScope = failure.Provider.Scope
 		item.FailureClass = failure.Provider.Class
 		item.RequiredInputTokens = failure.Provider.RequiredTokens

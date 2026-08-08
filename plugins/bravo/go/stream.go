@@ -34,29 +34,37 @@ func executeStream(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
+	body := executionBody(req)
+	protocol := requestProtocol(req.ExecutorRequest)
+	routeRecorder := newRouteTraceRecorder(req, strings.TrimSpace(req.Model), protocol, true)
 	streamID := strings.TrimSpace(req.StreamID)
 	if streamID == "" {
-		return failureEnvelope(executionFailure{
+		failure := executionFailure{
 			Code:    "bravo_stream_id_required",
 			Message: "stream_id is required for executor.execute_stream",
 			Status:  http.StatusBadRequest,
-		}), nil
+		}
+		routeRecorder.preflightFailure("stream_preflight", failure, nil)
+		return failureEnvelopeWithRouteTrace(routeRecorder, failure), nil
 	}
 	logicalName, model, cfg, failure := prepareBravoExecution(req)
 	if failure != nil {
-		return failureEnvelope(*failure), nil
-	}
-	body := executionBody(req)
-	protocol := requestProtocol(req.ExecutorRequest)
-	contract, errDetect := detectRequestContract(protocol, body, true)
-	if errDetect != nil {
-		return failureEnvelope(contractFailure(errDetect)), nil
-	}
-	if errPreflight := verifyLogicalModelContract(model, contract); errPreflight != nil {
-		return failureEnvelope(contractFailure(errPreflight)), nil
+		routeRecorder.preflightFailure("routing_preflight", *failure, nil)
+		return failureEnvelopeWithRouteTrace(routeRecorder, *failure), nil
 	}
 	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
-	routeRecorder := newRouteTraceRecorder(req, logicalModelID, protocol, true)
+	routeRecorder.setLogicalModel(logicalModelID)
+	contract, errDetect := detectRequestContract(protocol, body, true)
+	if errDetect != nil {
+		failure := contractFailure(errDetect)
+		routeRecorder.preflightFailure("contract_detection", failure, errDetect)
+		return failureEnvelopeWithRouteTrace(routeRecorder, failure), nil
+	}
+	if errPreflight := verifyLogicalModelContract(model, contract); errPreflight != nil {
+		failure := contractFailure(errPreflight)
+		routeRecorder.preflightFailure("logical_contract", failure, errPreflight)
+		return failureEnvelopeWithRouteTrace(routeRecorder, failure), nil
+	}
 	go runBravoStreamWithTrace(req, streamID, routeRecorder)
 	return okEnvelope(map[string]any{
 		"headers": http.Header{

@@ -17,7 +17,7 @@ import (
 func TestRouteTraceStorePersistsSafeBoundedHistory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bravo-state.json")
 	store := newRouteTraceStore(path)
-	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	secret := "sk-bravo-secret-sentinel"
 
 	store.append(routeTrace{
@@ -134,7 +134,7 @@ func TestRouteTraceManagementFiltersErrorsByProject(t *testing.T) {
 func TestRouteTraceStorePrunesRetentionAndCount(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bravo-state.json")
 	store := newRouteTraceStore(path)
-	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	store.maxEntries = 2
 	store.retention = 24 * time.Hour
 

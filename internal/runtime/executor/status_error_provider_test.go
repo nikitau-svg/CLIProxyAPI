@@ -114,6 +114,30 @@ func TestStatusErrCarriesSafeCodexServerError(t *testing.T) {
 	}
 }
 
+func TestStatusErrCarriesSafeCodexInvalidToolParameter(t *testing.T) {
+	errStatus := newCodexStatusErr(
+		http.StatusBadRequest,
+		[]byte(`{"error":{"type":"invalid_request_error","code":"invalid_tool_parameters","param":"tools[7].function.parameters","message":"echoed schema says context window and request_id=req_private"},"request_id":"req_private"}`),
+	)
+
+	detail, ok := providererror.FromError(errStatus)
+	if !ok {
+		t.Fatal("statusErr does not expose safe Codex invalid-tool detail")
+	}
+	if detail.Type != "invalid_request_error" ||
+		detail.Code != "invalid_tool_parameters" ||
+		detail.Parameter != "tools[7].function.parameters" ||
+		detail.Scope != providererror.ScopeRequest ||
+		detail.Class != providererror.ClassInvalidRequest {
+		t.Fatalf("ProviderErrorDetail = %#v", detail)
+	}
+	for _, forbidden := range []string{"echoed schema", "context window and request_id", "req_private"} {
+		if strings.Contains(strings.ToLower(errStatus.Error()), strings.ToLower(forbidden)) {
+			t.Fatalf("Error() leaks %q: %s", forbidden, errStatus.Error())
+		}
+	}
+}
+
 func TestClaudeHTTPStatusCarriesSafeRetryableStandardErrors(t *testing.T) {
 	tests := []struct {
 		name       string

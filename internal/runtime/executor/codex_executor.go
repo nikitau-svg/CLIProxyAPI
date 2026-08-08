@@ -2373,7 +2373,7 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	}
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
-	if detail, ok := codexSafeProviderErrorDetail(body); ok {
+	if detail, ok := codexSafeProviderErrorDetail(errCode, body); ok {
 		err.providerError = &detail
 	}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
@@ -2382,7 +2382,10 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	return err
 }
 
-func codexSafeProviderErrorDetail(body []byte) (providererror.Detail, bool) {
+func codexSafeProviderErrorDetail(statusCode int, body []byte) (providererror.Detail, bool) {
+	if classification, ok := providererror.ParseOpenAIStandard(statusCode, string(body)); ok {
+		return classification.Detail, true
+	}
 	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
 	code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
 

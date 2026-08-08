@@ -60,8 +60,12 @@ type routeTraceAttempt struct {
 	FirstContentMS       int64     `json:"first_content_ms,omitempty"`
 	ErrorCode            string    `json:"error_code,omitempty"`
 	ErrorMessage         string    `json:"error_message,omitempty"`
+	DiagnosticStage      string    `json:"diagnostic_stage,omitempty"`
+	RequiredCapability   string    `json:"required_capability,omitempty"`
+	ParameterPath        string    `json:"parameter_path,omitempty"`
 	ProviderErrorType    string    `json:"provider_error_type,omitempty"`
 	ProviderErrorCode    string    `json:"provider_error_code,omitempty"`
+	ProviderErrorParam   string    `json:"provider_error_parameter,omitempty"`
 	ProviderErrorScope   string    `json:"provider_error_scope,omitempty"`
 	FailureClass         string    `json:"failure_class,omitempty"`
 	RetryAfter           string    `json:"retry_after,omitempty"`
@@ -353,9 +357,12 @@ func sanitizeRouteTrace(trace routeTrace) routeTrace {
 		// unnecessary second source of personal data.
 		attempt.SubscriptionLabel = ""
 		attempt.ErrorCode = safeRouteTraceIdentifier(attempt.ErrorCode)
-		attempt.ErrorMessage = routeTraceMessageRU(attempt.ErrorCode)
+		attempt.DiagnosticStage = safeRouteTraceIdentifier(attempt.DiagnosticStage)
+		attempt.RequiredCapability = safeRouteTraceIdentifier(attempt.RequiredCapability)
+		attempt.ParameterPath = safeRouteTraceParameter(attempt.ParameterPath)
 		attempt.ProviderErrorType = safeRouteTraceIdentifier(attempt.ProviderErrorType)
 		attempt.ProviderErrorCode = safeRouteTraceIdentifier(attempt.ProviderErrorCode)
+		attempt.ProviderErrorParam = safeRouteTraceParameter(attempt.ProviderErrorParam)
 		attempt.ProviderErrorScope = safeRouteTraceIdentifier(attempt.ProviderErrorScope)
 		attempt.Outcome = safeRouteTraceIdentifier(attempt.Outcome)
 		attempt.Decision = safeRouteTraceIdentifier(attempt.Decision)
@@ -366,6 +373,7 @@ func sanitizeRouteTrace(trace routeTrace) routeTrace {
 		if attempt.LatencyMS < 0 {
 			attempt.LatencyMS = 0
 		}
+		attempt.ErrorMessage = routeTraceAttemptMessageRU(*attempt)
 	}
 	trace.FinalMessage = routeTraceActionRU(trace)
 	trace.ClientAction = routeTraceClientAction(trace)
@@ -377,12 +385,18 @@ func routeTraceClientAction(trace routeTrace) string {
 		return "none"
 	}
 	for _, attempt := range trace.Attempts {
+		if attempt.DiagnosticStage != "" || attempt.FailureClass == "invalid_request" {
+			return "fix_request"
+		}
 		if attempt.ErrorCode == "bravo_context_window_exceeded" ||
 			attempt.ErrorCode == "bravo_context_target_incompatible" {
 			return "compact"
 		}
 	}
 	switch trace.FinalCode {
+	case "bravo_provider_invalid_request", "invalid_request_error", "invalid_tool_parameters", "invalid_function_parameters",
+		"bravo_contract_unavailable", "bravo_contract_unverified", "bravo_capability_conflict", "bravo_capability_undeclared":
+		return "fix_request"
 	case "bravo_subscription_quota_exhausted", "bravo_subscription_model_credits_exhausted":
 		return "raise_quota"
 	case "bravo_subscription_auth_unavailable", "authentication_error":
@@ -413,6 +427,49 @@ func safeRouteTraceModel(value string) string {
 	return safeRouteTraceIdentifier(value)
 }
 
+func safeRouteTraceParameter(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 256 {
+		return ""
+	}
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z',
+			char >= 'A' && char <= 'Z',
+			char >= '0' && char <= '9',
+			char == '_',
+			char == '-',
+			char == '.',
+			char == '[',
+			char == ']',
+			char == '$':
+		default:
+			return ""
+		}
+	}
+	return value
+}
+
+func routeTraceAttemptMessageRU(attempt routeTraceAttempt) string {
+	if attempt.DiagnosticStage != "" {
+		path := strings.TrimSpace(attempt.ParameterPath)
+		capability := strings.TrimSpace(attempt.RequiredCapability)
+		switch {
+		case path != "" && capability != "":
+			return fmt.Sprintf("Локальная проверка запроса отклонила capability %s в поле %s до обращения к провайдеру.", capability, path)
+		case capability != "":
+			return fmt.Sprintf("Локальная проверка запроса отклонила capability %s до обращения к провайдеру.", capability)
+		default:
+			return "Локальная проверка отклонила параметры запроса до обращения к провайдеру."
+		}
+	}
+	if attempt.ProviderErrorParam != "" &&
+		(attempt.FailureClass == "invalid_request" || attempt.ProviderErrorType == "invalid_request_error") {
+		return fmt.Sprintf("Провайдер отклонил параметр запроса %s. Проверьте объявление инструмента и переданные аргументы.", attempt.ProviderErrorParam)
+	}
+	return routeTraceMessageRU(attempt.ErrorCode)
+}
+
 func routeTraceMessageRU(code string) string {
 	switch strings.TrimSpace(code) {
 	case "bravo_context_window_exceeded":
@@ -431,6 +488,10 @@ func routeTraceMessageRU(code string) string {
 		return "Провайдер временно перегружен."
 	case "server_error", "bravo_provider_stream_error":
 		return "Провайдер завершил запрос внутренней ошибкой."
+	case "bravo_provider_invalid_request", "invalid_request_error", "invalid_tool_parameters", "invalid_function_parameters":
+		return "Провайдер отклонил параметры запроса или инструмента. Проверьте JSON-схему и аргументы tool-вызова."
+	case "bravo_capability_conflict", "bravo_capability_undeclared", "bravo_contract_unverified", "bravo_contract_unavailable":
+		return "Локальная матрица совместимости отклонила контракт запроса до обращения к провайдеру."
 	case "bravo_route_temporarily_unavailable":
 		return "Все безопасные варианты маршрута временно недоступны."
 	case "":
@@ -442,11 +503,17 @@ func routeTraceMessageRU(code string) string {
 
 func routeTraceActionRU(trace routeTrace) string {
 	var contextAttempt *routeTraceAttempt
+	var requestDiagnostic *routeTraceAttempt
 	var claudeLimit *routeTraceAttempt
 	var claudeModelCredits *routeTraceAttempt
 	var claudeReserve *routeTraceAttempt
 	for index := range trace.Attempts {
 		attempt := &trace.Attempts[index]
+		if requestDiagnostic == nil && (attempt.DiagnosticStage != "" ||
+			attempt.FailureClass == "invalid_request" ||
+			attempt.ProviderErrorType == "invalid_request_error") {
+			requestDiagnostic = attempt
+		}
 		switch attempt.ErrorCode {
 		case "bravo_context_window_exceeded":
 			contextAttempt = attempt
@@ -463,6 +530,9 @@ func routeTraceActionRU(trace routeTrace) string {
 				claudeModelCredits = attempt
 			}
 		}
+	}
+	if requestDiagnostic != nil && contextAttempt == nil {
+		return requestDiagnostic.ErrorMessage
 	}
 	if contextAttempt != nil {
 		target := friendlyModelName(contextAttempt.Model)

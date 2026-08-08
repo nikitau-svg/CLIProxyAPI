@@ -37,29 +37,37 @@ func execute(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	logicalName, model, cfg, failure := prepareBravoExecution(req)
-	if failure != nil {
-		return failureEnvelope(*failure), nil
-	}
 	body := executionBody(req)
 	protocol := requestProtocol(req.ExecutorRequest)
+	routeTrace := newRouteTraceRecorder(req, strings.TrimSpace(req.Model), protocol, false)
+	logicalName, model, cfg, failure := prepareBravoExecution(req)
+	if failure != nil {
+		routeTrace.preflightFailure("routing_preflight", *failure, nil)
+		return failureEnvelopeWithRouteTrace(routeTrace, *failure), nil
+	}
+	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
+	routeTrace.setLogicalModel(logicalModelID)
 	contract, errDetect := detectRequestContract(protocol, body, false)
 	if errDetect != nil {
-		return failureEnvelope(contractFailure(errDetect)), nil
+		failure := contractFailure(errDetect)
+		routeTrace.preflightFailure("contract_detection", failure, errDetect)
+		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
 	if errPreflight := verifyLogicalModelContract(model, contract); errPreflight != nil {
-		return failureEnvelope(contractFailure(errPreflight)), nil
+		failure := contractFailure(errPreflight)
+		routeTrace.preflightFailure("logical_contract", failure, errPreflight)
+		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
 	candidateSourceBody, errStrip := stripRequestEffort(body, protocol, contract.Effort)
 	if errStrip != nil {
-		return failureEnvelope(executionFailure{
+		failure := executionFailure{
 			Code:    "bravo_request_invalid",
 			Message: errStrip.Error(),
 			Status:  http.StatusBadRequest,
-		}), nil
+		}
+		routeTrace.preflightFailure("request_rewrite", failure, errStrip)
+		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
-	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
-	routeTrace := newRouteTraceRecorder(req, logicalModelID, protocol, false)
 	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
 	if errPlan != nil {
 		failure := executionFailure{

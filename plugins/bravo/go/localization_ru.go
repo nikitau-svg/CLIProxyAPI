@@ -54,8 +54,17 @@ func clientExecutionFailureRU(failure executionFailure) executionFailure {
 		}
 	case "bravo_route_temporarily_unavailable", "overloaded_error":
 		failure.Message = "Все подходящие маршруты временно недоступны или перегружены. Подождите время из Retry-After и повторите запрос."
-	case "bravo_contract_unavailable", "bravo_contract_rejected", "bravo_capability_undeclared", "bravo_effort_unavailable":
+	case "bravo_contract_unavailable", "bravo_contract_rejected", "bravo_contract_unverified", "bravo_capability_conflict", "bravo_capability_undeclared", "bravo_effort_unavailable":
 		failure.Message = "Ни один маршрут Bravo не может безопасно сохранить контракт этого запроса. Упростите параметры, инструменты или режим reasoning/effort."
+	case "bravo_provider_invalid_request", "invalid_request_error", "invalid_tool_parameters", "invalid_function_parameters":
+		if failure.Provider != nil && strings.TrimSpace(failure.Provider.Parameter) != "" {
+			failure.Message = fmt.Sprintf(
+				"Провайдер отклонил параметр %s. Проверьте JSON-схему инструмента и переданные аргументы.",
+				failure.Provider.Parameter,
+			)
+		} else {
+			failure.Message = "Провайдер отклонил параметры запроса или инструмента. Проверьте JSON-схему и аргументы tool-вызова."
+		}
 	case "bravo_request_invalid":
 		failure.Message = "Bravo не смог разобрать или преобразовать запрос. Проверьте формат запроса и параметры модели."
 	case "request_canceled":

@@ -56,6 +56,7 @@ var anthropicPromptTooLongPattern = regexp.MustCompile(`(?i)^\s*prompt is too lo
 type Detail struct {
 	Type             string       `json:"type,omitempty"`
 	Code             string       `json:"code,omitempty"`
+	Parameter        string       `json:"parameter,omitempty"`
 	Message          string       `json:"message,omitempty"`
 	Model            string       `json:"model,omitempty"`
 	ModelDisplayName string       `json:"model_display_name,omitempty"`
@@ -102,6 +103,7 @@ func FromError(err error) (Detail, bool) {
 	}
 	detail = Sanitize(detail)
 	if detail.Code == "" && detail.Type == "" && detail.Message == "" &&
+		detail.Parameter == "" &&
 		detail.Model == "" && detail.ModelDisplayName == "" &&
 		detail.NoticeTitle == "" && detail.NoticeText == "" &&
 		detail.DisabledReason == "" && detail.Scope == "" && detail.Reason == "" &&
@@ -133,6 +135,17 @@ type providerErrorDetails struct {
 type providerErrorNotice struct {
 	Title string `json:"title"`
 	Text  string `json:"text"`
+}
+
+type openAIErrorEnvelope struct {
+	Error openAIErrorBody `json:"error"`
+}
+
+type openAIErrorBody struct {
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+	Param   string `json:"param"`
+	Message string `json:"message"`
 }
 
 // Parse extracts a provider error from a JSON response body. A short status-code
@@ -224,6 +237,56 @@ func ParseAnthropicStandard(value string) (Classification, bool) {
 		Status:    status,
 		Retryable: retryable,
 	}, true
+}
+
+// ParseOpenAIStandard recognizes the documented OpenAI/Codex error envelope
+// without retaining the provider-authored message or any echoed request data.
+// Parameter is accepted only when it is a bounded JSON-style field path such
+// as tools[3].function.parameters.
+func ParseOpenAIStandard(status int, value string) (Classification, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) == 0 || len(value) > maxProviderErrorPayloadBytes {
+		return Classification{}, false
+	}
+	var envelope openAIErrorEnvelope
+	if err := json.Unmarshal([]byte(value), &envelope); err != nil {
+		return Classification{}, false
+	}
+	errorType := strings.ToLower(strings.TrimSpace(envelope.Error.Type))
+	code := strings.ToLower(strings.TrimSpace(envelope.Error.Code))
+	if errorType != "invalid_request_error" && errorType != "bad_request_error" {
+		return Classification{}, false
+	}
+	if code == "" {
+		code = errorType
+	}
+	class := ClassInvalidRequest
+	reason := "provider_invalid_request"
+	message := "The provider rejected an invalid request."
+	switch code {
+	case "context_length_exceeded", "context_window_exceeded", "context_too_large":
+		class = ClassContextWindow
+		reason = "context_window_exceeded"
+		message = "Input exceeds the model context window."
+	}
+	detail := Sanitize(Detail{
+		Type:            errorType,
+		Code:            code,
+		Parameter:       safeProviderParameter(envelope.Error.Param),
+		Message:         message,
+		Scope:           ScopeRequest,
+		Reason:          reason,
+		TaxonomyVersion: FailureTaxonomyV1,
+		Class:           class,
+	})
+	if detail.Type == "" || detail.Code == "" {
+		return Classification{}, false
+	}
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity &&
+		status != http.StatusRequestEntityTooLarge {
+		status = http.StatusBadRequest
+	}
+	return Classification{Detail: detail, Status: status, Retryable: false}, true
 }
 
 func anthropicStandardClassification(errorType string) (
@@ -323,6 +386,7 @@ func Sanitize(detail Detail) Detail {
 	sanitized := Detail{
 		Type:             safeMachineText(detail.Type, 64),
 		Code:             safeMachineText(detail.Code, 128),
+		Parameter:        safeProviderParameter(detail.Parameter),
 		Message:          safeProviderText(detail.Message, 512),
 		Model:            safeMachineText(detail.Model, 256),
 		ModelDisplayName: safeProviderText(detail.ModelDisplayName, 160),
@@ -344,6 +408,28 @@ func Sanitize(detail Detail) Detail {
 		}
 	}
 	return sanitized
+}
+
+func safeProviderParameter(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 256 {
+		return ""
+	}
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z',
+			char >= 'A' && char <= 'Z',
+			char >= '0' && char <= '9',
+			char == '_',
+			char == '-',
+			char == '.',
+			char == '[',
+			char == ']':
+		default:
+			return ""
+		}
+	}
+	return value
 }
 
 func knownFailureScope(scope FailureScope) bool {

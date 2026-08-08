@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -14,35 +15,46 @@ func countTokens(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	logicalName, model, cfg, failure := prepareBravoExecution(req)
-	if failure != nil {
-		return failureEnvelope(*failure), nil
-	}
 	body := executionBody(req)
 	protocol := requestProtocol(req.ExecutorRequest)
+	routeTrace := newRouteTraceRecorder(req, strings.TrimSpace(req.Model), protocol, false)
+	logicalName, model, cfg, failure := prepareBravoExecution(req)
+	if failure != nil {
+		routeTrace.preflightFailure("routing_preflight", *failure, nil)
+		return failureEnvelopeWithRouteTrace(routeTrace, *failure), nil
+	}
+	routeTrace.setLogicalModel(clientLogicalModelID(req.Model, cfg.Prefix+logicalName))
 	contract, errDetect := detectRequestContract(protocol, body, false)
 	if errDetect != nil {
-		return failureEnvelope(contractFailure(errDetect)), nil
+		failure := contractFailure(errDetect)
+		routeTrace.preflightFailure("contract_detection", failure, errDetect)
+		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
 	if errPreflight := verifyLogicalModelContract(model, contract); errPreflight != nil {
-		return failureEnvelope(contractFailure(errPreflight)), nil
+		failure := contractFailure(errPreflight)
+		routeTrace.preflightFailure("logical_contract", failure, errPreflight)
+		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
 	candidateSourceBody, errStrip := stripRequestEffort(body, protocol, contract.Effort)
 	if errStrip != nil {
-		return failureEnvelope(executionFailure{
+		failure := executionFailure{
 			Code:    "bravo_request_invalid",
 			Message: errStrip.Error(),
 			Status:  http.StatusBadRequest,
-		}), nil
+		}
+		routeTrace.preflightFailure("request_rewrite", failure, errStrip)
+		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
 	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
 	if errPlan != nil {
-		return failureEnvelope(executionFailure{
+		failure := executionFailure{
 			Code:      "bravo_no_eligible_account",
 			Message:   errPlan.Error(),
 			Status:    http.StatusServiceUnavailable,
 			Retryable: true,
-		}), nil
+		}
+		routeTrace.preflightFailure("route_planning", failure, errPlan)
+		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
 
 	var lastFailure executionFailure
@@ -58,16 +70,19 @@ func countTokens(raw []byte) ([]byte, error) {
 		}
 		if errPreflight := verifyCandidateContract(attempt.Candidate, contract); errPreflight != nil {
 			lastFailure = contractFailure(errPreflight)
+			routeTrace.failure(attempt, time.Now(), lastFailure.Status, lastFailure)
 			continue
 		}
 		physicalModel := candidateModelName(attempt.Candidate)
 		candidateBody, errRewrite := rewriteCandidateRequest(candidateSourceBody, protocol, physicalModel, false, req.Headers.Get("Content-Type"))
 		if errRewrite != nil {
-			return failureEnvelope(executionFailure{
+			failure := executionFailure{
 				Code:    "bravo_request_invalid",
 				Message: errRewrite.Error(),
 				Status:  http.StatusBadRequest,
-			}), nil
+			}
+			routeTrace.failure(attempt, time.Now(), failure.Status, failure)
+			return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 		}
 		if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
 			break
@@ -80,6 +95,7 @@ func countTokens(raw []byte) ([]byte, error) {
 		})
 		if errCall != nil {
 			failure := classifyExecutionError(errCall)
+			routeTrace.failure(attempt, started, failure.Status, failure)
 			recordExecutionAttempt(attempt, started, failure.Status, false, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
@@ -90,7 +106,7 @@ func countTokens(raw []byte) ([]byte, error) {
 			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelope(finalExecutionFailure(failureTraces, failure)), nil
+			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
 		}
 		var response pluginapi.HostModelExecutionResponse
 		if errDecode := json.Unmarshal(responseRaw, &response); errDecode != nil {
@@ -100,12 +116,14 @@ func countTokens(raw []byte) ([]byte, error) {
 				Status:    http.StatusBadGateway,
 				Retryable: true,
 			}
+			routeTrace.failure(attempt, started, lastFailure.Status, lastFailure)
 			recordExecutionAttempt(attempt, started, lastFailure.Status, false, lastFailure)
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, lastFailure)
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
 			failure := classifyHTTPFailure(response.StatusCode, response.Headers, "token count returned an HTTP error", response.Body)
+			routeTrace.failure(attempt, started, response.StatusCode, failure)
 			recordExecutionAttempt(attempt, started, response.StatusCode, false, failure)
 			applyFailureCooldown(attempt, failure)
 			lastFailure = failure
@@ -116,7 +134,7 @@ func countTokens(raw []byte) ([]byte, error) {
 			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelope(finalExecutionFailure(failureTraces, failure)), nil
+			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
 		}
 		response.Headers.Del("Content-Length")
 		recordExecutionAttempt(attempt, started, response.StatusCode, true, executionFailure{})
@@ -141,5 +159,5 @@ func countTokens(raw []byte) ([]byte, error) {
 			Status:  http.StatusUnprocessableEntity,
 		}
 	}
-	return failureEnvelope(finalExecutionFailure(failureTraces, lastFailure)), nil
+	return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, lastFailure)), nil
 }

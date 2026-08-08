@@ -2,6 +2,7 @@ package providererror
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -314,6 +315,40 @@ func TestParseAnthropicStandardRejectsUnknownOrUnsafeEnvelopes(t *testing.T) {
 		if classification, ok := ParseAnthropicStandard(payload); ok {
 			t.Fatalf("ParseAnthropicStandard(%q) = %#v, true; want false", payload, classification)
 		}
+	}
+}
+
+func TestParseOpenAIStandardPreservesOnlySafeInvalidToolMetadata(t *testing.T) {
+	payload := `{"error":{"type":"invalid_request_error","code":"invalid_tool_parameters","param":"tools[12].function.parameters","message":"schema contains context window and secret sk-private"},"request_id":"req_private"}`
+	classification, ok := ParseOpenAIStandard(http.StatusBadRequest, payload)
+	if !ok {
+		t.Fatal("ParseOpenAIStandard() did not recognize invalid tool parameters")
+	}
+	detail := classification.Detail
+	if detail.Type != "invalid_request_error" || detail.Code != "invalid_tool_parameters" ||
+		detail.Parameter != "tools[12].function.parameters" ||
+		detail.Class != ClassInvalidRequest || detail.Scope != ScopeRequest {
+		t.Fatalf("detail = %#v", detail)
+	}
+	serialized, errMarshal := json.Marshal(detail)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	for _, forbidden := range []string{"req_private", "sk-private", "schema contains", "context window and secret"} {
+		if strings.Contains(string(serialized), forbidden) {
+			t.Fatalf("safe detail leaked %q: %s", forbidden, serialized)
+		}
+	}
+}
+
+func TestParseOpenAIStandardRejectsUnsafeParameterPath(t *testing.T) {
+	payload := `{"error":{"type":"invalid_request_error","code":"invalid_tool_parameters","param":"tools[0].parameters; bearer secret","message":"invalid"}}`
+	classification, ok := ParseOpenAIStandard(http.StatusUnprocessableEntity, payload)
+	if !ok {
+		t.Fatal("ParseOpenAIStandard() did not recognize envelope")
+	}
+	if classification.Detail.Parameter != "" {
+		t.Fatalf("unsafe parameter = %q", classification.Detail.Parameter)
 	}
 }
 
