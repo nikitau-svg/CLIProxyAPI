@@ -155,6 +155,28 @@ func TestClassifyHTTPFailureKeepsPreciseProvider400BodyTerminal(t *testing.T) {
 	}
 }
 
+func TestClassifyReviewedAnthropicMaxTokensDetailRemainsTerminal(t *testing.T) {
+	t.Parallel()
+
+	classification, ok := providererror.ParseAnthropicStandard(
+		`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens must not exceed 128000"}}`,
+	)
+	if !ok {
+		t.Fatal("provider parser did not recognize precise max_tokens failure")
+	}
+	failure := classifyProviderFailureDetail(executionFailure{
+		Code:   "model_execution_failed",
+		Status: http.StatusBadRequest,
+	}, classification.Detail)
+	if failure.Retryable || failure.RouteFallback {
+		t.Fatalf("failure = %#v, reviewed max_tokens detail must remain terminal", failure)
+	}
+	if failure.Code != "invalid_parameter" || failure.Provider == nil ||
+		failure.Provider.Parameter != "max_tokens" {
+		t.Fatalf("failure = %#v, want safe precise provider metadata", failure)
+	}
+}
+
 func TestClassifyExecutionErrorRetriesAccountScopedAuthFailures(t *testing.T) {
 	t.Parallel()
 

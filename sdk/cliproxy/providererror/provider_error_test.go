@@ -300,6 +300,46 @@ func TestParseAnthropicStandardClassifiesSafeRoutingMetadata(t *testing.T) {
 	}
 }
 
+func TestParseAnthropicStandardPreservesReviewedMaxTokensParameter(t *testing.T) {
+	t.Parallel()
+
+	payload := `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens must not exceed 128000; request_id=req_private sk-private"}}`
+	classification, ok := ParseAnthropicStandard(payload)
+	if !ok {
+		t.Fatal("ParseAnthropicStandard() did not recognize max_tokens rejection")
+	}
+	detail := classification.Detail
+	if detail.Type != "invalid_request_error" || detail.Code != "invalid_parameter" ||
+		detail.Parameter != "max_tokens" || detail.Reason != "invalid_max_tokens" ||
+		detail.Class != ClassInvalidRequest || detail.Scope != ScopeRequest {
+		t.Fatalf("detail = %#v, want reviewed max_tokens metadata", detail)
+	}
+	serialized, errMarshal := json.Marshal(classification)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	for _, forbidden := range []string{"128000", "req_private", "sk-private"} {
+		if strings.Contains(string(serialized), forbidden) {
+			t.Fatalf("classification leaks %q: %s", forbidden, serialized)
+		}
+	}
+}
+
+func TestParseAnthropicStandardKeepsOpaqueInvalidRequestGeneric(t *testing.T) {
+	t.Parallel()
+
+	classification, ok := ParseAnthropicStandard(
+		`{"type":"error","error":{"type":"invalid_request_error","message":"The provider rejected this request."}}`,
+	)
+	if !ok {
+		t.Fatal("ParseAnthropicStandard() did not recognize generic invalid request")
+	}
+	detail := classification.Detail
+	if detail.Code != "invalid_request_error" || detail.Parameter != "" || detail.Reason != "" {
+		t.Fatalf("detail = %#v, opaque rejection must remain generic", detail)
+	}
+}
+
 func TestParseAnthropicStandardRejectsUnknownOrUnsafeEnvelopes(t *testing.T) {
 	t.Parallel()
 

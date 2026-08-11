@@ -219,6 +219,9 @@ func ParseAnthropicStandard(value string) (Classification, bool) {
 		if classification, ok := anthropicContextWindowClassification(envelope.Error.Message); ok {
 			return classification, true
 		}
+		if classification, ok := anthropicReviewedInvalidRequestClassification(envelope.Error.Message); ok {
+			return classification, true
+		}
 	}
 	status, retryable, scope, class, message, ok := anthropicStandardClassification(errorType)
 	if !ok {
@@ -236,6 +239,70 @@ func ParseAnthropicStandard(value string) (Classification, bool) {
 		Detail:    detail,
 		Status:    status,
 		Retryable: retryable,
+	}, true
+}
+
+// anthropicReviewedInvalidRequestClassification retains only a small,
+// reviewed machine-readable reason from provider-authored text. The raw
+// message, numeric limits, request IDs and request payload fragments never
+// cross the executor boundary. This lets downstream routing distinguish a
+// precise client-contract failure from an opaque provider-specific rejection.
+func anthropicReviewedInvalidRequestClassification(message string) (Classification, bool) {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return Classification{}, false
+	}
+
+	code := "invalid_parameter"
+	parameter := ""
+	reason := ""
+	safeMessage := "The provider rejected an invalid request parameter."
+	switch {
+	case strings.Contains(lower, "max_tokens") || strings.Contains(lower, "max output tokens"):
+		parameter = "max_tokens"
+		reason = "invalid_max_tokens"
+	case strings.Contains(lower, "response_format"):
+		parameter = "response_format"
+		reason = "invalid_response_format"
+	case strings.Contains(lower, "tool_choice"):
+		parameter = "tool_choice"
+		reason = "invalid_tool_choice"
+	case strings.Contains(lower, "tool_use_id"):
+		parameter = "messages"
+		reason = "invalid_tool_use"
+	case strings.Contains(lower, "unknown tool"):
+		parameter = "tools"
+		reason = "unknown_tool"
+	case strings.Contains(lower, "json schema"):
+		code = "invalid_schema"
+		reason = "invalid_json_schema"
+		safeMessage = "The provider rejected an invalid JSON schema."
+	case strings.Contains(lower, "invalid json") || strings.Contains(lower, "malformed"):
+		code = "malformed_request"
+		reason = "malformed_request"
+		safeMessage = "The provider rejected malformed request JSON."
+	case strings.Contains(lower, "missing required"):
+		code = "missing_required_parameter"
+		reason = "missing_required_parameter"
+		safeMessage = "The provider reported a missing required request parameter."
+	default:
+		return Classification{}, false
+	}
+
+	detail := Sanitize(Detail{
+		Type:            "invalid_request_error",
+		Code:            code,
+		Parameter:       parameter,
+		Message:         safeMessage,
+		Scope:           ScopeRequest,
+		Reason:          reason,
+		TaxonomyVersion: FailureTaxonomyV1,
+		Class:           ClassInvalidRequest,
+	})
+	return Classification{
+		Detail:    detail,
+		Status:    http.StatusBadRequest,
+		Retryable: false,
 	}, true
 }
 
