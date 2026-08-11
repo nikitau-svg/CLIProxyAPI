@@ -192,6 +192,22 @@ func TestClaudeHTTPStatusCarriesSafeRetryableStandardErrors(t *testing.T) {
 	}
 }
 
+func TestClaudeHTTPStatusPreservesReviewedMaxTokensParameter(t *testing.T) {
+	t.Parallel()
+
+	errStatus := claudeHTTPStatusError(http.StatusBadRequest, []byte(
+		`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens must not exceed 128000; request_id=req_private"}}`,
+	))
+	detail, ok := providererror.FromError(errStatus)
+	if !ok || detail.Type != "invalid_request_error" || detail.Code != "invalid_parameter" ||
+		detail.Parameter != "max_tokens" || detail.Scope != providererror.ScopeRequest {
+		t.Fatalf("ProviderErrorDetail = %#v, %t; want reviewed max_tokens metadata", detail, ok)
+	}
+	if strings.Contains(errStatus.Error(), "128000") || strings.Contains(errStatus.Error(), "req_private") {
+		t.Fatalf("status error leaks raw provider detail: %s", errStatus.Error())
+	}
+}
+
 func TestClaudeHTTPStatusCreditsRequiredIsSafeAcrossEntryPoints(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
