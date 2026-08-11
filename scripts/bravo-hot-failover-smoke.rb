@@ -53,7 +53,7 @@ class BravoHotFailoverSmoke
     stream_fault, boundary_fault = fault_subscriptions.first(2)
     raise FailoverSmokeFailure, "fault credentials did not appear" unless stream_fault && boundary_fault
 
-    check("streaming 429 falls back before the first client payload") do
+    check("streaming #{@expected_failure_status} falls back before the first client payload") do
       create_project(stream_fault, codex)
       started = Time.now.utc - 1
       status, body = project_stream_request
@@ -61,6 +61,17 @@ class BravoHotFailoverSmoke
       raise FailoverSmokeFailure, "stream has no terminal marker" unless body.include?("[DONE]")
       if body.include?("canary_fault_injected") || body.include?("Controlled canary failure")
         raise FailoverSmokeFailure, "upstream 429 leaked into the client stream"
+      end
+      verify_attempt_pair(started, stream_fault, codex)
+    end
+
+    check("non-streaming #{@expected_failure_status} falls back inside one client request") do
+      started = Time.now.utc - 1
+      status, body = project_non_stream_request
+      raise FailoverSmokeFailure, "non-stream fallback returned HTTP #{status}" unless status == 200
+      raise FailoverSmokeFailure, "non-stream fallback response was empty" if body.empty?
+      if body.include?("canary_fault_injected") || body.include?("Controlled canary failure")
+        raise FailoverSmokeFailure, "upstream failure leaked into the non-stream client response"
       end
       verify_attempt_pair(started, stream_fault, codex)
     end
@@ -301,6 +312,11 @@ class BravoHotFailoverSmoke
     unless failure["status"].to_i == @expected_failure_status
       raise FailoverSmokeFailure,
         "controlled failure was HTTP #{failure["status"]}, expected #{@expected_failure_status}"
+    end
+    if @expected_failure_status == 400 &&
+        failure["error_code"] != "bravo_provider_ambiguous_invalid_request"
+      raise FailoverSmokeFailure,
+        "controlled generic 400 code was #{failure["error_code"].inspect}"
     end
     raise FailoverSmokeFailure, "Codex fallback success event is missing" unless success
     raise FailoverSmokeFailure, "fallback event order is invalid" unless Time.parse(failure["at"]) <= Time.parse(success["at"])
