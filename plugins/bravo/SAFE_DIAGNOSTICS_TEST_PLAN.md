@@ -21,6 +21,11 @@ quota routing from 0.8.4 is deliberately out of scope.
    the failure happened during local contract preflight or at the provider.
 6. Existing successful routing, fallback order, custom-tool aliasing, and
    0.8.2 quota behaviour remain byte-for-byte or semantically unchanged.
+7. A provider `400 invalid_request_error` without a reviewed code, parameter,
+   or precise request/schema signal is candidate-local: Bravo skips the same
+   physical model and continues a compatible neighbouring route without a
+   provider cooldown. A precise `max_tokens`, tool, parameter, malformed JSON,
+   or schema failure remains terminal and is never hidden by fallback.
 
 ## Automated tests
 
@@ -42,6 +47,13 @@ quota routing from 0.8.4 is deliberately out of scope.
   custom-tool alias regression suites remain green.
 - `SD-U10`: focused race tests cover simultaneous early failures and trace
   persistence.
+- `SD-U11`: non-stream, stream, count-token, callback-error, and ordinary HTTP
+  response-body paths classify an opaque provider 400 identically.
+- `SD-U12`: an opaque Claude 400 followed by Codex Terra succeeds inside one
+  client request; a second Claude credential for the same physical model is
+  skipped and does not consume the remaining provider-call budget.
+- `SD-U13`: exact invalid-tool/parameter/schema and output-limit failures stay
+  terminal with zero fallback provider calls.
 
 ## Canary acceptance
 
@@ -56,6 +68,10 @@ quota routing from 0.8.4 is deliberately out of scope.
    overflow and recommend `/compact`.
 5. Verify route trace retention, file permissions, container health, restart
    count, CPU/memory, and that production remains untouched.
+6. Replay the Maria request shape against a synthetic Claude candidate that
+   returns the exact generic 400 envelope and a Codex candidate that succeeds.
+   Require one Claude call, one Codex call, a successful client response, no
+   cooldown, and the Russian candidate-local trace explanation.
 
 Promotion to production requires a separate explicit approval after the
 canary report.

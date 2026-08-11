@@ -162,6 +162,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 	contextRouting := newContextRoutingState(req.HostCallbackID)
 	providerCalls := 0
 	attempted := make(map[int]bool, len(plan))
+	blockedModels := make(map[string]bool)
 	hedgeUsed := false
 
 	rememberFailure := func(run *bravoStreamAttemptRun, failure executionFailure) {
@@ -172,6 +173,9 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		contextRouting.observeFailure(run.attempt, failure)
 		failureTraces = appendExecutionFailureTrace(failureTraces, run.attempt, failure)
 		routeRecorder.failure(run.attempt, run.started, failure.Status, failure)
+		if executionFailureBlocksPhysicalModel(failure) {
+			blockedModels[executionFailureModelKey(run.attempt)] = true
+		}
 	}
 	closeTerminalFailure := func(failure executionFailure) {
 		final := finalExecutionFailure(failureTraces, failure)
@@ -192,6 +196,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		provider := normalizeProvider(plan[index].Candidate.Provider)
 		for next := index + 1; next < len(plan); next++ {
 			if attempted[next] ||
+				blockedModels[executionFailureModelKey(plan[next])] ||
 				normalizeProvider(plan[next].Candidate.Provider) == provider ||
 				verifyCandidateContract(plan[next].Candidate, contract) != nil {
 				continue
@@ -203,6 +208,9 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 
 	startAttempt := func(index int, childScope bool) (*bravoStreamAttemptRun, *executionFailure, bool) {
 		attempt := plan[index]
+		if blockedModels[executionFailureModelKey(attempt)] {
+			return nil, nil, false
+		}
 		if skipCoolingExecutionAttempt(attempt, &lastFailure) {
 			return nil, nil, false
 		}

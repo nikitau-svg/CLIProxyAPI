@@ -385,7 +385,8 @@ func routeTraceClientAction(trace routeTrace) string {
 		return "none"
 	}
 	for _, attempt := range trace.Attempts {
-		if attempt.DiagnosticStage != "" || attempt.FailureClass == "invalid_request" {
+		if attempt.DiagnosticStage != "" ||
+			(attempt.FailureClass == "invalid_request" && attempt.ErrorCode != "bravo_provider_ambiguous_invalid_request") {
 			return "fix_request"
 		}
 		if attempt.ErrorCode == "bravo_context_window_exceeded" ||
@@ -401,7 +402,7 @@ func routeTraceClientAction(trace routeTrace) string {
 		return "raise_quota"
 	case "bravo_subscription_auth_unavailable", "authentication_error":
 		return "reauth"
-	case "bravo_route_temporarily_unavailable", "overloaded_error", "server_error":
+	case "bravo_route_temporarily_unavailable", "bravo_provider_ambiguous_invalid_request", "overloaded_error", "server_error":
 		return "retry"
 	default:
 		return "none"
@@ -472,6 +473,8 @@ func routeTraceAttemptMessageRU(attempt routeTraceAttempt) string {
 
 func routeTraceMessageRU(code string) string {
 	switch strings.TrimSpace(code) {
+	case "bravo_provider_ambiguous_invalid_request":
+		return "Провайдер неоднозначно отклонил только этот физический кандидат; Bravo продолжил соседний совместимый маршрут."
 	case "bravo_context_window_exceeded":
 		return "Контекст запроса не помещается в окно выбранной модели. Выполните /compact или начните новую сессию."
 	case "bravo_subscription_quota_exhausted", "rate_limit_error", "rate_limited":
@@ -509,7 +512,7 @@ func routeTraceActionRU(trace routeTrace) string {
 	var claudeReserve *routeTraceAttempt
 	for index := range trace.Attempts {
 		attempt := &trace.Attempts[index]
-		if requestDiagnostic == nil && (attempt.DiagnosticStage != "" ||
+		if requestDiagnostic == nil && attempt.ErrorCode != "bravo_provider_ambiguous_invalid_request" && (attempt.DiagnosticStage != "" ||
 			attempt.FailureClass == "invalid_request" ||
 			attempt.ProviderErrorType == "invalid_request_error") {
 			requestDiagnostic = attempt

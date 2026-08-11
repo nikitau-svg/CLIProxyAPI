@@ -462,6 +462,20 @@ func classifyProviderFailureDetail(failure executionFailure, detail providererro
 	if providerContextWindowSignal(values...) {
 		return classifyProviderFailureSignal(failure, values...)
 	}
+	failure = classifyProviderQuotaSignal(failure, values...)
+	if failure.Code == "bravo_subscription_quota_exhausted" {
+		failure.Provider = &detail
+		return sanitizeExecutionFailure(failure)
+	}
+	if (failure.Status == http.StatusBadRequest || failure.Status == http.StatusUnprocessableEntity) &&
+		providerModelEntitlementSignal(values...) {
+		detail.Scope = "model"
+		failure.Code = "bravo_subscription_model_unavailable"
+		failure.Retryable = true
+		failure.AccountWide = false
+		failure.Provider = &detail
+		return sanitizeExecutionFailure(failure)
+	}
 	if classified, ok := classifyReviewedProviderFailureDetail(failure, detail); ok {
 		return sanitizeExecutionFailure(classified)
 	}
@@ -516,6 +530,16 @@ func classifyReviewedProviderFailureDetail(
 		failure.AccountWide = false
 	case "invalid_request_error", "bad_request_error", "not_found_error",
 		"conflict_error", "request_too_large":
+		if ambiguousProviderInvalidRequest(detail) {
+			detail.Scope = "candidate"
+			failure.Code = "bravo_provider_ambiguous_invalid_request"
+			failure.Retryable = false
+			failure.RouteFallback = true
+			failure.AccountWide = false
+			failure.RetryAfter = ""
+			failure.Provider = &detail
+			return failure, true
+		}
 		detail.Scope = "request"
 		failure.Retryable = false
 		failure.RouteFallback = false
@@ -529,6 +553,60 @@ func classifyReviewedProviderFailureDetail(
 	failure.Message = firstNonEmpty(detail.Message, failure.Message)
 	failure.Provider = &detail
 	return failure, true
+}
+
+// An upstream can reject a provider-specific representation even after Bravo
+// has validated the logical request. A generic invalid_request_error without a
+// stable code or parameter therefore belongs to this candidate, not to the
+// whole logical route. Continue to another compatible provider without putting
+// the account into cooldown. Precise parameter/schema failures remain terminal.
+func ambiguousProviderInvalidRequest(detail providererror.Detail) bool {
+	errorType := strings.ToLower(strings.TrimSpace(detail.Type))
+	if errorType == "" {
+		errorType = strings.ToLower(strings.TrimSpace(detail.Code))
+	}
+	switch errorType {
+	case "invalid_request_error", "bad_request_error":
+	default:
+		return false
+	}
+	if strings.TrimSpace(detail.Parameter) != "" {
+		return false
+	}
+	code := strings.ToLower(strings.TrimSpace(detail.Code))
+	if code != "" && code != "invalid_request_error" && code != "bad_request_error" {
+		return false
+	}
+	return !preciseProviderRequestSignal(detail.Message, detail.Reason)
+}
+
+func preciseProviderRequestSignal(values ...string) bool {
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		for _, signal := range []string{
+			"max_tokens",
+			"max output tokens",
+			"response_format",
+			"json schema",
+			"tool_choice",
+			"unknown tool",
+			"tool_use_id",
+			"invalid json",
+			"malformed",
+			"missing required",
+			"must be greater than",
+			"must be less than",
+			"must not exceed",
+		} {
+			if strings.Contains(value, signal) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func localHostFailureCode(code string) bool {
@@ -610,6 +688,42 @@ func classifyProviderFailureSignal(failure executionFailure, values ...string) (
 		providerModelEntitlementSignal(values...) {
 		failure.Code = "bravo_subscription_model_unavailable"
 		failure.Retryable = true
+		return failure
+	}
+
+	// Some host implementations return the provider response as an ordinary
+	// HTTP body instead of attaching ProviderError to the callback error. Apply
+	// the same reviewed classification in both forms so routing does not depend
+	// on which host boundary happened to carry the diagnostic.
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		rawCarriesPreciseRequestSignal := preciseProviderRequestSignal(value)
+		if classification, ok := providererror.ParseOpenAIStandard(failure.Status, value); ok {
+			if rawCarriesPreciseRequestSignal && ambiguousProviderInvalidRequest(classification.Detail) {
+				continue
+			}
+			classified := failure
+			classified.Status = firstPositive(classification.Status, failure.Status)
+			classified.Retryable = classification.Retryable
+			if reviewed, accepted := classifyReviewedProviderFailureDetail(classified, classification.Detail); accepted {
+				return reviewed
+			}
+		}
+		if classification, ok := providererror.ParseAnthropicStandard(value); ok {
+			// Anthropic's safe parser deliberately discards the provider-authored
+			// message. Preserve a precise local/request failure when the bounded raw
+			// body still names a known parameter or schema defect.
+			if classification.Detail.Class == providererror.ClassInvalidRequest &&
+				rawCarriesPreciseRequestSignal {
+				continue
+			}
+			classified := failure
+			classified.Status = firstPositive(classification.Status, failure.Status)
+			classified.Retryable = classification.Retryable
+			if reviewed, accepted := classifyReviewedProviderFailureDetail(classified, classification.Detail); accepted {
+				return reviewed
+			}
+		}
 	}
 	return failure
 }

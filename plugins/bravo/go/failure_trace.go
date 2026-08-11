@@ -49,7 +49,12 @@ func executionFailureCanContinueRoute(failure executionFailure) bool {
 }
 
 func executionFailureBlocksPhysicalModel(failure executionFailure) bool {
-	return failure.Code == "bravo_context_window_exceeded"
+	switch failure.Code {
+	case "bravo_context_window_exceeded", "bravo_provider_ambiguous_invalid_request":
+		return true
+	default:
+		return false
+	}
 }
 
 func executionFailureModelKey(attempt executionAttempt) string {
@@ -128,6 +133,8 @@ func safeExecutionFailureSummary(trace executionFailureTrace) string {
 		}
 	}
 	switch trace.Failure.Code {
+	case "bravo_provider_ambiguous_invalid_request":
+		return failureModelSummary(model, "провайдер неоднозначно отклонил этот кандидат; Bravo продолжил соседний маршрут")
 	case "bravo_allocator_reserve_floor":
 		return failureModelSummary(model, "Claude не вызван: подписка достигла внутреннего резервного порога CLIProxyAPI")
 	case "bravo_allocator_withheld":

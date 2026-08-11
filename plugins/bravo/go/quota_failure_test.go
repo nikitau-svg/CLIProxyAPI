@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -73,6 +74,84 @@ func TestClassifyExecutionErrorKeepsOrdinaryInvalidRequestTerminal(t *testing.T)
 		if failure.Code != "model_execution_failed" {
 			t.Fatalf("code = %q, want original host error code", failure.Code)
 		}
+	}
+}
+
+func TestClassifyExecutionErrorAllowsFallbackForAmbiguousProvider400(t *testing.T) {
+	t.Parallel()
+
+	detail := providererror.Detail{
+		Type:    "invalid_request_error",
+		Message: "The provider rejected this request.",
+	}
+	failure := classifyExecutionError(&hostCallError{
+		Code:          "model_execution_failed",
+		Message:       detail.Message,
+		HTTPStatus:    http.StatusBadRequest,
+		ProviderError: &detail,
+	})
+	if failure.Retryable {
+		t.Fatalf("failure = %#v, ambiguous candidate failure must not create a provider cooldown", failure)
+	}
+	if !failure.RouteFallback || failure.Code != "bravo_provider_ambiguous_invalid_request" {
+		t.Fatalf("failure = %#v, want candidate-local fallback", failure)
+	}
+}
+
+func TestClassifyExecutionErrorKeepsPreciseProvider400Terminal(t *testing.T) {
+	t.Parallel()
+
+	detail := providererror.Detail{
+		Type:      "invalid_request_error",
+		Code:      "invalid_tool_parameters",
+		Parameter: "tools[3].function.parameters",
+		Message:   "Invalid tool schema.",
+	}
+	failure := classifyExecutionError(&hostCallError{
+		Code:          detail.Code,
+		Message:       detail.Message,
+		HTTPStatus:    http.StatusBadRequest,
+		ProviderError: &detail,
+	})
+	if failure.Retryable || failure.RouteFallback {
+		t.Fatalf("failure = %#v, precise invalid parameter must remain terminal", failure)
+	}
+	if failure.Code != "invalid_tool_parameters" {
+		t.Fatalf("code = %q, want precise provider code", failure.Code)
+	}
+}
+
+func TestClassifyHTTPFailureAllowsFallbackForAmbiguousProvider400Body(t *testing.T) {
+	t.Parallel()
+
+	failure := classifyHTTPFailure(
+		http.StatusBadRequest,
+		nil,
+		"provider returned an HTTP error",
+		[]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"The provider rejected this request."}}`),
+	)
+	if failure.Retryable {
+		t.Fatalf("failure = %#v, ambiguous candidate failure must not create a provider cooldown", failure)
+	}
+	if !failure.RouteFallback || failure.Code != "bravo_provider_ambiguous_invalid_request" {
+		t.Fatalf("failure = %#v, want candidate-local fallback from an ordinary HTTP response body", failure)
+	}
+}
+
+func TestClassifyHTTPFailureKeepsPreciseProvider400BodyTerminal(t *testing.T) {
+	t.Parallel()
+
+	failure := classifyHTTPFailure(
+		http.StatusBadRequest,
+		nil,
+		"provider returned an HTTP error",
+		[]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens must not exceed 128000"}}`),
+	)
+	if failure.Retryable || failure.RouteFallback {
+		t.Fatalf("failure = %#v, precise request failure must remain terminal", failure)
+	}
+	if failure.Code != "bravo_candidate_http_error" {
+		t.Fatalf("code = %q, want original terminal HTTP classification", failure.Code)
 	}
 }
 
@@ -900,6 +979,231 @@ func TestBravoExecuteFallsBackForAccountAndModelAvailabilityFailures(t *testing.
 				t.Fatalf("attempt diagnostics = %#v, want retryable %s", attempts, test.wantCode)
 			}
 		})
+	}
+}
+
+func TestBravoExecuteFallsBackFromAmbiguousClaude400ToCodex(t *testing.T) {
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{
+		Candidates: []candidate{
+			{Provider: "claude", Model: "claude-sonnet-5", Priority: 100, Capabilities: []string{capabilityText, capabilityTools}},
+			{Provider: "codex", Model: "gpt-5.6-terra", Priority: 90, Capabilities: []string{capabilityText, capabilityTools}},
+		},
+	})
+
+	auths := []pluginapi.HostAuthFileEntry{
+		{ID: "claude-maria", AuthIndex: "claude-maria", Name: "claude-maria.json", Provider: "claude"},
+		{ID: "codex-maria", AuthIndex: "codex-maria", Name: "codex-maria.json", Provider: "codex"},
+	}
+	var calls []pluginapi.HostModelExecutionRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelExecute:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			if request.ForcedProvider == "claude" {
+				detail := providererror.Detail{
+					Type:    "invalid_request_error",
+					Message: "The provider rejected this request.",
+				}
+				return nil, &hostCallError{
+					Code:          "model_execution_failed",
+					Message:       detail.Message,
+					HTTPStatus:    http.StatusBadRequest,
+					ProviderError: &detail,
+				}
+			}
+			return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
+				StatusCode: http.StatusOK,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       []byte(`{"model":"gpt-5.6-terra","content":[{"type":"text","text":"ok"}]}`),
+			}), nil
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	raw, errExecute := execute(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:        "bravo/fallback-probe",
+			Format:       protocolClaude,
+			SourceFormat: protocolClaude,
+			OriginalRequest: []byte(`{
+				"model":"bravo/fallback-probe",
+				"max_tokens":65536,
+				"tools":[
+					{"name":"memory_get","description":"d","input_schema":{"type":"object","properties":{}}},
+					{"name":"memory_search","description":"d","input_schema":{"type":"object","properties":{}}}
+				],
+				"messages":[{"role":"user","content":"ok"}]
+			}`),
+		},
+		HostCallbackID: "maria-ambiguous-400-fallback",
+	}))
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !env.OK {
+		t.Fatalf("Bravo execution failed instead of protecting Maria: %#v", env.Error)
+	}
+	if len(calls) != 2 || calls[0].ForcedProvider != "claude" || calls[1].ForcedProvider != "codex" {
+		t.Fatalf("calls = %#v, want Claude Sonnet then Codex Terra", calls)
+	}
+
+	runtimeState.RLock()
+	attempts := append([]attemptRecord(nil), runtimeState.Attempts...)
+	runtimeState.RUnlock()
+	if len(attempts) != 2 || attempts[0].ErrorCode != "bravo_provider_ambiguous_invalid_request" ||
+		attempts[0].Retryable || !attempts[1].Success {
+		t.Fatalf("attempt diagnostics = %#v", attempts)
+	}
+}
+
+func TestBravoStreamFallsBackFromAmbiguousClaude400WithoutRepeatingPhysicalModel(t *testing.T) {
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{
+		Candidates: []candidate{
+			{Provider: "claude", Model: "claude-sonnet-5", Priority: 100, Capabilities: []string{capabilityText, capabilityTools, capabilityStream}},
+			{Provider: "codex", Model: "gpt-5.6-terra", Priority: 90, Capabilities: []string{capabilityText, capabilityTools, capabilityStream}},
+		},
+	})
+	cfg := loadedConfig()
+	cfg.MaxAttempts = 2
+	currentConfig.Store(cfg)
+
+	auths := []pluginapi.HostAuthFileEntry{
+		{ID: "claude-maria-a", AuthIndex: "claude-maria-a", Name: "claude-maria-a.json", Provider: "claude"},
+		{ID: "claude-maria-b", AuthIndex: "claude-maria-b", Name: "claude-maria-b.json", Provider: "claude"},
+		{ID: "codex-maria", AuthIndex: "codex-maria", Name: "codex-maria.json", Provider: "codex"},
+	}
+	var calls []pluginapi.HostModelExecutionRequest
+	var pluginClose rpcStreamCloseRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelExecuteStream:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			return mustBravoJSON(t, pluginapi.HostModelStreamResponse{
+				StatusCode: http.StatusOK,
+				StreamID:   request.ForcedProvider + "-ambiguous-stream",
+			}), nil
+		case pluginabi.MethodHostModelStreamRead:
+			var request pluginapi.HostModelStreamReadRequest
+			decodeBravoPayload(t, payload, &request)
+			if strings.HasPrefix(request.StreamID, "claude-") {
+				detail := providererror.Detail{
+					Type:    "invalid_request_error",
+					Message: "The provider rejected this request.",
+				}
+				return mustBravoJSON(t, pluginapi.HostModelStreamReadResponse{
+					ErrorDetail: &pluginapi.HostModelExecutionError{
+						Code:          "model_execution_failed",
+						Message:       detail.Message,
+						HTTPStatus:    http.StatusBadRequest,
+						ProviderError: &detail,
+					},
+				}), nil
+			}
+			return mustBravoJSON(t, pluginapi.HostModelStreamReadResponse{Done: true}), nil
+		case pluginabi.MethodHostModelStreamClose:
+			return mustBravoJSON(t, map[string]any{}), nil
+		case pluginabi.MethodHostStreamClose:
+			decodeBravoPayload(t, payload, &pluginClose)
+			return mustBravoJSON(t, map[string]any{}), nil
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	runBravoStream(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/fallback-probe",
+			Format:          protocolClaude,
+			SourceFormat:    protocolClaude,
+			OriginalRequest: []byte(`{"model":"bravo/fallback-probe","max_tokens":65536,"messages":[{"role":"user","content":"ok"}],"stream":true}`),
+		},
+		HostCallbackID: "maria-ambiguous-400-stream-fallback",
+	}, "maria-client-stream")
+
+	if len(calls) != 2 || calls[0].ForcedProvider != "claude" || calls[1].ForcedProvider != "codex" {
+		t.Fatalf("stream calls = %#v, want one Claude Sonnet call then Codex Terra", calls)
+	}
+	if pluginClose.StreamID != "maria-client-stream" || pluginClose.Error != "" {
+		t.Fatalf("plugin stream close = %#v, want successful Codex close", pluginClose)
+	}
+}
+
+func TestBravoCountFallsBackFromAmbiguousClaude400ResponseBody(t *testing.T) {
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{
+		Candidates: []candidate{
+			{Provider: "claude", Model: "claude-sonnet-5", Priority: 100, Capabilities: []string{capabilityText}},
+			{Provider: "codex", Model: "gpt-5.6-terra", Priority: 90, Capabilities: []string{capabilityText}},
+		},
+	})
+
+	auths := []pluginapi.HostAuthFileEntry{
+		{ID: "claude-maria", AuthIndex: "claude-maria", Name: "claude-maria.json", Provider: "claude"},
+		{ID: "codex-maria", AuthIndex: "codex-maria", Name: "codex-maria.json", Provider: "codex"},
+	}
+	var calls []pluginapi.HostModelExecutionRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelCountTokens:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			if request.ForcedProvider == "claude" {
+				return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
+					StatusCode: http.StatusBadRequest,
+					Body:       []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"The provider rejected this request."}}`),
+				}), nil
+			}
+			return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
+				StatusCode: http.StatusOK,
+				Body:       []byte(`{"input_tokens":26140}`),
+			}), nil
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	raw, errCount := countTokens(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/fallback-probe",
+			Format:          protocolClaude,
+			SourceFormat:    protocolClaude,
+			OriginalRequest: []byte(`{"model":"bravo/fallback-probe","max_tokens":65536,"messages":[{"role":"user","content":"ok"}]}`),
+		},
+		HostCallbackID: "maria-ambiguous-400-count-fallback",
+	}))
+	if errCount != nil {
+		t.Fatal(errCount)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !env.OK {
+		t.Fatalf("Bravo token count failed instead of using Codex: %#v", env.Error)
+	}
+	if len(calls) != 2 || calls[0].ForcedProvider != "claude" || calls[1].ForcedProvider != "codex" {
+		t.Fatalf("count calls = %#v, want Claude Sonnet then Codex Terra", calls)
 	}
 }
 
