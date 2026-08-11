@@ -26,6 +26,9 @@ class BravoHotFailoverSmoke
     @project_id = nil
     @project_key = nil
     @installed_fault_keys = false
+    @logical_model = options.fetch(:logical_model)
+    @claude_model = options.fetch(:claude_model)
+    @expected_failure_status = options.fetch(:expected_failure_status)
     @passed = 0
     @failed = 0
     @secrets = [@management_key]
@@ -181,8 +184,8 @@ class BravoHotFailoverSmoke
         "base-url" => @fault_base_url,
         "models" => [
           {
-            "name" => "claude-opus-4-8",
-            "alias" => "claude-opus-4-8",
+            "name" => @claude_model,
+            "alias" => @claude_model,
             "force-mapping" => true
           }
         ]
@@ -213,7 +216,7 @@ class BravoHotFailoverSmoke
       {
         "name" => "bravo-hot-failover-#{SecureRandom.hex(4)}",
         "enabled" => true,
-        "models" => ["opus"],
+        "models" => [@logical_model],
         "allowed_auth_ids" => [fault_subscription.fetch("auth_index"), codex.fetch("auth_index")],
         "primary_auth_ids" => [fault_subscription.fetch("auth_index"), codex.fetch("auth_index")]
       },
@@ -232,7 +235,7 @@ class BravoHotFailoverSmoke
         "id" => @project_id,
         "name" => "bravo-hot-failover-boundary",
         "enabled" => true,
-        "models" => ["opus"],
+        "models" => [@logical_model],
         "allowed_auth_ids" => allowed.map { |item| item.fetch("auth_index") },
         "primary_auth_ids" => primary.map { |item| item.fetch("auth_index") }
       }
@@ -241,7 +244,7 @@ class BravoHotFailoverSmoke
 
   def request_payload(stream)
     {
-      "model" => "bravo/opus",
+      "model" => "bravo/#{@logical_model}",
       "messages" => [{ "role" => "user", "content" => "Reply with exactly: fallback-ok" }],
       "max_tokens" => 32,
       "stream" => stream
@@ -282,7 +285,7 @@ class BravoHotFailoverSmoke
     events = management_request(:get, "/v0/management/bravo/events")
     Array(events["events"]).select do |event|
       at = Time.parse(event["at"].to_s)
-      at >= started && event["logical_model"] == "opus"
+      at >= started && event["logical_model"] == @logical_model
     rescue ArgumentError
       false
     end
@@ -295,7 +298,10 @@ class BravoHotFailoverSmoke
     failure = attempts.find { |event| event["auth_id"] == fault_id && event["success"] == false }
     success = attempts.find { |event| event["auth_id"] == codex_id && event["success"] == true }
     raise FailoverSmokeFailure, "controlled Claude failure event is missing" unless failure
-    raise FailoverSmokeFailure, "controlled failure was not HTTP 429" unless failure["status"].to_i == 429
+    unless failure["status"].to_i == @expected_failure_status
+      raise FailoverSmokeFailure,
+        "controlled failure was HTTP #{failure["status"]}, expected #{@expected_failure_status}"
+    end
     raise FailoverSmokeFailure, "Codex fallback success event is missing" unless success
     raise FailoverSmokeFailure, "fallback event order is invalid" unless Time.parse(failure["at"]) <= Time.parse(success["at"])
   end
@@ -338,6 +344,9 @@ options = {
   fault_base_url: "http://127.0.0.1:18991",
   management_env_file: "secrets.env",
   management_env_variable: "MANAGEMENT_KEY",
+  logical_model: "opus",
+  claude_model: "claude-opus-4-8",
+  expected_failure_status: 429,
   confirmed: false
 }
 
@@ -348,6 +357,9 @@ OptionParser.new do |parser|
   parser.on("--fault-base-url URL") { |value| options[:fault_base_url] = value }
   parser.on("--management-env-file PATH") { |value| options[:management_env_file] = value }
   parser.on("--management-env-variable NAME") { |value| options[:management_env_variable] = value }
+  parser.on("--logical-model NAME") { |value| options[:logical_model] = value }
+  parser.on("--claude-model NAME") { |value| options[:claude_model] = value }
+  parser.on("--expected-failure-status STATUS", Integer) { |value| options[:expected_failure_status] = value }
 end.parse!
 
 abort("pass --confirm-canary-mutations") unless options[:confirmed]
