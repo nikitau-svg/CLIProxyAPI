@@ -699,29 +699,30 @@ func classifyProviderFailureSignal(failure executionFailure, values ...string) (
 		value = strings.TrimSpace(value)
 		rawCarriesPreciseRequestSignal := preciseProviderRequestSignal(value)
 		if classification, ok := providererror.ParseOpenAIStandard(failure.Status, value); ok {
-			if rawCarriesPreciseRequestSignal && ambiguousProviderInvalidRequest(classification.Detail) {
-				continue
-			}
-			classified := failure
-			classified.Status = firstPositive(classification.Status, failure.Status)
-			classified.Retryable = classification.Retryable
-			if reviewed, accepted := classifyReviewedProviderFailureDetail(classified, classification.Detail); accepted {
-				return reviewed
+			if !(rawCarriesPreciseRequestSignal && ambiguousProviderInvalidRequest(classification.Detail)) {
+				classified := failure
+				classified.Status = firstPositive(classification.Status, failure.Status)
+				classified.Retryable = classification.Retryable
+				if reviewed, accepted := classifyReviewedProviderFailureDetail(classified, classification.Detail); accepted {
+					return reviewed
+				}
 			}
 		}
 		if classification, ok := providererror.ParseAnthropicStandard(value); ok {
-			// Anthropic's safe parser deliberately discards the provider-authored
-			// message. Preserve a precise local/request failure when the bounded raw
-			// body still names a known parameter or schema defect.
-			if classification.Detail.Class == providererror.ClassInvalidRequest &&
-				rawCarriesPreciseRequestSignal {
-				continue
-			}
-			classified := failure
-			classified.Status = firstPositive(classification.Status, failure.Status)
-			classified.Retryable = classification.Retryable
-			if reviewed, accepted := classifyReviewedProviderFailureDetail(classified, classification.Detail); accepted {
-				return reviewed
+			// Older host parsers discarded the provider-authored message without
+			// retaining a reviewed parameter. Keep the raw-signal fail-closed guard
+			// only while the safe classification is still ambiguous. A parser that
+			// retained a reviewed code/parameter can cross the boundary directly.
+			preserveRawPreciseSignal := classification.Detail.Class == providererror.ClassInvalidRequest &&
+				rawCarriesPreciseRequestSignal &&
+				ambiguousProviderInvalidRequest(classification.Detail)
+			if !preserveRawPreciseSignal {
+				classified := failure
+				classified.Status = firstPositive(classification.Status, failure.Status)
+				classified.Retryable = classification.Retryable
+				if reviewed, accepted := classifyReviewedProviderFailureDetail(classified, classification.Detail); accepted {
+					return reviewed
+				}
 			}
 		}
 	}

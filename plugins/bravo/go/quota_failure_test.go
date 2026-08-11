@@ -150,8 +150,9 @@ func TestClassifyHTTPFailureKeepsPreciseProvider400BodyTerminal(t *testing.T) {
 	if failure.Retryable || failure.RouteFallback {
 		t.Fatalf("failure = %#v, precise request failure must remain terminal", failure)
 	}
-	if failure.Code != "bravo_candidate_http_error" {
-		t.Fatalf("code = %q, want original terminal HTTP classification", failure.Code)
+	if failure.Code != "invalid_parameter" || failure.Provider == nil ||
+		failure.Provider.Parameter != "max_tokens" {
+		t.Fatalf("failure = %#v, want reviewed terminal max_tokens classification", failure)
 	}
 }
 
