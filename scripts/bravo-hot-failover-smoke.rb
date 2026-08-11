@@ -29,6 +29,7 @@ class BravoHotFailoverSmoke
     @logical_model = options.fetch(:logical_model)
     @claude_model = options.fetch(:claude_model)
     @expected_failure_status = options.fetch(:expected_failure_status)
+    @expect_terminal = options.fetch(:expect_terminal)
     @passed = 0
     @failed = 0
     @secrets = [@management_key]
@@ -52,6 +53,21 @@ class BravoHotFailoverSmoke
     fault_subscriptions = install_fault_credentials(Array(before["subscriptions"]))
     stream_fault, boundary_fault = fault_subscriptions.first(2)
     raise FailoverSmokeFailure, "fault credentials did not appear" unless stream_fault && boundary_fault
+
+    if @expect_terminal
+      check("precise provider #{@expected_failure_status} remains terminal") do
+        create_project(stream_fault, codex)
+        started = Time.now.utc - 1
+        status, body = project_non_stream_request
+        unless status == @expected_failure_status
+          raise FailoverSmokeFailure,
+            "precise provider failure returned HTTP #{status}, expected #{@expected_failure_status}"
+        end
+        raise FailoverSmokeFailure, "terminal response was empty" if body.empty?
+        verify_terminal_attempt(started, stream_fault, codex)
+      end
+      return finish
+    end
 
     check("streaming #{@expected_failure_status} falls back before the first client payload") do
       create_project(stream_fault, codex)
@@ -334,6 +350,20 @@ class BravoHotFailoverSmoke
     end
   end
 
+  def verify_terminal_attempt(started, fault_subscription, codex)
+    attempts = recent_attempts(started)
+    fault_id = fault_subscription.fetch("auth_id")
+    codex_id = codex.fetch("auth_id")
+    failure = attempts.find { |event| event["auth_id"] == fault_id && event["success"] == false }
+    raise FailoverSmokeFailure, "precise provider failure event is missing" unless failure
+    if failure["error_code"] == "bravo_provider_ambiguous_invalid_request"
+      raise FailoverSmokeFailure, "precise provider failure was misclassified as ambiguous"
+    end
+    if attempts.any? { |event| event["auth_id"] == codex_id }
+      raise FailoverSmokeFailure, "precise request failure incorrectly reached Codex"
+    end
+  end
+
   def cleanup_project
     return unless @project_id
 
@@ -363,6 +393,7 @@ options = {
   logical_model: "opus",
   claude_model: "claude-opus-4-8",
   expected_failure_status: 429,
+  expect_terminal: false,
   confirmed: false
 }
 
@@ -376,6 +407,7 @@ OptionParser.new do |parser|
   parser.on("--logical-model NAME") { |value| options[:logical_model] = value }
   parser.on("--claude-model NAME") { |value| options[:claude_model] = value }
   parser.on("--expected-failure-status STATUS", Integer) { |value| options[:expected_failure_status] = value }
+  parser.on("--expect-terminal") { options[:expect_terminal] = true }
 end.parse!
 
 abort("pass --confirm-canary-mutations") unless options[:confirmed]
