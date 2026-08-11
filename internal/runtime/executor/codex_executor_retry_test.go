@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 )
 
 func TestParseCodexRetryAfter(t *testing.T) {
@@ -178,9 +180,37 @@ func TestNewCodexStatusErrClassifiesKnownCodexFailures(t *testing.T) {
 			if got := err.StatusCode(); got != tc.wantStatus {
 				t.Fatalf("status code = %d, want %d", got, tc.wantStatus)
 			}
-			assertCodexErrorCode(t, err.Error(), tc.wantType, tc.wantCode)
+			detail, ok := providererror.FromError(err)
+			if !ok {
+				assertCodexErrorCode(t, err.Error(), tc.wantType, tc.wantCode)
+				return
+			}
+			assertCodexProviderError(t, err, detail, tc.wantType, tc.wantCode)
 		})
 	}
+}
+
+func assertCodexProviderError(t *testing.T, err error, detail providererror.Detail, wantType string, wantCode string) {
+	t.Helper()
+	coded, ok := err.(interface{ ErrorCode() string })
+	if !ok {
+		t.Fatalf("%T does not expose ErrorCode()", err)
+	}
+	if got := coded.ErrorCode(); got != wantCode {
+		t.Fatalf("ErrorCode() = %q, want %q", got, wantCode)
+	}
+	if detail.Type != wantType || detail.Code != wantCode {
+		t.Fatalf("ProviderErrorDetail() = %#v, want type=%q code=%q", detail, wantType, wantCode)
+	}
+}
+
+func assertCodexSafeProviderError(t *testing.T, err error, wantType string, wantCode string) {
+	t.Helper()
+	detail, ok := providererror.FromError(err)
+	if !ok {
+		t.Fatalf("ProviderErrorDetail() missing: %v", err)
+	}
+	assertCodexProviderError(t, err, detail, wantType, wantCode)
 }
 
 func TestNewCodexStatusErrPreservesUnclassifiedErrors(t *testing.T) {

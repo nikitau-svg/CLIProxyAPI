@@ -1,6 +1,6 @@
-# Bravo 0.8.5 safe diagnostics test plan
+# Bravo 0.8.6 safe diagnostics test plan
 
-Status: implementation gate for the isolated 0.8.5 canary.
+Status: implementation gate for the isolated 0.8.6 canary.
 
 Scope: Bravo 0.8.2 plus the Claude OAuth custom-tool alias hotfix. Adaptive
 quota routing from 0.8.4 is deliberately out of scope.
@@ -58,7 +58,7 @@ quota routing from 0.8.4 is deliberately out of scope.
 ## Canary acceptance
 
 1. Run the existing Claude Code compatibility smoke against an isolated
-   0.8.5 container.
+   0.8.6 container.
 2. Reproduce a local capability mismatch and verify `422`, trace header,
    Russian explanation, stage, capability, and zero provider calls.
 3. Feed a synthetic Codex invalid-tool envelope through the canary host path;
