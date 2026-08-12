@@ -39,8 +39,8 @@ stream или какой capability был потерян при перевод�
 | Upstream repository | [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) |
 | Upstream tag | [`v7.2.94`](https://github.com/router-for-me/CLIProxyAPI/tree/v7.2.94) |
 | Upstream commit | [`36b45d57a3e804b9dfcee307e5d7b3e8cea5acfc`](https://github.com/router-for-me/CLIProxyAPI/commit/36b45d57a3e804b9dfcee307e5d7b3e8cea5acfc) |
-| Bravo stable | `0.8.10` |
-| Stable code snapshot | [`59fc4f0260831a192aac782cdea3950d91d0d4d6`](https://github.com/nikitau-svg/CLIProxyAPI/commit/59fc4f0260831a192aac782cdea3950d91d0d4d6) |
+| Bravo stable | `0.8.11` |
+| Stable feature snapshot | [`4af9679916dbfa9fdfe756e1bd9370dd591466e9`](https://github.com/nikitau-svg/CLIProxyAPI/commit/4af9679916dbfa9fdfe756e1bd9370dd591466e9) |
 
 Commit upstream выше является предком stable-линии Bravo. Поэтому ссылка ведёт
 не на «примерно похожую» версию, а на точную основу текущего форка.
@@ -60,9 +60,10 @@ Commit upstream выше является предком stable-линии Bravo
 
 ### `bravo/stable`
 
-Историческая линия адаптивного allocator, дошедшая до Bravo 0.8.4. Она
-сохранена для аудита и разработки 0.8.11, но не является текущей публичной
-stable-линией.
+Совместимый alias текущего стабильного release. Новые инструкции используют
+`bravo/main`; alias сохраняется для старых автоматизаций. Историческая линия
+экспериментального allocator 0.8.4 сохранена отдельно как
+`archive/bravo-0.8.4-adaptive` и не является installation channel.
 
 ### `main`
 
@@ -73,12 +74,12 @@ CLIProxyAPI, но пользователи Bravo не должны брать е
 
 | Версия | Назначение | Статус |
 | --- | --- | --- |
-| `0.8.10` | Безопасный fallback, vision, tool aliases, `json_object`, нормализация Claude sampling | stable |
-| `0.8.11` | Проектные endpoints лимитов/маршрутов и новый адаптивный allocator | preview, [draft PR #29](https://github.com/nikitau-svg/CLIProxyAPI/pull/29) |
+| `0.8.10` | Безопасный fallback, vision, tool aliases, `json_object`, нормализация Claude sampling | previous stable |
+| `0.8.11` | Возможности 0.8.10 плюс проектные endpoints лимитов и прозрачных маршрутов; без нового adaptive allocator | stable |
 
-Наличие preview-кода в GitHub не разрешает его выкладку в production. Сборка,
-переключение контейнера и миграция состояния выполняются только отдельной
-явной операцией после проверки.
+Наличие stable-кода в GitHub само по себе не меняет production. Сборка и
+переключение контейнера выполняются только отдельной явной операцией после
+проверки точного release commit.
 
 ## Как обновляется upstream
 

@@ -56,6 +56,7 @@ const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authe
 var corsExposedResponseHeaders = []string{
 	logging.CPATraceIDHeader,
 	"X-Bravo-Trace-Id",
+	"Retry-After",
 	"X-CPA-VERSION",
 	"X-CPA-COMMIT",
 	"X-CPA-BUILD-DATE",
@@ -71,6 +72,8 @@ var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, 
 const (
 	exampleAPIKeyManagementPath = "/management.html"
 	exampleAPIKeyManagementURL  = "/management.html?safe-mode=configure"
+	bravoProjectLimitsPath      = "/v0/management/bravo/project-limits"
+	bravoProjectRoutesPath      = "/v0/management/bravo/project-routes"
 )
 
 type serverOptionConfig struct {
@@ -524,6 +527,8 @@ func (s *Server) setupRoutes() {
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
+		v1.GET("/bravo/limits", s.serveBravoProjectEndpoint(bravoProjectLimitsPath))
+		v1.GET("/bravo/routes", s.serveBravoProjectEndpoint(bravoProjectRoutesPath))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
 		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
@@ -627,6 +632,34 @@ func (s *Server) setupRoutes() {
 	})
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
+}
+
+func (s *Server) serveBravoProjectEndpoint(pluginPath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s == nil || s.pluginHost == nil || c == nil || c.Request == nil || c.Request.URL == nil {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+				"error": gin.H{
+					"code":    "bravo_project_api_unavailable",
+					"message": "Проектный API Bravo сейчас недоступен.",
+				},
+			})
+			return
+		}
+		request := c.Request.Clone(c.Request.Context())
+		urlCopy := *request.URL
+		urlCopy.Path = pluginPath
+		request.URL = &urlCopy
+		if s.pluginHost.ServeManagementHTTP(c.Writer, request) {
+			c.Abort()
+			return
+		}
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+			"error": gin.H{
+				"code":    "bravo_project_api_unavailable",
+				"message": "Проектный API Bravo сейчас недоступен.",
+			},
+		})
+	}
 }
 
 func sanitizeCodexAlphaSearchBody(body []byte) []byte {

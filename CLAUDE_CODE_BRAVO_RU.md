@@ -175,8 +175,7 @@ curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/routes" \
 - `max` может расходовать квоту значительно быстрее `xhigh`/`high`.
 - `/compact` остаётся полезным перед передачей очень длинной сессии модели с
   меньшим окном.
-- `/v1/bravo/limits` и `/v1/bravo/routes` входят в preview 0.8.11 и отсутствуют
-  в stable 0.8.10 до отдельного релиза.
+- `/v1/bravo/limits` и `/v1/bravo/routes` доступны начиная со stable 0.8.11.
 
 Актуальные переменные Claude Code описаны в официальных разделах
 [Environment variables](https://code.claude.com/docs/en/env-vars),

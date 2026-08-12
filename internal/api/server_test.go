@@ -544,6 +544,29 @@ func TestNewServerWithoutPluginHostLeavesHandlerInterceptorsDisabled(t *testing.
 	}
 }
 
+func TestBravoProjectEndpointsRequireAPIAuthenticationAndPlugin(t *testing.T) {
+	server := newTestServer(t)
+	for _, path := range []string{"/v1/bravo/limits", "/v1/bravo/routes"} {
+		t.Run(path+" missing key", func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401; body=%s", rr.Code, rr.Body.String())
+			}
+		})
+		t.Run(path+" plugin unavailable", func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("Authorization", "Bearer test-key")
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+			if rr.Code != http.StatusNotFound || !strings.Contains(rr.Body.String(), "bravo_project_api_unavailable") {
+				t.Fatalf("status = %d, want 404 typed error; body=%s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 
