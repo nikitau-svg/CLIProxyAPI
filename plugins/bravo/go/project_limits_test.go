@@ -1,0 +1,269 @@
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+func TestProjectLimitsReturnsConfirmedResetsUsageAndRateLimit(t *testing.T) {
+	restoreUsage := isolateBravoUsageState(t)
+	defer restoreUsage()
+	resetProjectLimitsRateForTest()
+	t.Cleanup(resetProjectLimitsRateForTest)
+
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	previousNow := projectLimitsNow
+	projectLimitsNow = func() time.Time { return now }
+	t.Cleanup(func() { projectLimitsNow = previousNow })
+
+	const plaintext = "brv_project_limits_test"
+	cfg := projectLimitsTestConfig(t, plaintext)
+	previousConfig := loadedConfig()
+	currentConfig.Store(cfg)
+	t.Cleanup(func() { currentConfig.Store(previousConfig) })
+
+	storeQuotaSnapshot("claude-private", credentialQuotaState{
+		Confidence:  "confirmed",
+		Provider:    "claude",
+		Session:     quotaWindowState{RemainingPercent: 0, UsedPercent: 100, ResetAt: now.Add(3 * time.Hour)},
+		Weekly:      quotaWindowState{RemainingPercent: 10, UsedPercent: 90, ResetAt: now.Add(30 * time.Hour)},
+		ModelWeekly: []modelQuotaWindowState{{Model: "claude-fable-5", quotaWindowState: quotaWindowState{RemainingPercent: 0, UsedPercent: 100, ResetAt: now.Add(3 * time.Hour)}}},
+		RefreshedAt: now,
+		ConfirmedAt: now,
+	})
+	storeQuotaSnapshot("codex-private", credentialQuotaState{
+		Confidence:  "confirmed",
+		Provider:    "codex",
+		Session:     quotaWindowState{RemainingPercent: 80, UsedPercent: 20, ResetAt: now.Add(4 * time.Hour)},
+		Weekly:      quotaWindowState{RemainingPercent: 70, UsedPercent: 30, ResetAt: now.Add(48 * time.Hour)},
+		RefreshedAt: now,
+		ConfirmedAt: now,
+	})
+	recordAnalyticsUsage(bravoUsageState, now.Add(-24*time.Hour), "prj_limits", "claude-private", "claude", "claude-fable-5", "bravo/fable", 123)
+
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostAuthList {
+			t.Fatalf("unexpected host method %q", method)
+		}
+		return mustBravoJSON(t, hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{
+			{AuthIndex: "claude-private", Provider: "claude", Name: "must-not-leak@example.test"},
+			{AuthIndex: "codex-private", Provider: "codex", Name: "also-secret@example.test"},
+			{AuthIndex: "outside-private", Provider: "claude", Name: "outside@example.test"},
+		}}), nil
+	})
+
+	status, headers, body := callProjectKeyEndpoint(t, http.MethodGet, projectLimitsPath, plaintext, url.Values{"format": {"json"}})
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body=%s", status, body)
+	}
+	if !strings.Contains(headers.Get("Content-Type"), "application/json") {
+		t.Fatalf("content type = %q", headers.Get("Content-Type"))
+	}
+	var response projectLimitsResponse
+	if errUnmarshal := json.Unmarshal(body, &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if response.Project.ID != "prj_limits" || response.Usage.Summary.Requests != 1 || response.Usage.Summary.TotalTokens != 123 {
+		t.Fatalf("response = %#v", response)
+	}
+	claude := findProjectLimitProvider(t, response.Providers, "claude")
+	if claude.Status == "available" || claude.AccountsTotal != 1 {
+		t.Fatalf("claude = %#v", claude)
+	}
+	fable := findProjectLimitWindow(t, claude.Windows, pluginapi.HostAuthQuotaWindowKindModelWeekly, "claude-fable-5")
+	if fable.ResetsInSeconds == nil || *fable.ResetsInSeconds != int64(3*time.Hour/time.Second) {
+		t.Fatalf("fable reset = %#v", fable)
+	}
+	codex := findProjectLimitProvider(t, response.Providers, "codex")
+	if codex.Status != "available" || codex.AccountsTotal != 1 {
+		t.Fatalf("codex = %#v", codex)
+	}
+	if raw := string(body); strings.Contains(raw, "private") || strings.Contains(raw, "example.test") {
+		t.Fatalf("response leaked account identity: %s", raw)
+	}
+
+	status, headers, body = callProjectKeyEndpoint(t, http.MethodGet, projectLimitsPath, plaintext, nil)
+	if status != http.StatusTooManyRequests || headers.Get("Retry-After") != "3600" || !strings.Contains(string(body), "bravo_project_limits_rate_limited") {
+		t.Fatalf("rate limit status=%d headers=%v body=%s", status, headers, body)
+	}
+
+	resetProjectLimitsRateForTest()
+	status, headers, body = callProjectKeyEndpoint(t, http.MethodGet, projectLimitsPath, plaintext, url.Values{"format": {"text"}})
+	if status != http.StatusOK || !strings.Contains(headers.Get("Content-Type"), "text/plain") {
+		t.Fatalf("text status=%d headers=%v body=%s", status, headers, body)
+	}
+	for _, expected := range []string{"Проект Bravo: Limits test", "сброс через 3 ч", "Usage за 30 дней: 1 запросов"} {
+		if !strings.Contains(string(body), expected) {
+			t.Fatalf("text body %q does not contain %q", body, expected)
+		}
+	}
+	if raw := string(body); strings.Contains(raw, "private") || strings.Contains(raw, "example.test") {
+		t.Fatalf("text response leaked account identity: %s", raw)
+	}
+}
+
+func TestProjectEndpointsRejectNonProjectKeyBeforeHostIO(t *testing.T) {
+	previousConfig := loadedConfig()
+	cfg := defaultPluginConfig()
+	currentConfig.Store(cfg)
+	t.Cleanup(func() { currentConfig.Store(previousConfig) })
+	hostCalls := 0
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		hostCalls++
+		return nil, nil
+	})
+	for _, path := range []string{projectLimitsPath, projectRoutesPath} {
+		status, _, body := callProjectKeyEndpoint(t, http.MethodGet, path, "ordinary-api-key", nil)
+		if status != http.StatusUnauthorized || !strings.Contains(string(body), "bravo_smart_key_required") {
+			t.Fatalf("%s status=%d body=%s", path, status, body)
+		}
+	}
+	if hostCalls != 0 {
+		t.Fatalf("unauthorized endpoint performed %d host calls", hostCalls)
+	}
+}
+
+func TestProjectRoutesReturnsOnlyAllowedEffectiveRoutes(t *testing.T) {
+	const plaintext = "brv_project_routes_test"
+	cfg := projectLimitsTestConfig(t, plaintext)
+	cfg.SmartKeys[0].Models = []string{"fable"}
+	cfg.RouteOverrides = []routeOverrideConfig{{ID: "fable", Candidates: []candidate{{Provider: "codex", Model: "gpt-5.6-sol", Effort: "max", Priority: 100}}}}
+	if errNormalize := normalizeConfig(&cfg); errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	previousConfig := loadedConfig()
+	currentConfig.Store(cfg)
+	t.Cleanup(func() { currentConfig.Store(previousConfig) })
+
+	status, _, body := callProjectKeyEndpoint(t, http.MethodGet, projectRoutesPath, plaintext, nil)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body=%s", status, body)
+	}
+	var response projectRoutesResponse
+	if errUnmarshal := json.Unmarshal(body, &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if len(response.Routes) != 1 || response.Routes[0].ID != "fable" || response.Routes[0].Source != "override" {
+		t.Fatalf("routes = %#v", response.Routes)
+	}
+	if got := response.Routes[0].Candidates; len(got) != 1 || got[0].Order != 1 || got[0].Provider != "codex" || got[0].PhysicalModel != "gpt-5.6-sol" {
+		t.Fatalf("candidates = %#v", got)
+	}
+	if raw := string(body); strings.Contains(raw, "claude-private") || strings.Contains(raw, "codex-private") {
+		t.Fatalf("routes leaked account identity: %s", raw)
+	}
+}
+
+func TestProjectQuotaAndContextFailureNamesResetsAndAvailableCodex(t *testing.T) {
+	restoreUsage := isolateBravoUsageState(t)
+	defer restoreUsage()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	cfg := projectLimitsTestConfig(t, "brv_failure_summary_test")
+	previousConfig := loadedConfig()
+	currentConfig.Store(cfg)
+	t.Cleanup(func() { currentConfig.Store(previousConfig) })
+	storeQuotaSnapshot("claude-private", credentialQuotaState{
+		Confidence: "confirmed", Provider: "claude", ConfirmedAt: now, RefreshedAt: now,
+		Session: quotaWindowState{RemainingPercent: 0, ResetAt: now.Add(3 * time.Hour)},
+		Weekly:  quotaWindowState{RemainingPercent: 0, ResetAt: now.Add(30 * time.Hour)},
+		ModelWeekly: []modelQuotaWindowState{{
+			Model:            "claude-fable-5",
+			quotaWindowState: quotaWindowState{RemainingPercent: 0, ResetAt: now.Add(3 * time.Hour)},
+		}},
+	})
+	storeQuotaSnapshot("codex-private", credentialQuotaState{
+		Confidence: "confirmed", Provider: "codex", ConfirmedAt: now, RefreshedAt: now,
+		Session: quotaWindowState{RemainingPercent: 80, ResetAt: now.Add(4 * time.Hour)},
+		Weekly:  quotaWindowState{RemainingPercent: 70, ResetAt: now.Add(48 * time.Hour)},
+	})
+	traces := []executionFailureTrace{
+		{Provider: "claude", Model: "claude-fable-5", Failure: executionFailure{Code: "bravo_subscription_quota_exhausted", Status: 429, Retryable: true}},
+		{Provider: "codex", Model: "gpt-5.6-terra", Failure: executionFailure{
+			Code: "bravo_context_window_exceeded", Status: 400,
+			Provider: &providererror.Detail{RequiredTokens: 314000, LimitTokens: 256000},
+		}},
+	}
+	failure := enrichProjectQuotaContextFailure(cfg.SmartKeys[0], traces, executionFailure{}, now)
+	if failure.Code != "bravo_quota_then_context_exhausted" || failure.Status != http.StatusBadRequest || failure.Retryable {
+		t.Fatalf("failure = %#v", failure)
+	}
+	for _, expected := range []string{"Fable 5", "3 ч", "30 ч", "Лимиты Codex доступны", "Terra", "314 000", "256 000", "/v1/bravo/limits"} {
+		if !strings.Contains(failure.Message, expected) {
+			t.Fatalf("message %q does not contain %q", failure.Message, expected)
+		}
+	}
+}
+
+func projectLimitsTestConfig(t *testing.T, plaintext string) pluginConfig {
+	t.Helper()
+	cfg := defaultPluginConfig()
+	sum := sha256.Sum256([]byte(plaintext))
+	cfg.SmartKeys = []smartKeyConfig{{
+		ID:             "prj_limits",
+		Name:           "Limits test",
+		SHA256:         hex.EncodeToString(sum[:]),
+		Models:         []string{"fable", "terra"},
+		AllowedAuthIDs: []string{"claude-private", "codex-private"},
+	}}
+	if errNormalize := normalizeConfig(&cfg); errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	return cfg
+}
+
+func callProjectKeyEndpoint(t *testing.T, method, path, plaintext string, query url.Values) (int, http.Header, []byte) {
+	t.Helper()
+	raw, errHandle := handleManagement(mustJSONValue(t, rpcManagementRequest{
+		ManagementRequest: pluginapi.ManagementRequest{
+			Method:  method,
+			Path:    path,
+			Headers: http.Header{"Authorization": []string{"Bearer " + plaintext}},
+			Query:   query,
+		},
+		HostCallbackID: "project-api-callback",
+	}))
+	if errHandle != nil {
+		t.Fatal(errHandle)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	var response pluginapi.ManagementResponse
+	if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	return response.StatusCode, response.Headers, response.Body
+}
+
+func findProjectLimitProvider(t *testing.T, providers []projectLimitProviderView, name string) projectLimitProviderView {
+	t.Helper()
+	for _, provider := range providers {
+		if provider.Provider == name {
+			return provider
+		}
+	}
+	t.Fatalf("provider %q not found in %#v", name, providers)
+	return projectLimitProviderView{}
+}
+
+func findProjectLimitWindow(t *testing.T, windows []projectLimitWindowView, kind, model string) projectLimitWindowView {
+	t.Helper()
+	for _, window := range windows {
+		if window.Kind == kind && window.Model == model {
+			return window
+		}
+	}
+	t.Fatalf("window %s/%s not found in %#v", kind, model, windows)
+	return projectLimitWindowView{}
+}

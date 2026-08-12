@@ -91,6 +91,12 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	if !strings.HasPrefix(plaintext, "brv_") {
 		t.Fatalf("plaintext_key = %q", plaintext)
 	}
+	projectAPI := projectMap(t, created["project_api"])
+	limitsAPI := projectMap(t, projectAPI["limits"])
+	routesAPI := projectMap(t, projectAPI["routes"])
+	if limitsAPI["endpoint"] != projectLimitsPublicPath || routesAPI["endpoint"] != projectRoutesPublicPath {
+		t.Fatalf("project_api = %#v", projectAPI)
+	}
 	project := projectMap(t, created["project"])
 	projectID, _ := project["id"].(string)
 	if !strings.HasPrefix(projectID, "prj_") || project["name"] != "Alpha" {
@@ -198,6 +204,9 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	rotatedPlaintext, _ := rotated["plaintext_key"].(string)
 	if !strings.HasPrefix(rotatedPlaintext, "brv_") || rotatedPlaintext == plaintext {
 		t.Fatalf("rotated plaintext_key = %q", rotatedPlaintext)
+	}
+	if projectAPI := projectMap(t, rotated["project_api"]); projectMap(t, projectAPI["limits"])["endpoint"] != projectLimitsPublicPath {
+		t.Fatalf("rotated project_api = %#v", projectAPI)
 	}
 	if authenticateProjectKey(t, plaintext).Authenticated {
 		t.Fatal("old key authenticates after rotation")

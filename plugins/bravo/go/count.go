@@ -106,7 +106,7 @@ func countTokens(raw []byte) ([]byte, error) {
 			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
+			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailureForRequest(req, failureTraces, failure)), nil
 		}
 		var response pluginapi.HostModelExecutionResponse
 		if errDecode := json.Unmarshal(responseRaw, &response); errDecode != nil {
@@ -134,7 +134,7 @@ func countTokens(raw []byte) ([]byte, error) {
 			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
+			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailureForRequest(req, failureTraces, failure)), nil
 		}
 		response.Headers.Del("Content-Length")
 		recordExecutionAttempt(attempt, started, response.StatusCode, true, executionFailure{})
@@ -159,5 +159,5 @@ func countTokens(raw []byte) ([]byte, error) {
 			Status:  http.StatusUnprocessableEntity,
 		}
 	}
-	return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, lastFailure)), nil
+	return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailureForRequest(req, failureTraces, lastFailure)), nil
 }

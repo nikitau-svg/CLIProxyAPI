@@ -178,7 +178,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		}
 	}
 	closeTerminalFailure := func(failure executionFailure) {
-		final := finalExecutionFailure(failureTraces, failure)
+		final := finalExecutionFailureForRequest(req, failureTraces, failure)
 		routeRecorder.finish(false, final.Status, final)
 		closePluginStreamFailure(pluginStreamID, final)
 	}
