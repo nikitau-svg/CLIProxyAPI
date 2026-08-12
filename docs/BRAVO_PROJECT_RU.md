@@ -2,13 +2,35 @@
 
 ## Идентичность проекта
 
-**Bravo — проект Никиты Ускова.** Репозиторий является настоящим GitHub fork
-CLIProxyAPI, но продуктовая линия Bravo, её проектные ключи, маршруты,
-диагностика, UI-контракты и правила эксплуатации поддерживаются отдельно.
+**Bravo разрабатывается компанией Slowdive. Создатель — Никита Усков.**
+Репозиторий является настоящим GitHub fork CLIProxyAPI, но продуктовая линия
+Bravo, её проектные ключи, маршруты, диагностика, UI-контракты и правила
+эксплуатации поддерживаются отдельно.
 
 Это не официальный релиз CLIProxyAPI и не зеркало, которое автоматически
 следует за upstream. Такое разделение намеренное: изменение внешнего ядра не
 должно незаметно менять production-поведение Bravo.
+
+## Почему это fork, а не внешний набор патчей
+
+Ключевые гарантии Bravo проходят через несколько уровней CLIProxyAPI:
+
+- входные OpenAI и Anthropic протоколы;
+- project-key authentication и allowed pool;
+- plugin plan, retry и fallback;
+- host callbacks и закрепление физического аккаунта;
+- request translation, streaming и provider error classification;
+- prompt caching, quota snapshots, analytics и management UI.
+
+Отдельный внешний proxy wrapper видел бы только часть этого пути и был бы
+вынужден угадывать, дошёл ли запрос до provider, можно ли безопасно повторить
+stream или какой capability был потерян при переводе. Fork позволяет менять и
+тестировать весь путь атомарно, при этом точная upstream-база остаётся видимой
+и проверяемой.
+
+Практический результат: stable, документация, миграции и rollback относятся к
+одному commit. Обновление upstream становится осознанной интеграцией, а не
+случайным изменением работающего сервиса.
 
 ## Зафиксированная основа
 
@@ -88,6 +110,8 @@ CLIProxyAPI, но пользователи Bravo не должны брать е
 - [`../BRAVO_MODELS_AND_KEYS_RU.md`](../BRAVO_MODELS_AND_KEYS_RU.md) — модели,
   проектные ключи, allowlist и fallback;
 - [`../AWS_INSTALL_RU.md`](../AWS_INSTALL_RU.md) — чистая установка;
+- [`../CLAUDE_CODE_BRAVO_RU.md`](../CLAUDE_CODE_BRAVO_RU.md) — Claude Code,
+  agent teams, project status и готовая инструкция для команды;
 - [`../plugins/bravo/README.md`](../plugins/bravo/README.md) — технический
   контракт плагина;
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — баги, логи и изменения;
