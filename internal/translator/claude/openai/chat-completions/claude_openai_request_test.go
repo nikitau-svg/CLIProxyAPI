@@ -1,6 +1,7 @@
 package chat_completions
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -471,23 +472,33 @@ func TestConvertOpenAIRequestToClaude_PartCacheControlWinsOverMessageLevel(t *te
 }
 
 func TestConvertOpenAIRequestToClaude_AcceptsAndIgnoresJSONObjectHint(t *testing.T) {
-	t.Parallel()
-
 	input := []byte(`{
 		"model":"claude-sonnet-5",
 		"messages":[{"role":"user","content":"return sync state"}],
 		"response_format":{"type":"json_object"}
 	}`)
-	out := ConvertOpenAIRequestToClaude("claude-sonnet-5", input, false)
-	result := gjson.ParseBytes(out)
+	for _, stream := range []bool{false, true} {
+		out := ConvertOpenAIRequestToClaude("claude-sonnet-5", input, stream)
+		result := gjson.ParseBytes(out)
 
-	if result.Get("response_format").Exists() {
-		t.Fatalf("OpenAI-only response_format leaked to Claude: %s", out)
-	}
-	if result.Get("output_config.format").Exists() {
-		t.Fatalf("unverified strict Claude format was invented: %s", out)
-	}
-	if got := result.Get("messages.0.content.0.text").String(); got != "return sync state" {
-		t.Fatalf("message was not preserved, got %q: %s", got, out)
+		if result.Get("response_format").Exists() {
+			t.Fatalf("OpenAI-only response_format leaked to Claude: %s", out)
+		}
+		if result.Get("output_config.format").Exists() {
+			t.Fatalf("unverified strict Claude format was invented: %s", out)
+		}
+		if got := result.Get("messages.0.content.0.text").String(); got != "return sync state" {
+			t.Fatalf("message was not preserved, got %q: %s", got, out)
+		}
+		instructionFound := false
+		for _, block := range result.Get("system").Array() {
+			if strings.Contains(block.Get("text").String(), "Do not wrap it in markdown fences") {
+				instructionFound = true
+				break
+			}
+		}
+		if !instructionFound {
+			t.Fatalf("JSON mode instruction is missing for stream=%v: %s", stream, out)
+		}
 	}
 }

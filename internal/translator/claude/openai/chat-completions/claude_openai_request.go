@@ -279,6 +279,15 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 			}
 			return true
 		})
+		if strings.EqualFold(strings.TrimSpace(root.Get("response_format.type").String()), "json_object") {
+			jsonModeInstruction := []byte(`{"type":"text","text":""}`)
+			jsonModeInstruction, _ = sjson.SetBytes(
+				jsonModeInstruction,
+				"text",
+				"Return exactly one valid JSON object. Do not wrap it in markdown fences and do not add prose before or after the object.",
+			)
+			systemBlocks = append(systemBlocks, jsonModeInstruction)
+		}
 
 		// Preserve a minimal conversational turn for system-only inputs.
 		// Claude payloads with top-level system instructions but no messages are risky for downstream validation.

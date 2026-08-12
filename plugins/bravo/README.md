@@ -63,8 +63,11 @@ OpenAI Chat accepts `reasoning_effort` or `reasoning.effort`; OpenAI Responses
 accepts `reasoning.effort` and the compatibility form `reasoning_effort`.
 OpenAI Chat also accepts `response_format: {"type":"json_object"}`. Codex
 receives its native JSON-mode equivalent; Claude executes the request without
-rejecting the advisory format hint. Strict `json_schema` remains fail-closed
-until its cross-provider output contract is verified.
+rejecting the format hint and receives an explicit instruction to emit one bare
+JSON object. If a non-streaming provider still wraps one valid object in an
+outer `json` Markdown fence, Bravo removes that fence before returning the
+OpenAI Chat response. Strict `json_schema` remains fail-closed until its
+cross-provider output contract is verified.
 OpenAI Chat sampling controls are also treated as advisory when routed to
 Claude Code: `temperature` and `top_p` are omitted from the translated Claude
 request because the provider rejects `top_p < 1` and mixed sampling controls.

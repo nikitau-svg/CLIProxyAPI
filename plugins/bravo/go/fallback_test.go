@@ -274,6 +274,75 @@ func TestBravoExecuteAcceptsJSONObjectAcrossClaudeToCodexFallback(t *testing.T) 
 	}
 }
 
+func TestBravoExecuteUnwrapsFencedJSONObject(t *testing.T) {
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{Candidates: []candidate{{
+		Provider: "claude", Model: "claude-sonnet-5", Priority: 100, Capabilities: []string{capabilityText},
+	}}})
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{{ID: "claude-a", Provider: "claude"}}}), nil
+		case pluginabi.MethodHostModelExecute:
+			responseBody, errMarshal := json.Marshal(map[string]any{
+				"model": "claude-sonnet-5",
+				"choices": []any{map[string]any{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "```json\n{\"results\":[]}\n```",
+					},
+				}},
+			})
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
+				StatusCode: http.StatusOK,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       responseBody,
+			}), nil
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	body := []byte(`{"model":"bravo/sonnet","messages":[{"role":"user","content":"sync"}],"top_p":0.1,"response_format":{"type":"json_object"}}`)
+	raw, errExecute := execute(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model: "bravo/fallback-probe", Format: protocolOpenAI, SourceFormat: protocolOpenAI, OriginalRequest: body,
+		},
+		HostCallbackID: "json-mode-output",
+	}))
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !env.OK {
+		t.Fatalf("Bravo JSON-mode execution failed: %#v", env.Error)
+	}
+	var executorResponse pluginapi.ExecutorResponse
+	if errUnmarshal := json.Unmarshal(env.Result, &executorResponse); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if errUnmarshal := json.Unmarshal(executorResponse.Payload, &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if got := response.Choices[0].Message.Content; got != `{"results":[]}` {
+		t.Fatalf("content = %q, want bare JSON object; payload=%s", got, executorResponse.Payload)
+	}
+}
+
 func TestBravoExecuteClientEffortResolvesForEveryFallback(t *testing.T) {
 	isolateBravoFallbackTestState(t)
 	installBravoTestConfig(t, logicalModel{

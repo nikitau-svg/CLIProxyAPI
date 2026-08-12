@@ -179,6 +179,88 @@ func rewriteResponseModel(body []byte, physicalModel, logicalModel string) []byt
 	return raw
 }
 
+// normalizeOpenAIChatJSONModeResponse repairs the only safe and deterministic
+// packaging mismatch for response_format=json_object: a model returned one
+// valid JSON object but wrapped it in a Markdown code fence. It deliberately
+// does not extract JSON from prose, arrays, malformed data, or nested fences.
+func normalizeOpenAIChatJSONModeResponse(body, requestBody []byte, protocol string) []byte {
+	if normalizeContractProtocol(protocol) != protocolOpenAI || !openAIChatRequestsJSONObject(requestBody) {
+		return body
+	}
+	var response map[string]any
+	if errUnmarshal := json.Unmarshal(body, &response); errUnmarshal != nil || response == nil {
+		return body
+	}
+	choices, okChoices := response["choices"].([]any)
+	if !okChoices {
+		return body
+	}
+	changed := false
+	for _, rawChoice := range choices {
+		choice, okChoice := rawChoice.(map[string]any)
+		if !okChoice {
+			continue
+		}
+		message, okMessage := choice["message"].(map[string]any)
+		if !okMessage {
+			continue
+		}
+		content, okContent := message["content"].(string)
+		if !okContent {
+			continue
+		}
+		if normalized, okNormalize := unwrapJSONObjectFence(content); okNormalize {
+			message["content"] = normalized
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	normalized, errMarshal := json.Marshal(response)
+	if errMarshal != nil {
+		return body
+	}
+	return normalized
+}
+
+func openAIChatRequestsJSONObject(body []byte) bool {
+	var request struct {
+		ResponseFormat struct {
+			Type string `json:"type"`
+		} `json:"response_format"`
+	}
+	if errUnmarshal := json.Unmarshal(body, &request); errUnmarshal != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(request.ResponseFormat.Type), "json_object")
+}
+
+func unwrapJSONObjectFence(content string) (string, bool) {
+	trimmed := strings.TrimSpace(content)
+	if !strings.HasPrefix(trimmed, "```") {
+		return "", false
+	}
+	headerEnd := strings.IndexByte(trimmed, '\n')
+	if headerEnd < 0 {
+		return "", false
+	}
+	header := strings.ToLower(strings.TrimSpace(trimmed[:headerEnd]))
+	if header != "```" && header != "```json" {
+		return "", false
+	}
+	fencedBody := strings.TrimSpace(trimmed[headerEnd+1:])
+	if !strings.HasSuffix(fencedBody, "```") {
+		return "", false
+	}
+	inner := strings.TrimSpace(strings.TrimSuffix(fencedBody, "```"))
+	var object map[string]any
+	if errUnmarshal := json.Unmarshal([]byte(inner), &object); errUnmarshal != nil || object == nil {
+		return "", false
+	}
+	return inner, true
+}
+
 func rewriteModelFields(value any, physicalModel, logicalModel string) {
 	switch typed := value.(type) {
 	case map[string]any:

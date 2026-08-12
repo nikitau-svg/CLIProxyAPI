@@ -214,8 +214,9 @@ func execute(raw []byte) ([]byte, error) {
 		traceID := routeTrace.finish(true, response.StatusCode, executionFailure{})
 		responseHeaders = attachRouteTraceHeader(responseHeaders, traceID)
 		metadata["bravo_trace_id"] = traceID
+		normalizedBody := normalizeOpenAIChatJSONModeResponse(response.Body, body, protocol)
 		return okEnvelope(pluginapi.ExecutorResponse{
-			Payload:  rewriteResponseModel(response.Body, physicalModel, logicalModelID),
+			Payload:  rewriteResponseModel(normalizedBody, physicalModel, logicalModelID),
 			Headers:  responseHeaders,
 			Metadata: metadata,
 		})
