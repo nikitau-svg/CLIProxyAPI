@@ -117,6 +117,7 @@ func cliproxyPluginShutdown() {
 	quotaPollingConfigured.Store(false)
 	stopQuotaPolling()
 	quotaRefreshRuntimeWG.Wait()
+	closeAdaptiveShadowAuditStore()
 	flushUsageState()
 }
 

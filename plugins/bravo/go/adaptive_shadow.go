@@ -17,6 +17,9 @@ const (
 	adaptiveShadowMaximumLearnedScale       = 8.0
 	adaptiveShadowMaximumAccounts           = 4096
 	adaptiveShadowMaximumCommitsPerAccount  = 256
+	adaptiveShadowDecisionAdmit             = "would_admit"
+	adaptiveShadowDecisionWithhold          = "would_withhold"
+	adaptiveShadowDecisionUnknown           = "unknown"
 )
 
 var adaptiveShadowNow = func() time.Time { return time.Now().UTC() }
@@ -165,8 +168,68 @@ func annotateAdaptiveShadowPlan(
 		if _, ok := primary[authIndex]; ok {
 			attempts[index].Primary = true
 		}
+		decision, pending, before, after := adaptiveShadowDecisionFor(
+			cfg,
+			attempts[index],
+			quota,
+			tariff,
+			estimate.ReservationPercent,
+			now,
+		)
+		attempts[index].AdaptiveShadowDecision = decision
+		attempts[index].AdaptiveShadowPendingPercent = pending
+		attempts[index].AdaptiveShadowHeadroomBefore = before
+		attempts[index].AdaptiveShadowHeadroomAfter = after
 	}
 	return attempts
+}
+
+func adaptiveShadowDecisionFor(
+	cfg pluginConfig,
+	attempt executionAttempt,
+	quota credentialQuotaState,
+	tariff tariffConfig,
+	reservation float64,
+	now time.Time,
+) (string, float64, float64, float64) {
+	authIndex := strings.TrimSpace(attempt.Auth.AuthIndex)
+	pending := adaptiveShadowEffectivePendingFor(authIndex, cfg, now)
+	if quotaRoutingConfidenceAt(quota, attempt.Candidate.Model, cfg, now) != "confirmed" {
+		return adaptiveShadowDecisionUnknown, adaptiveShadowRound(pending), 0, 0
+	}
+	session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
+	sessionFloor, weeklyFloor := tariff.SessionFloorPercent, tariff.WeeklyFloorPercent
+	if attempt.Primary {
+		sessionFloor, weeklyFloor = 0, 0
+	}
+	before := math.Min(
+		session.RemainingPercent-sessionFloor,
+		weekly.RemainingPercent-weeklyFloor,
+	) - pending
+	after := before - reservation
+	decision := adaptiveShadowDecisionAdmit
+	if after <= 0 {
+		decision = adaptiveShadowDecisionWithhold
+	}
+	return decision, adaptiveShadowRound(pending), adaptiveShadowRound(before), adaptiveShadowRound(after)
+}
+
+func adaptiveShadowEffectivePendingFor(authIndex string, cfg pluginConfig, now time.Time) float64 {
+	if authIndex == "" {
+		return 0
+	}
+	adaptiveShadowRuntime.Lock()
+	defer adaptiveShadowRuntime.Unlock()
+	account := adaptiveShadowRuntime.Accounts[authIndex]
+	if account == nil {
+		return 0
+	}
+	pruneAdaptiveShadowAccount(account, cfg, now)
+	effective := adaptiveShadowCommitWeight(account.OverflowPercent, account.OverflowAt, cfg, now)
+	for _, item := range account.Commits {
+		effective += adaptiveShadowCommitWeight(item.Percent, item.At, cfg, now)
+	}
+	return effective
 }
 
 func wrapAdaptiveShadowLease(attempt executionAttempt, release func(bool)) func(bool) {

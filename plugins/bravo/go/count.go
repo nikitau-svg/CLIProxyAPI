@@ -18,6 +18,9 @@ func countTokens(raw []byte) ([]byte, error) {
 	body := executionBody(req)
 	protocol := requestProtocol(req.ExecutorRequest)
 	routeTrace := newRouteTraceRecorder(req, strings.TrimSpace(req.Model), protocol, false)
+	// Token-count probes are not inference attempts and must not calibrate the
+	// adaptive allocator or inflate its request/fallback audit.
+	routeTrace.disableAdaptiveAudit()
 	logicalName, model, cfg, failure := prepareBravoExecution(req)
 	if failure != nil {
 		routeTrace.preflightFailure("routing_preflight", *failure, nil)

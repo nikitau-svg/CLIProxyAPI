@@ -303,6 +303,7 @@ func configure(raw []byte) error {
 	if errTraces := configureRouteTraceStore(cfg.StatePath); errTraces != nil {
 		return fmt.Errorf("configure Bravo route traces: %w", errTraces)
 	}
+	configureAdaptiveShadowAuditStore(cfg.StatePath)
 	currentConfig.Store(cfg)
 	quotaPollingConfigured.Store(true)
 	wakeQuotaPolling()

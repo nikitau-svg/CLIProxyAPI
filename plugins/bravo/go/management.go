@@ -94,6 +94,7 @@ func registerManagement() ([]byte, error) {
 			{Method: http.MethodPut, Path: "/bravo/routes", Description: "Validate, preview, and persist one Bravo route override."},
 			{Method: http.MethodPost, Path: "/bravo/routes/reset", Description: "Reset one Bravo route to its configured default."},
 			{Method: http.MethodGet, Path: "/bravo/subscriptions", Description: "List redacted subscription policy, quota, and usage views."},
+			{Method: http.MethodGet, Path: "/bravo/adaptive-audit", Description: "Read the bounded, privacy-safe adaptive allocator shadow audit."},
 			{Method: http.MethodPatch, Path: "/bravo/subscriptions", Description: "Update one subscription policy by auth_index."},
 			{Method: http.MethodPatch, Path: "/bravo/tariffs", Description: "Update one allocator tariff."},
 			{Method: http.MethodPost, Path: "/bravo/quotas/refresh", Description: "Refresh confirmed subscription quotas."},
@@ -119,6 +120,9 @@ func handleManagement(raw []byte) ([]byte, error) {
 	}
 	if response, errProjects := handleProjectsManagement(rpcReq); response != nil || errProjects != nil {
 		return response, errProjects
+	}
+	if response, errAudit := handleAdaptiveShadowAuditManagement(rpcReq); response != nil || errAudit != nil {
+		return response, errAudit
 	}
 	if response, errAllocator := handleAllocatorManagement(rpcReq); response != nil || errAllocator != nil {
 		return response, errAllocator

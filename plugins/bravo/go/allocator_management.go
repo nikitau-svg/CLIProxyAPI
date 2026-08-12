@@ -122,6 +122,7 @@ func handleAllocatorManagement(req rpcManagementRequest) ([]byte, error) {
 			"tariffs":            append([]tariffConfig(nil), loadedConfig().Tariffs...),
 			"quota_polling":      quotaPollingSummary(),
 			"adaptive_allocator": adaptiveShadowSummary(loadedConfig(), subscriptionViewAuthIndexes(views), time.Now()),
+			"adaptive_audit":     currentAdaptiveShadowAuditReport(loadedConfig(), 24*time.Hour, 0, time.Now()),
 		})
 	case path == "/v0/management/bravo/subscriptions" && req.Method == http.MethodPatch:
 		allocatorMutationMu.Lock()

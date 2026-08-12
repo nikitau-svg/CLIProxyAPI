@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.9.0-preview.1"
+	pluginVersion    = "0.9.0-preview.2"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -201,6 +201,12 @@ type executionAttempt struct {
 	AdaptiveShadow               bool
 	AdaptiveReservationPercent   float64
 	AdaptiveEstimateConfidence   string
+	AdaptiveShadowDecision       string
+	AdaptiveShadowPendingPercent float64
+	AdaptiveShadowHeadroomBefore float64
+	AdaptiveShadowHeadroomAfter  float64
+	AdaptiveProviderDispatched   bool
+	AdaptiveProviderAccepted     bool
 }
 
 type attemptRecord struct {

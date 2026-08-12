@@ -121,7 +121,7 @@ func (r *bravoStreamAttemptRun) execute(req rpcExecutorRequest, protocol string)
 		return
 	}
 	completed = true
-	r.results <- bravoStreamBootstrapResult{response: &response}
+	r.results <- bravoStreamBootstrapResult{response: &response, accepted: true}
 }
 
 func (r *bravoStreamAttemptRun) release(accepted bool) {
@@ -178,6 +178,7 @@ func (r *bravoStreamAttemptRun) cancelWithRequest(failure executionFailure) {
 	failure.AccountWide = false
 	failure.RetryAfter = ""
 	recordExecutionAttempt(r.attempt, r.started, failure.Status, false, failure)
+	r.traceRecorder.captureAdaptiveAuditAttempt(r.attempt, r.started, failure.Status, false, "canceled", failure.Code)
 }
 
 func (r *bravoStreamAttemptRun) abort(failure executionFailure) {
@@ -187,6 +188,7 @@ func (r *bravoStreamAttemptRun) abort(failure executionFailure) {
 	r.release(true)
 	r.closeScope()
 	recordExecutionAttempt(r.attempt, r.started, failure.Status, false, failure)
+	r.traceRecorder.captureAdaptiveAuditAttempt(r.attempt, r.started, failure.Status, false, "failed", failure.Code)
 }
 
 func settleBravoCompetingAttempt(
@@ -200,6 +202,7 @@ func settleBravoCompetingAttempt(
 	select {
 	case result := <-results:
 		if result.response != nil {
+			run.attempt.AdaptiveProviderAccepted = true
 			if requestFailure != nil && requestFailure.Code == "request_canceled" {
 				run.cancelWithRequest(*requestFailure)
 			} else {
@@ -216,6 +219,14 @@ func settleBravoCompetingAttempt(
 			}
 		}
 		finishBravoStreamAttemptFailure(run, *result.failure, result.accepted)
+		run.traceRecorder.captureAdaptiveAuditAttempt(
+			run.attempt,
+			run.started,
+			result.failure.Status,
+			false,
+			"failed",
+			result.failure.Code,
+		)
 	default:
 		if requestFailure != nil && requestFailure.Code == "request_canceled" {
 			run.cancelWithRequest(*requestFailure)
@@ -236,6 +247,7 @@ func finishBravoStreamAttemptFailure(run *bravoStreamAttemptRun, failure executi
 			applyCooldown = false
 		}
 	}
+	run.attempt.AdaptiveProviderAccepted = accepted
 	run.release(accepted)
 	run.closeScope()
 	recordExecutionAttempt(run.attempt, run.started, failure.Status, false, failure)
