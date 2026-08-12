@@ -19,7 +19,7 @@ Bravo.
 Bravo, имя image, платформу и builder image.
 
 1. [`nikitau-svg/CLIProxyAPI`](https://github.com/nikitau-svg/CLIProxyAPI),
-   ветка `bravo/stable` — проверенный patched host, Bravo, healthcheck и
+   ветка `bravo/main` — проверенный patched host, Bravo, healthcheck и
    AWS-installer.
 2. [`nikitau-svg/Cli-Proxy-API-Management-Center`](https://github.com/nikitau-svg/Cli-Proxy-API-Management-Center),
    точный commit из `deploy/aws/release.env` — подходящая версия админки.
@@ -133,7 +133,7 @@ sudo install -d -o ubuntu -g ubuntu /srv/bravo-build
 cd /srv/bravo-build
 
 git clone \
-  --branch bravo/stable \
+  --branch bravo/main \
   --single-branch \
   https://github.com/nikitau-svg/CLIProxyAPI.git \
   CLIProxyAPI
@@ -168,7 +168,7 @@ test "$(git -C ../Cli-Proxy-API-Management-Center rev-parse HEAD)" = \
 ```
 
 Обычная новая установка всегда начинает со свежего проверенного состояния
-`bravo/stable` и **не требует release tag**. Опциональные immutable-теги вида
+`bravo/main` и **не требует release tag**. Опциональные immutable-теги вида
 `bravo-vX.Y.Z` — только удобные точки воспроизведения и отката уже
 опубликованных версий.
 
@@ -572,7 +572,7 @@ ledger на диск.
 
 Сейчас Bravo image не опубликован в GHCR/Docker Hub, поэтому на AWS он
 собирается из согласованных исходников и используется с `pull_policy: never`.
-`bravo/stable` — движущийся проверенный канал, а не immutable tag. Поэтому для
+`bravo/main` — движущийся проверенный канал, а не immutable tag. Поэтому для
 каждой сборки обязательно записывайте backend SHA и локальный image ID.
 Наличие отдельного release tag не предполагается.
 
@@ -588,7 +588,7 @@ BUILD_ROOT="/srv/bravo-build-${RELEASE_ID}"
 
 sudo install -d -o ubuntu -g ubuntu "$BUILD_ROOT"
 git clone \
-  --branch bravo/stable \
+  --branch bravo/main \
   --single-branch \
   https://github.com/nikitau-svg/CLIProxyAPI.git \
   "${BUILD_ROOT}/CLIProxyAPI"

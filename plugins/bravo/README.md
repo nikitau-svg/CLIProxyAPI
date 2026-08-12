@@ -438,7 +438,7 @@ scripts/bravo-credits-context-smoke.rb
 The live harnesses read credentials from files and avoid printing secrets or
 image payloads.
 
-`bravo/stable` and `deploy/aws/release.env` are the installation channel.
+`bravo/main` and `deploy/aws/release.env` are the installation channel.
 Release tags are retained only as immutable rollback points. Moving the stable
 channel requires the full Go suite, plugin race/vet, risk-relevant protocol
 and management smoke checks, and controlled pre-payload failover. Real Claude
