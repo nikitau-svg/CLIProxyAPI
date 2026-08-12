@@ -47,6 +47,7 @@ var liveCapabilityMatrix = map[providerProtocol]capabilitySet{
 		capabilityText:       {},
 		capabilityTools:      {},
 		capabilityToolResult: {},
+		capabilityVision:     {},
 		capabilityWebSearch:  {},
 		capabilityStream:     {},
 	},
@@ -70,6 +71,7 @@ var liveCapabilityMatrix = map[providerProtocol]capabilitySet{
 		capabilityText:       {},
 		capabilityTools:      {},
 		capabilityToolResult: {},
+		capabilityVision:     {},
 		capabilityWebSearch:  {},
 		capabilityStream:     {},
 	},
@@ -94,10 +96,12 @@ var liveCapabilityMatrix = map[providerProtocol]capabilitySet{
 	},
 }
 
-// Vision through Anthropic Messages is live-verified for Claude and Codex,
-// including nested tool-result images, adaptive effort, and streaming. OpenAI
-// image generation and edit are also live-verified. Image-generation streaming
-// remains absent until its upstream response framing is verified as valid SSE.
+// Vision through OpenAI Chat and Anthropic Messages is live-verified for Claude
+// and Codex. The Anthropic path additionally covers nested tool-result images,
+// adaptive effort, and streaming. OpenAI Responses vision remains absent until
+// that entry/exit contract is exercised end to end. OpenAI image generation and
+// edit are also live-verified; image-generation streaming remains absent until
+// its upstream response framing is verified as valid SSE.
 //
 // capabilityReasoning for {codex, claude} is a *degraded* contract, and it is
 // declared because the alternative was worse. It is the contract for replaying a

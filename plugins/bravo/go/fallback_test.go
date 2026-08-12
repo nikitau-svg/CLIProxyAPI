@@ -119,6 +119,93 @@ func TestBravoExecuteExhaustsPrimaryAuthsBeforeNextCandidate(t *testing.T) {
 	}
 }
 
+func TestBravoExecutePreservesOpenAIChatVisionAcrossClaudeToCodexFallback(t *testing.T) {
+	isolateBravoFallbackTestState(t)
+	installBravoTestConfig(t, logicalModel{
+		Candidates: []candidate{
+			{
+				Provider:     "claude",
+				Model:        "claude-sonnet-5",
+				Priority:     100,
+				Capabilities: []string{capabilityText, capabilityVision},
+			},
+			{
+				Provider:     "codex",
+				Model:        "gpt-5.6-terra",
+				Priority:     90,
+				Capabilities: []string{capabilityText, capabilityVision},
+			},
+		},
+	})
+
+	auths := []pluginapi.HostAuthFileEntry{
+		{ID: "claude-a", Provider: "claude"},
+		{ID: "codex-a", Provider: "codex"},
+	}
+	const imageURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+	var calls []pluginapi.HostModelExecutionRequest
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return mustBravoJSON(t, hostAuthListResponse{Files: auths}), nil
+		case pluginabi.MethodHostModelExecute:
+			var request hostModelExecutionRequest
+			decodeBravoPayload(t, payload, &request)
+			calls = append(calls, request.HostModelExecutionRequest)
+			if !strings.Contains(string(request.Body), imageURL) ||
+				!strings.Contains(string(request.Body), `"type":"image_url"`) ||
+				!strings.Contains(string(request.Body), `"detail":"high"`) {
+				t.Fatalf("vision content was not preserved for %s: %s", request.ForcedProvider, request.Body)
+			}
+			if request.ForcedProvider == "claude" {
+				return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
+					StatusCode: http.StatusBadRequest,
+					Headers:    http.Header{"Content-Type": []string{"application/json"}},
+					Body:       []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"opaque provider rejection"}}`),
+				}), nil
+			}
+			return mustBravoJSON(t, pluginapi.HostModelExecutionResponse{
+				StatusCode: http.StatusOK,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       []byte(`{"model":"gpt-5.6-terra","choices":[{"message":{"role":"assistant","content":"image received"}}]}`),
+			}), nil
+		default:
+			t.Fatalf("unexpected host callback %q", method)
+			return nil, nil
+		}
+	})
+
+	body := []byte(`{
+		"model":"bravo/sonnet",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"what is shown?"},
+			{"type":"image_url","image_url":{"url":"` + imageURL + `","detail":"high"}}
+		]}]
+	}`)
+	raw, errExecute := execute(mustJSONValue(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "bravo/fallback-probe",
+			Format:          protocolOpenAI,
+			SourceFormat:    protocolOpenAI,
+			OriginalRequest: body,
+		},
+		HostCallbackID: "openai-vision-fallback",
+	}))
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !env.OK {
+		t.Fatalf("Bravo vision execution failed: %#v", env.Error)
+	}
+	if len(calls) != 2 || calls[0].ForcedProvider != "claude" || calls[1].ForcedProvider != "codex" {
+		t.Fatalf("calls = %#v, want Claude then Codex", calls)
+	}
+}
+
 func TestBravoExecuteClientEffortResolvesForEveryFallback(t *testing.T) {
 	isolateBravoFallbackTestState(t)
 	installBravoTestConfig(t, logicalModel{

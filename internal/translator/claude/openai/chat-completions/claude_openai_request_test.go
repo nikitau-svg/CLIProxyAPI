@@ -65,6 +65,25 @@ func TestConvertOpenAIRequestToClaude_DropsTemperature(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIRequestToClaude_UserImageURLBecomesVisionBlock(t *testing.T) {
+	inputJSON := `{
+		"model":"bravo/sonnet",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"inspect"},
+			{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8=","detail":"high"}}
+		]}]
+	}`
+
+	result := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-sonnet-5", []byte(inputJSON), false))
+	image := result.Get("messages.0.content.1")
+	if image.Get("type").String() != "image" || image.Get("source.type").String() != "base64" {
+		t.Fatalf("image block = %s, want Claude base64 image", image.Raw)
+	}
+	if image.Get("source.media_type").String() != "image/png" || image.Get("source.data").String() != "aGVsbG8=" {
+		t.Fatalf("image source = %s, want original PNG payload", image.Get("source").Raw)
+	}
+}
+
 func TestConvertOpenAIRequestToClaude_ToolResultTextAndBase64Image(t *testing.T) {
 	inputJSON := `{
 		"model": "gpt-4.1",

@@ -217,6 +217,9 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 								if u := it.Get("image_url.url"); u.Exists() {
 									part, _ = sjson.SetBytes(part, "image_url", u.String())
 								}
+								if detail := it.Get("image_url.detail").String(); detail != "" {
+									part, _ = sjson.SetBytes(part, "detail", detail)
+								}
 								contentItems = append(contentItems, part)
 							}
 						case "file":

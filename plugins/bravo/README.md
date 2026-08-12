@@ -327,6 +327,7 @@ Text logical models currently support:
 - client-defined function tools;
 - synthetic tool results;
 - built-in web search;
+- PNG/JPEG vision through OpenAI Chat on both Claude and Codex candidates;
 - PNG/JPEG vision through Anthropic Messages, including nested `tool_result`
   history, on both Claude and Codex candidates;
 - Anthropic token counting;
@@ -337,7 +338,7 @@ Image logical models currently support non-streaming generation and edit.
 The plugin rejects unverified semantics instead of silently dropping them.
 This currently includes image streaming, web-search domain filters, arbitrary
 provider-built-in tools, manual reasoning budgets/summaries, cross-provider
-signed-thinking replay, OpenAI Chat/Responses vision, file/document inputs,
+signed-thinking replay, OpenAI Responses vision, file/document inputs,
 structured output, and background execution. Named effort is supported and
 resolved against each physical model before execution; signed Claude thinking
 replay is supported only on the native Anthropic-Messages-to-Claude route.

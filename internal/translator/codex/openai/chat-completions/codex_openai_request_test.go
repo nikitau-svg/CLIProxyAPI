@@ -254,6 +254,25 @@ func TestToolCallOutputWithMultimodalContent(t *testing.T) {
 	}
 }
 
+func TestUserImageURLBecomesCodexInputImage(t *testing.T) {
+	input := []byte(`{
+		"model":"bravo/sonnet",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"inspect"},
+			{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8=","detail":"high"}}
+		]}]
+	}`)
+
+	result := gjson.ParseBytes(ConvertOpenAIRequestToCodex("gpt-5.6-terra", input, true))
+	image := result.Get("input.0.content.1")
+	if image.Get("type").String() != "input_image" {
+		t.Fatalf("image block = %s, want Codex input_image", image.Raw)
+	}
+	if image.Get("image_url").String() != "data:image/png;base64,aGVsbG8=" || image.Get("detail").String() != "high" {
+		t.Fatalf("image block = %s, want original URL and detail", image.Raw)
+	}
+}
+
 func TestToolCallOutputFallsBackForInvalidStructuredParts(t *testing.T) {
 	input := []byte(`{
 		"model": "gpt-4o",

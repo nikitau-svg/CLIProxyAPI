@@ -514,6 +514,35 @@ func TestPreflightCandidateContractAllowsLiveAnthropicVision(t *testing.T) {
 	}
 }
 
+func TestPreflightCandidateContractAllowsLiveOpenAIChatVision(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"inspect"},
+			{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","detail":"high"}}
+		]}]
+	}`)
+	for _, provider := range []string{"claude", "codex"} {
+		provider := provider
+		t.Run(provider, func(t *testing.T) {
+			t.Parallel()
+			item := candidate{
+				Provider: provider,
+				Capabilities: []string{
+					capabilityText,
+					capabilityVision,
+				},
+			}
+			contract, errPreflight := preflightCandidateContract(item, protocolOpenAI, body, false)
+			if errPreflight != nil {
+				t.Fatalf("preflightCandidateContract() error = %v", errPreflight)
+			}
+			assertCapabilities(t, contract, capabilityText, capabilityVision)
+		})
+	}
+}
+
 func TestPreflightCandidateContractRejectsUndeclaredCapability(t *testing.T) {
 	t.Parallel()
 
