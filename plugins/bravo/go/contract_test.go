@@ -67,6 +67,46 @@ func TestDetectRequestContractOpenAI(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatJSONModeIsAdvisoryButJSONSchemaRemainsStrict(t *testing.T) {
+	t.Parallel()
+
+	jsonObject, errDetect := detectRequestContract(
+		protocolOpenAI,
+		[]byte(`{"messages":[{"role":"user","content":"sync"}],"response_format":{"type":"json_object"}}`),
+		false,
+	)
+	if errDetect != nil {
+		t.Fatalf("detect json_object contract: %v", errDetect)
+	}
+	assertCapabilities(t, jsonObject, capabilityText)
+
+	for _, provider := range []string{"claude", "codex"} {
+		provider := provider
+		t.Run(provider, func(t *testing.T) {
+			t.Parallel()
+			_, errPreflight := preflightCandidateContract(
+				candidate{Provider: provider, Capabilities: []string{capabilityText}},
+				protocolOpenAI,
+				[]byte(`{"messages":[{"role":"user","content":"sync"}],"response_format":{"type":"json_object"}}`),
+				false,
+			)
+			if errPreflight != nil {
+				t.Fatalf("json_object preflight for %s: %v", provider, errPreflight)
+			}
+		})
+	}
+
+	jsonSchema, errDetect := detectRequestContract(
+		protocolOpenAI,
+		[]byte(`{"messages":[{"role":"user","content":"sync"}],"response_format":{"type":"json_schema","json_schema":{"name":"sync","schema":{"type":"object"}}}}`),
+		false,
+	)
+	if errDetect != nil {
+		t.Fatalf("detect json_schema contract: %v", errDetect)
+	}
+	assertCapabilities(t, jsonSchema, capabilityText, capabilityStructuredOutput)
+}
+
 func TestDetectRequestContractOpenAIResponse(t *testing.T) {
 	t.Parallel()
 

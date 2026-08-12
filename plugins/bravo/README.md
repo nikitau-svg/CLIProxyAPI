@@ -61,6 +61,10 @@ with and without streaming. Images do not change effort routing.
 
 OpenAI Chat accepts `reasoning_effort` or `reasoning.effort`; OpenAI Responses
 accepts `reasoning.effort` and the compatibility form `reasoning_effort`.
+OpenAI Chat also accepts `response_format: {"type":"json_object"}`. Codex
+receives its native JSON-mode equivalent; Claude executes the request without
+rejecting the advisory format hint. Strict `json_schema` remains fail-closed
+until its cross-provider output contract is verified.
 Explicit effort wins over the candidate's mapped default. `auto` uses each
 mapped physical candidate's default. When a physical model does not expose the
 exact requested level, Bravo uses the greatest supported level below it and

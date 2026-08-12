@@ -488,10 +488,26 @@ func inspectOpenAIChat(root map[string]any, capabilities capabilitySet) {
 	if openAIHasUnhandledReasoning(root) {
 		capabilities[capabilityReasoning] = struct{}{}
 	}
-	if structuredFormat(root["response_format"]) || structuredTextConfig(root["text"]) {
+	// OpenAI Chat json_object is a soft JSON-mode hint rather than a strict
+	// schema contract. Codex can translate it to its native JSON mode; Claude
+	// may ignore the hint while still executing the request. Keep json_schema
+	// and every future structured format fail-closed until their exact output
+	// contract has been verified end to end.
+	if strictOpenAIChatStructuredFormat(root["response_format"]) || structuredTextConfig(root["text"]) {
 		capabilities[capabilityStructuredOutput] = struct{}{}
 	}
 	inspectConversationValue(root["messages"], protocolOpenAI, capabilities)
+}
+
+func strictOpenAIChatStructuredFormat(value any) bool {
+	object, ok := value.(map[string]any)
+	if !ok || len(object) == 0 {
+		return false
+	}
+	if lowerString(object["type"]) == "json_object" {
+		return false
+	}
+	return structuredFormat(value)
 }
 
 func inspectOpenAIResponse(root map[string]any, capabilities capabilitySet) {

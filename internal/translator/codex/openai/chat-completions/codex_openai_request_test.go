@@ -1128,3 +1128,18 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 		t.Errorf("tool 'search' not found in output tools: %s", gjson.Get(result, "tools").Raw)
 	}
 }
+
+func TestResponseFormatJSONObjectBecomesNativeCodexJSONMode(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{
+		"model":"gpt-5.6-terra",
+		"messages":[{"role":"user","content":"return sync state"}],
+		"response_format":{"type":"json_object"}
+	}`)
+	out := ConvertOpenAIRequestToCodex("gpt-5.6-terra", input, false)
+
+	if got := gjson.GetBytes(out, "text.format.type").String(); got != "json_object" {
+		t.Fatalf("text.format.type = %q, want json_object. Output: %s", got, out)
+	}
+}

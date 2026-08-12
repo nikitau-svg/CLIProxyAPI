@@ -361,6 +361,8 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 		switch rft {
 		case "text":
 			out, _ = sjson.SetBytes(out, "text.format.type", "text")
+		case "json_object":
+			out, _ = sjson.SetBytes(out, "text.format.type", "json_object")
 		case "json_schema":
 			js := rf.Get("json_schema")
 			if js.Exists() {

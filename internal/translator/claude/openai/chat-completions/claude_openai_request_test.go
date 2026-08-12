@@ -459,3 +459,25 @@ func TestConvertOpenAIRequestToClaude_PartCacheControlWinsOverMessageLevel(t *te
 		t.Fatalf("part-level cache_control should win; unexpected ttl: %s", result)
 	}
 }
+
+func TestConvertOpenAIRequestToClaude_AcceptsAndIgnoresJSONObjectHint(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{
+		"model":"claude-sonnet-5",
+		"messages":[{"role":"user","content":"return sync state"}],
+		"response_format":{"type":"json_object"}
+	}`)
+	out := ConvertOpenAIRequestToClaude("claude-sonnet-5", input, false)
+	result := gjson.ParseBytes(out)
+
+	if result.Get("response_format").Exists() {
+		t.Fatalf("OpenAI-only response_format leaked to Claude: %s", out)
+	}
+	if result.Get("output_config.format").Exists() {
+		t.Fatalf("unverified strict Claude format was invented: %s", out)
+	}
+	if got := result.Get("messages.0.content.0.text").String(); got != "return sync state" {
+		t.Fatalf("message was not preserved, got %q: %s", got, out)
+	}
+}
