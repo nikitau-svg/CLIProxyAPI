@@ -159,7 +159,7 @@ func execute(raw []byte) ([]byte, error) {
 			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
+			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailureForRequest(req, failureTraces, failure)), nil
 		}
 		// A host response means the provider accepted the attempt. Keep the
 		// reservation until the next confirmed quota snapshot, even when the
@@ -194,7 +194,7 @@ func execute(raw []byte) ([]byte, error) {
 			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
-			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, failure)), nil
+			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailureForRequest(req, failureTraces, failure)), nil
 		}
 
 		response.Headers.Del("Content-Length")
@@ -228,7 +228,7 @@ func execute(raw []byte) ([]byte, error) {
 			Status:  http.StatusUnprocessableEntity,
 		}
 	}
-	return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailure(failureTraces, lastFailure)), nil
+	return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailureForRequest(req, failureTraces, lastFailure)), nil
 }
 
 func failureEnvelopeWithRouteTrace(recorder *routeTraceRecorder, failure executionFailure) []byte {

@@ -128,6 +128,23 @@ Use the new key as either an OpenAI API key or an Anthropic API key. Rotating
 immediately replaces the old key. Deleting a project invalidates its key.
 Revoked projects cannot be re-enabled or rotated.
 
+The one-time key dialog also shows two project-key endpoints. They require the
+same `brv_...` key and never expose credential identities or other projects:
+
+```text
+GET /v1/bravo/limits?format=json
+GET /v1/bravo/limits?format=text
+GET /v1/bravo/routes
+```
+
+`limits` returns confirmed provider reset windows plus project-only usage for
+the latest 30 days (daily series and provider/model breakdown). A project may
+request one fresh limits result per hour; excess calls receive `429` and
+`Retry-After`. It performs no provider request. `routes` returns the effective
+logical routes allowed by this key, their preferred/fallback order, physical
+provider/model, effort, capabilities, and whether each route comes from the
+built-in default or an operator override.
+
 ## Per-project prompt caching
 
 Each project has a collapsed **Prompt caching** section in the standard
@@ -270,11 +287,11 @@ POST  /v0/management/bravo/quotas/refresh
 Project and credential usage summaries include requests, failures, latency,
 input/output/reasoning/cache tokens, and total tokens. State is atomically
 persisted outside the credential discovery directory in
-`bravo-data/bravo-state.json`. The same schema-v2 snapshot optionally stores
+`bravo-data/bravo-state.json`. The same schema-v3 snapshot optionally stores
 active provider/auth/physical-model cooldowns with reviewed, sanitized
 provider detail. Existing snapshots without that field continue to load.
 
-Schema v2 also retains hourly analytics for 31 days and daily analytics for
+Schema v3 also retains hourly analytics for 31 days and daily analytics for
 400 days. The authenticated analytics endpoint supports project,
 subscription, provider, model, time-range, and interval filters while exposing
 only stable redacted subscription IDs. Its compact `subscription_timeline`

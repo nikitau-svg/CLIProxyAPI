@@ -76,6 +76,8 @@ const (
 func registerManagement() ([]byte, error) {
 	return okEnvelope(managementRegistrationResponse{
 		Routes: []pluginapi.ManagementRoute{
+			{Method: http.MethodGet, Path: "/bravo/project-limits", Description: "Project-key quota resets and 30-day usage."},
+			{Method: http.MethodGet, Path: "/bravo/project-routes", Description: "Project-key effective Bravo routes."},
 			{Method: http.MethodGet, Path: "/bravo/status", Description: "Bravo runtime and model status."},
 			{Method: http.MethodGet, Path: "/bravo/events", Description: "Recent Bravo execution attempts."},
 			{Method: http.MethodGet, Path: "/bravo/traces", Description: "Read persistent, redacted Bravo route traces."},
@@ -107,6 +109,12 @@ func handleManagement(raw []byte) ([]byte, error) {
 	var rpcReq rpcManagementRequest
 	if errUnmarshal := json.Unmarshal(raw, &rpcReq); errUnmarshal != nil {
 		return nil, errUnmarshal
+	}
+	if response, errLimits := handleProjectLimits(rpcReq); response != nil || errLimits != nil {
+		return response, errLimits
+	}
+	if response, errRoutes := handleProjectRoutes(rpcReq); response != nil || errRoutes != nil {
+		return response, errRoutes
 	}
 	if response, errProjects := handleProjectsManagement(rpcReq); response != nil || errProjects != nil {
 		return response, errProjects

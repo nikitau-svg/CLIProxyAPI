@@ -239,6 +239,10 @@ func createProject(req rpcManagementRequest) ([]byte, error) {
 	return managementJSON(http.StatusCreated, map[string]any{
 		"project":       smartKeyProjectView(item),
 		"plaintext_key": plaintext,
+		"project_api": map[string]any{
+			"limits": projectLimitsDocs(),
+			"routes": projectRoutesDocs(),
+		},
 	})
 }
 
@@ -428,6 +432,10 @@ func rotateProject(req rpcManagementRequest) ([]byte, error) {
 	return managementJSON(http.StatusOK, map[string]any{
 		"project":       smartKeyProjectView(updated),
 		"plaintext_key": plaintext,
+		"project_api": map[string]any{
+			"limits": projectLimitsDocs(),
+			"routes": projectRoutesDocs(),
+		},
 	})
 }
 
