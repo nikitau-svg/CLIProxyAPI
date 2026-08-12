@@ -32,7 +32,7 @@ var (
 // It extracts the model name, system instruction, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the Claude Code API.
 // The function performs comprehensive transformation including:
-// 1. Model name mapping and parameter extraction (max_tokens, top_p, etc.)
+// 1. Model name mapping and compatible parameter extraction
 // 2. Message content conversion from OpenAI to Claude Code format
 // 3. Tool call and tool result handling with proper ID mapping
 // 4. Image data conversion from OpenAI data URLs to Claude Code base64 format
@@ -137,10 +137,11 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
 
-	// Top P setting for nucleus sampling.
-	if topP := root.Get("top_p"); topP.Exists() {
-		out, _ = sjson.SetBytes(out, "top_p", topP.Float())
-	}
+	// Claude Code's current provider contract rejects OpenAI Chat top_p values
+	// below 1 and also rejects the usual temperature+top_p combination. Treat
+	// sampling controls as advisory compatibility fields: temperature was
+	// already omitted here, and top_p must be omitted as well. The original
+	// request remains intact for a later cross-provider Bravo fallback.
 
 	// Stop sequences configuration for custom termination conditions
 	if stop := root.Get("stop"); stop.Exists() {

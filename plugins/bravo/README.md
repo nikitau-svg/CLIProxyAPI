@@ -65,6 +65,10 @@ OpenAI Chat also accepts `response_format: {"type":"json_object"}`. Codex
 receives its native JSON-mode equivalent; Claude executes the request without
 rejecting the advisory format hint. Strict `json_schema` remains fail-closed
 until its cross-provider output contract is verified.
+OpenAI Chat sampling controls are also treated as advisory when routed to
+Claude Code: `temperature` and `top_p` are omitted from the translated Claude
+request because the provider rejects `top_p < 1` and mixed sampling controls.
+The original request remains available unchanged to a later Codex fallback.
 Explicit effort wins over the candidate's mapped default. `auto` uses each
 mapped physical candidate's default. When a physical model does not expose the
 exact requested level, Bravo uses the greatest supported level below it and

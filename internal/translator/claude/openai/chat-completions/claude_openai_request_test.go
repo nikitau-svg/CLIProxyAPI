@@ -44,24 +44,34 @@ func TestConvertOpenAIRequestToClaude_SanitizesToolCallIDsForClaude(t *testing.T
 	}
 }
 
-func TestConvertOpenAIRequestToClaude_DropsTemperature(t *testing.T) {
-	inputJSON := `{
-		"model": "gpt-4.1",
-		"temperature": 0.2,
-		"top_p": 0.8,
-		"messages": [
-			{"role": "user", "content": "hi"}
-		]
-	}`
-
-	result := ConvertOpenAIRequestToClaude("claude-sonnet-5", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
-
-	if resultJSON.Get("temperature").Exists() {
-		t.Fatalf("temperature should be removed")
+func TestConvertOpenAIRequestToClaude_DropsUnsupportedSamplingControls(t *testing.T) {
+	tests := []struct {
+		name        string
+		temperature string
+		topP        string
+	}{
+		{name: "top p below one", topP: `,"top_p":0.1`},
+		{name: "top p one", topP: `,"top_p":1`},
+		{name: "temperature only", temperature: `,"temperature":0.1`},
+		{name: "temperature and top p", temperature: `,"temperature":0.1`, topP: `,"top_p":0.1`},
 	}
-	if got := resultJSON.Get("top_p").Float(); got != 0.8 {
-		t.Fatalf("top_p = %v, want 0.8", got)
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			inputJSON := `{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]` +
+				testCase.temperature + testCase.topP + `}`
+			result := ConvertOpenAIRequestToClaude("claude-sonnet-5", []byte(inputJSON), false)
+			resultJSON := gjson.ParseBytes(result)
+			if resultJSON.Get("temperature").Exists() {
+				t.Fatalf("temperature should be removed: %s", result)
+			}
+			if resultJSON.Get("top_p").Exists() {
+				t.Fatalf("top_p should be removed: %s", result)
+			}
+			if got := resultJSON.Get("messages.0.content.0.text").String(); got != "hi" {
+				t.Fatalf("message = %q, want hi: %s", got, result)
+			}
+		})
 	}
 }
 
