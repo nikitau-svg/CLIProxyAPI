@@ -19,21 +19,22 @@ type managementRegistrationResponse struct {
 }
 
 type bravoStatus struct {
-	Version          string                 `json:"version"`
-	Enabled          bool                   `json:"enabled"`
-	Degraded         bool                   `json:"degraded"`
-	StatusCode       string                 `json:"status_code,omitempty"`
-	Mode             string                 `json:"mode"`
-	Prefix           string                 `json:"prefix"`
-	SmartKeyCount    int                    `json:"smart_key_count"`
-	ModelCount       int                    `json:"model_count"`
-	Models           []bravoStatusModel     `json:"models"`
-	Providers        []bravoProviderSummary `json:"providers"`
-	Cooldowns        int                    `json:"cooldowns"`
-	RecentSuccess    int                    `json:"recent_success"`
-	RecentSuperseded int                    `json:"recent_superseded"`
-	RecentFailure    int                    `json:"recent_failure"`
-	GeneratedAt      time.Time              `json:"generated_at"`
+	Version           string                   `json:"version"`
+	Enabled           bool                     `json:"enabled"`
+	Degraded          bool                     `json:"degraded"`
+	StatusCode        string                   `json:"status_code,omitempty"`
+	Mode              string                   `json:"mode"`
+	Prefix            string                   `json:"prefix"`
+	SmartKeyCount     int                      `json:"smart_key_count"`
+	ModelCount        int                      `json:"model_count"`
+	Models            []bravoStatusModel       `json:"models"`
+	Providers         []bravoProviderSummary   `json:"providers"`
+	Cooldowns         int                      `json:"cooldowns"`
+	RecentSuccess     int                      `json:"recent_success"`
+	RecentSuperseded  int                      `json:"recent_superseded"`
+	RecentFailure     int                      `json:"recent_failure"`
+	AdaptiveAllocator adaptiveShadowPublicView `json:"adaptive_allocator"`
+	GeneratedAt       time.Time                `json:"generated_at"`
 }
 
 type bravoStatusModel struct {
@@ -218,6 +219,7 @@ func collectBravoStatus(hostCallbackID string) (bravoStatus, error) {
 		return status, errUnmarshal
 	}
 	status.Providers = summarizeBravoProviders(cfg, authResp.Files, time.Now())
+	status.AdaptiveAllocator = adaptiveShadowSummary(cfg, adaptiveShadowAuthIndexes(authResp.Files), time.Now())
 	for _, provider := range status.Providers {
 		status.Cooldowns += provider.Cooldown
 	}
@@ -574,6 +576,9 @@ func redactedBravoConfig(cfg pluginConfig) map[string]any {
 		"compact_bypass_cooldown_seconds":        cfg.CompactBypassCooldownSeconds,
 		"fallback_hedge_delay_seconds":           cfg.FallbackHedgeDelaySeconds,
 		"allocator_mode":                         cfg.AllocatorMode,
+		"adaptive_allocator_mode":                cfg.AdaptiveAllocatorMode,
+		"adaptive_cooling_half_life_seconds":     cfg.AdaptiveCoolingHalfLifeSeconds,
+		"adaptive_cooling_max_age_seconds":       cfg.AdaptiveCoolingMaxAgeSeconds,
 		"quota_refresh_seconds":                  cfg.QuotaRefreshSeconds,
 		"quota_usage_refresh_seconds":            cfg.QuotaUsageRefreshSeconds,
 		"quota_usage_max_stale_seconds":          cfg.QuotaUsageMaxStaleSeconds,

@@ -118,9 +118,10 @@ func handleAllocatorManagement(req rpcManagementRequest) ([]byte, error) {
 			return projectHostFailureJSON(errViews)
 		}
 		return managementJSON(http.StatusOK, map[string]any{
-			"subscriptions": views,
-			"tariffs":       append([]tariffConfig(nil), loadedConfig().Tariffs...),
-			"quota_polling": quotaPollingSummary(),
+			"subscriptions":      views,
+			"tariffs":            append([]tariffConfig(nil), loadedConfig().Tariffs...),
+			"quota_polling":      quotaPollingSummary(),
+			"adaptive_allocator": adaptiveShadowSummary(loadedConfig(), subscriptionViewAuthIndexes(views), time.Now()),
 		})
 	case path == "/v0/management/bravo/subscriptions" && req.Method == http.MethodPatch:
 		allocatorMutationMu.Lock()
@@ -135,6 +136,16 @@ func handleAllocatorManagement(req rpcManagementRequest) ([]byte, error) {
 	default:
 		return nil, nil
 	}
+}
+
+func subscriptionViewAuthIndexes(views []subscriptionView) []string {
+	indexes := make([]string, 0, len(views))
+	for _, view := range views {
+		if value := strings.TrimSpace(view.AuthIndex); value != "" {
+			indexes = append(indexes, value)
+		}
+	}
+	return indexes
 }
 
 func quotaPollingSummary() quotaPollingView {

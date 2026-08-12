@@ -18,6 +18,8 @@ import (
 func TestProjectLimitsReturnsConfirmedResetsUsageAndRateLimit(t *testing.T) {
 	restoreUsage := isolateBravoUsageState(t)
 	defer restoreUsage()
+	resetAdaptiveShadowForTest()
+	t.Cleanup(resetAdaptiveShadowForTest)
 	resetProjectLimitsRateForTest()
 	t.Cleanup(resetProjectLimitsRateForTest)
 
@@ -50,6 +52,8 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndRateLimit(t *testing.T) {
 		ConfirmedAt: now,
 	})
 	recordAnalyticsUsage(bravoUsageState, now.Add(-24*time.Hour), "prj_limits", "claude-private", "claude", "claude-fable-5", "bravo/fable", 123)
+	recordAdaptiveShadowCommit("claude-private", 2, now)
+	recordAdaptiveShadowCommit("outside-private", 9, now)
 
 	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
 		if method != pluginabi.MethodHostAuthList {
@@ -75,6 +79,13 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndRateLimit(t *testing.T) {
 	}
 	if response.Project.ID != "prj_limits" || response.Usage.Summary.Requests != 1 || response.Usage.Summary.TotalTokens != 123 {
 		t.Fatalf("response = %#v", response)
+	}
+	if response.SchemaVersion != 2 || response.AdaptiveAllocator.Mode != "observe" ||
+		response.AdaptiveAllocator.RoutingEnforced || response.AdaptiveAllocator.AdditionalProviderRequests {
+		t.Fatalf("adaptive project view = %#v", response.AdaptiveAllocator)
+	}
+	if response.AdaptiveAllocator.TrackedAccounts != 1 || response.AdaptiveAllocator.RawPendingPercent != 2 {
+		t.Fatalf("adaptive project scope = %#v, want only allowed account aggregate", response.AdaptiveAllocator)
 	}
 	claude := findProjectLimitProvider(t, response.Providers, "claude")
 	if claude.Status == "available" || claude.AccountsTotal != 1 {
@@ -102,7 +113,7 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndRateLimit(t *testing.T) {
 	if status != http.StatusOK || !strings.Contains(headers.Get("Content-Type"), "text/plain") {
 		t.Fatalf("text status=%d headers=%v body=%s", status, headers, body)
 	}
-	for _, expected := range []string{"Проект Bravo: Limits test", "сброс через 3 ч", "Usage за 30 дней: 1 запросов"} {
+	for _, expected := range []string{"Проект Bravo: Limits test", "сброс через 3 ч", "Адаптивный allocator: observe", "дополнительных запросов к подпискам: нет", "Usage за 30 дней: 1 запросов"} {
 		if !strings.Contains(string(body), expected) {
 			t.Fatalf("text body %q does not contain %q", body, expected)
 		}
@@ -155,6 +166,10 @@ func TestProjectRoutesReturnsOnlyAllowedEffectiveRoutes(t *testing.T) {
 	}
 	if len(response.Routes) != 1 || response.Routes[0].ID != "fable" || response.Routes[0].Source != "override" {
 		t.Fatalf("routes = %#v", response.Routes)
+	}
+	if response.SchemaVersion != 2 || response.Policy.AdaptiveAllocatorMode != "observe" ||
+		response.Policy.AdaptiveRoutingEnforced || response.Policy.AdaptiveAdditionalProviderRequests {
+		t.Fatalf("adaptive route policy = %#v", response.Policy)
 	}
 	if got := response.Routes[0].Candidates; len(got) != 1 || got[0].Order != 1 || got[0].Provider != "codex" || got[0].PhysicalModel != "gpt-5.6-sol" {
 		t.Fatalf("candidates = %#v", got)

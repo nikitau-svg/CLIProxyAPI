@@ -14,9 +14,13 @@ import (
 var currentConfig atomic.Value
 
 const (
-	defaultQuotaUsageRefreshSeconds = 15 * 60
-	minimumQuotaUsageRefreshSeconds = 5 * 60
-	maximumQuotaUsageRefreshSeconds = 24 * 60 * 60
+	defaultQuotaUsageRefreshSeconds       = 15 * 60
+	minimumQuotaUsageRefreshSeconds       = 5 * 60
+	maximumQuotaUsageRefreshSeconds       = 24 * 60 * 60
+	defaultAdaptiveCoolingHalfLifeSeconds = 5 * 60
+	defaultAdaptiveCoolingMaxAgeSeconds   = 30 * 60
+	minimumAdaptiveCoolingHalfLifeSeconds = 60
+	maximumAdaptiveCoolingMaxAgeSeconds   = 24 * 60 * 60
 )
 
 // selfOnlyDefaultModels are connected Codex models with no counterpart on the
@@ -230,6 +234,9 @@ func defaultPluginConfig() pluginConfig {
 		FallbackHedgeDelaySeconds:         40,
 		StatePath:                         defaultStatePath,
 		AllocatorMode:                     "enforce",
+		AdaptiveAllocatorMode:             "observe",
+		AdaptiveCoolingHalfLifeSeconds:    defaultAdaptiveCoolingHalfLifeSeconds,
+		AdaptiveCoolingMaxAgeSeconds:      defaultAdaptiveCoolingMaxAgeSeconds,
 		QuotaRefreshSeconds:               defaultQuotaUsageRefreshSeconds,
 		QuotaUsageRefreshSeconds:          defaultQuotaUsageRefreshSeconds,
 		QuotaUsageMaxStaleSeconds:         60 * 60,
@@ -336,6 +343,30 @@ func normalizeConfig(cfg *pluginConfig) error {
 	case "off", "observe", "enforce":
 	default:
 		return fmt.Errorf("allocator_mode must be off, observe, or enforce")
+	}
+	cfg.AdaptiveAllocatorMode = strings.ToLower(strings.TrimSpace(cfg.AdaptiveAllocatorMode))
+	switch cfg.AdaptiveAllocatorMode {
+	case "":
+		cfg.AdaptiveAllocatorMode = "observe"
+	case "off", "observe":
+	case "assist", "enforce":
+		return fmt.Errorf("adaptive_allocator_mode %q is not available in the 0.9 preview; use off or observe", cfg.AdaptiveAllocatorMode)
+	default:
+		return fmt.Errorf("adaptive_allocator_mode must be off or observe in the 0.9 preview")
+	}
+	if cfg.AdaptiveCoolingHalfLifeSeconds <= 0 {
+		cfg.AdaptiveCoolingHalfLifeSeconds = defaultAdaptiveCoolingHalfLifeSeconds
+	}
+	if cfg.AdaptiveCoolingHalfLifeSeconds < minimumAdaptiveCoolingHalfLifeSeconds ||
+		cfg.AdaptiveCoolingHalfLifeSeconds > maximumAdaptiveCoolingMaxAgeSeconds {
+		return fmt.Errorf("adaptive_cooling_half_life_seconds must be between %d and %d", minimumAdaptiveCoolingHalfLifeSeconds, maximumAdaptiveCoolingMaxAgeSeconds)
+	}
+	if cfg.AdaptiveCoolingMaxAgeSeconds <= 0 {
+		cfg.AdaptiveCoolingMaxAgeSeconds = defaultAdaptiveCoolingMaxAgeSeconds
+	}
+	if cfg.AdaptiveCoolingMaxAgeSeconds < cfg.AdaptiveCoolingHalfLifeSeconds ||
+		cfg.AdaptiveCoolingMaxAgeSeconds > maximumAdaptiveCoolingMaxAgeSeconds {
+		return fmt.Errorf("adaptive_cooling_max_age_seconds must be between adaptive_cooling_half_life_seconds and %d", maximumAdaptiveCoolingMaxAgeSeconds)
 	}
 	if cfg.QuotaRefreshSeconds <= 0 {
 		cfg.QuotaRefreshSeconds = defaultQuotaUsageRefreshSeconds

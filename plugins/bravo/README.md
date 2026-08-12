@@ -143,7 +143,29 @@ request one fresh limits result per hour; excess calls receive `429` and
 `Retry-After`. It performs no provider request. `routes` returns the effective
 logical routes allowed by this key, their preferred/fallback order, physical
 provider/model, effort, capabilities, and whether each route comes from the
-built-in default or an operator override.
+built-in default or an operator override. In the 0.9 preview both responses
+also state that the adaptive allocator is `shadow_only`, has no routing
+authority, and generates no additional provider requests.
+
+## Adaptive allocator 0.9 preview
+
+The first 0.9 phase deliberately observes without enforcing. It estimates the
+possible quota cost of the request that Bravo actually attempts, then compares
+that estimate only with quota snapshots produced by the existing background
+poller. It does not wake the poller, shorten its interval, call a subscription,
+withhold an account, reorder a route, or change fallback behavior.
+
+Shadow commitments and learned uncertainty have a five-minute half-life by
+default and become exactly inert after thirty minutes. Runtime state is bounded
+and is intentionally discarded on restart. The standard Management Center,
+`/v1/bravo/limits`, and `/v1/bravo/routes` show the current mode and aggregate
+cooling state without credential identities.
+
+`adaptive_allocator_mode` accepts only `off` or `observe` in this preview.
+`assist` and `enforce` are rejected at configuration time, so a partial rollout
+cannot accidentally turn telemetry into a routing gate. The full contract and
+promotion gates are documented in
+[`docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md`](docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md).
 
 ## Per-project prompt caching
 

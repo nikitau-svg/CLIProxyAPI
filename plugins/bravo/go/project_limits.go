@@ -84,6 +84,7 @@ type projectLimitsResponse struct {
 	RateLimitSeconds  int64                      `json:"rate_limit_seconds"`
 	SnapshotFreshness string                     `json:"snapshot_freshness"`
 	Providers         []projectLimitProviderView `json:"providers"`
+	AdaptiveAllocator adaptiveShadowPublicView   `json:"adaptive_allocator"`
 	Usage             projectLimitsUsageView     `json:"usage"`
 }
 
@@ -223,7 +224,7 @@ func buildProjectLimitsResponse(
 		ProjectID: project.ID,
 	}, now)
 	return projectLimitsResponse{
-		SchemaVersion:     1,
+		SchemaVersion:     2,
 		Object:            "bravo.project_limits",
 		Project:           projectLimitsProjectView{ID: project.ID, Name: project.Name},
 		GeneratedAt:       now,
@@ -231,6 +232,7 @@ func buildProjectLimitsResponse(
 		RateLimitSeconds:  int64(projectLimitsRateInterval / time.Second),
 		SnapshotFreshness: freshness,
 		Providers:         providers,
+		AdaptiveAllocator: adaptiveShadowSummary(cfg, adaptiveShadowAuthIndexes(auths), now),
 		Usage: projectLimitsUsageView{
 			PeriodDays: int(projectLimitsUsageWindow / (24 * time.Hour)),
 			From:       analytics.From,
@@ -519,6 +521,11 @@ func renderProjectLimitsText(response projectLimitsResponse) string {
 			builder.WriteByte('\n')
 		}
 	}
+	fmt.Fprintf(&builder, "\nАдаптивный allocator: %s (%s). Маршруты не блокирует; дополнительных запросов к подпискам: нет. Оценка полностью остывает не позднее чем через %s.\n",
+		response.AdaptiveAllocator.Mode,
+		response.AdaptiveAllocator.Effect,
+		formatProjectLimitDuration(time.Duration(response.AdaptiveAllocator.CoolingMaxAgeSeconds)*time.Second),
+	)
 	fmt.Fprintf(&builder, "\nUsage за %d дней: %d запросов, %d токенов, ошибок %d (%.1f%%)\n",
 		response.Usage.PeriodDays,
 		response.Usage.Summary.Requests,

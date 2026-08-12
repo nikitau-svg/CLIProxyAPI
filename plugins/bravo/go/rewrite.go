@@ -19,6 +19,17 @@ func executionBody(req rpcExecutorRequest) []byte {
 	return bytes.Clone(req.Payload)
 }
 
+// executionBodyView is the read-only counterpart used by local request
+// classification. Callers must never retain or mutate the returned bytes.
+// Keeping this separate from executionBody avoids copying multi-megabyte
+// prompts merely to calculate shadow telemetry.
+func executionBodyView(req rpcExecutorRequest) []byte {
+	if len(req.OriginalRequest) > 0 {
+		return req.OriginalRequest
+	}
+	return req.Payload
+}
+
 func candidateModelName(item candidate) string {
 	model := strings.TrimSpace(item.Model)
 	effort := normalizeEffort(item.Effort)
