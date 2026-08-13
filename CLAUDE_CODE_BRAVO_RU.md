@@ -89,7 +89,7 @@ Skill остаётся модельным prompt: Claude Code добавляет
 любой другой модельный маршрут**:
 
 ```bash
-!curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
+!curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 ```
 
 Это работает даже тогда, когда текущий модельный контекст уже не помещается.
@@ -99,14 +99,14 @@ Skill остаётся модельным prompt: Claude Code добавляет
 Ту же проверку можно выполнить в обычном терминале вне Claude Code:
 
 ```bash
-curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" \
+curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" \
   -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 ```
 
 JSON для автоматизации:
 
 ```bash
-curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=json" \
+curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=json" \
   -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 ```
 

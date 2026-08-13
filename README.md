@@ -256,10 +256,10 @@ Completions и OpenAI Responses. Полное объяснение ключей,
 Начиная с Bravo **0.8.11**, ключ проекта получает две read-only ручки:
 
 ```bash
-curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" \
+curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" \
   -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 
-curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/routes" \
+curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/routes" \
   -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 ```
 

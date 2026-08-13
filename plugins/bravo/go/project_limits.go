@@ -118,7 +118,7 @@ func projectLimitsDocs() projectLimitsDocumentation {
 		Formats:              []string{"json", "text"},
 		RateLimitSeconds:     int64(projectLimitsRateInterval / time.Second),
 		JSONCommandTemplate:  "curl -sS '<BRAVO_BASE_URL>/v1/bravo/limits?format=json' -H 'Authorization: Bearer <PROJECT_KEY>'",
-		TextCommandTemplate:  "curl -sS '<BRAVO_BASE_URL>/v1/bravo/limits?format=text' -H 'Authorization: Bearer <PROJECT_KEY>'",
+		TextCommandTemplate:  "curl --fail-with-body -sS '<BRAVO_BASE_URL>/v1/bravo/limits?format=text' -H 'Authorization: Bearer <PROJECT_KEY>'",
 		AuthenticationHeader: "Authorization: Bearer <PROJECT_KEY>",
 	}
 }
