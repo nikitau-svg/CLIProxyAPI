@@ -186,6 +186,39 @@ func TestQuotaConsumptionHighConfidenceFlagsFableMaxAndCapacity(t *testing.T) {
 	}
 }
 
+func TestQuotaConsumptionPartialFirstHourNeverReportsPeakBelowAverage(t *testing.T) {
+	project := &quotaConsumptionProjectAccumulator{
+		ProjectID: "prj_partial",
+		Counters:  quotaProjectCounters{Commitments: 7, AttributedPercent: 3},
+		Hourly: map[string]quotaProjectCounters{
+			"2026-08-14T01:00:00Z": {Commitments: 7, AttributedPercent: 3},
+		},
+		Models: map[string]*quotaConsumptionModelAccumulator{},
+		Plans: map[string]*quotaConsumptionPlanAccumulator{
+			"x5": {
+				TariffID: "x5", Multiplier: 5,
+				Counters: quotaProjectCounters{Commitments: 7, AttributedPercent: 3},
+				Hourly: map[string]quotaProjectCounters{
+					"2026-08-14T01:00:00Z": {Commitments: 7, AttributedPercent: 3},
+				},
+			},
+		},
+	}
+
+	view := buildQuotaConsumptionProjectView(
+		&quotaConsumptionWindowAccumulator{Provider: "claude", Kind: pluginapi.HostAuthQuotaWindowKindSession},
+		project, 3, 0.25, "collecting",
+	)
+
+	if view.AveragePPPerHour != 12 || view.PeakHourlyPP != 12 {
+		t.Fatalf("partial-hour average/peak = %.2f/%.2f, want 12/12", view.AveragePPPerHour, view.PeakHourlyPP)
+	}
+	if len(view.Plans) != 1 || view.Plans[0].EstimatedSubscriptionsAtAveragePace != 0.6 ||
+		view.Plans[0].EstimatedSubscriptionsAtPeakPace != 0.6 {
+		t.Fatalf("partial-hour capacity estimate = %#v", view.Plans)
+	}
+}
+
 func TestQuotaConsumptionCapacityUsesEachProjectsAllowedPool(t *testing.T) {
 	restoreUsage := isolateBravoUsageState(t)
 	defer restoreUsage()
