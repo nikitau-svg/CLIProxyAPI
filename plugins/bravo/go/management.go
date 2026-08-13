@@ -19,21 +19,22 @@ type managementRegistrationResponse struct {
 }
 
 type bravoStatus struct {
-	Version          string                 `json:"version"`
-	Enabled          bool                   `json:"enabled"`
-	Degraded         bool                   `json:"degraded"`
-	StatusCode       string                 `json:"status_code,omitempty"`
-	Mode             string                 `json:"mode"`
-	Prefix           string                 `json:"prefix"`
-	SmartKeyCount    int                    `json:"smart_key_count"`
-	ModelCount       int                    `json:"model_count"`
-	Models           []bravoStatusModel     `json:"models"`
-	Providers        []bravoProviderSummary `json:"providers"`
-	Cooldowns        int                    `json:"cooldowns"`
-	RecentSuccess    int                    `json:"recent_success"`
-	RecentSuperseded int                    `json:"recent_superseded"`
-	RecentFailure    int                    `json:"recent_failure"`
-	GeneratedAt      time.Time              `json:"generated_at"`
+	Version           string                   `json:"version"`
+	Enabled           bool                     `json:"enabled"`
+	Degraded          bool                     `json:"degraded"`
+	StatusCode        string                   `json:"status_code,omitempty"`
+	Mode              string                   `json:"mode"`
+	Prefix            string                   `json:"prefix"`
+	SmartKeyCount     int                      `json:"smart_key_count"`
+	ModelCount        int                      `json:"model_count"`
+	Models            []bravoStatusModel       `json:"models"`
+	Providers         []bravoProviderSummary   `json:"providers"`
+	Cooldowns         int                      `json:"cooldowns"`
+	RecentSuccess     int                      `json:"recent_success"`
+	RecentSuperseded  int                      `json:"recent_superseded"`
+	RecentFailure     int                      `json:"recent_failure"`
+	AdaptiveAllocator adaptiveShadowPublicView `json:"adaptive_allocator"`
+	GeneratedAt       time.Time                `json:"generated_at"`
 }
 
 type bravoStatusModel struct {
@@ -93,6 +94,7 @@ func registerManagement() ([]byte, error) {
 			{Method: http.MethodPut, Path: "/bravo/routes", Description: "Validate, preview, and persist one Bravo route override."},
 			{Method: http.MethodPost, Path: "/bravo/routes/reset", Description: "Reset one Bravo route to its configured default."},
 			{Method: http.MethodGet, Path: "/bravo/subscriptions", Description: "List redacted subscription policy, quota, and usage views."},
+			{Method: http.MethodGet, Path: "/bravo/adaptive-audit", Description: "Read the bounded, privacy-safe adaptive allocator shadow audit."},
 			{Method: http.MethodPatch, Path: "/bravo/subscriptions", Description: "Update one subscription policy by auth_index."},
 			{Method: http.MethodPatch, Path: "/bravo/tariffs", Description: "Update one allocator tariff."},
 			{Method: http.MethodPost, Path: "/bravo/quotas/refresh", Description: "Refresh confirmed subscription quotas."},
@@ -118,6 +120,9 @@ func handleManagement(raw []byte) ([]byte, error) {
 	}
 	if response, errProjects := handleProjectsManagement(rpcReq); response != nil || errProjects != nil {
 		return response, errProjects
+	}
+	if response, errAudit := handleAdaptiveShadowAuditManagement(rpcReq); response != nil || errAudit != nil {
+		return response, errAudit
 	}
 	if response, errAllocator := handleAllocatorManagement(rpcReq); response != nil || errAllocator != nil {
 		return response, errAllocator
@@ -218,6 +223,7 @@ func collectBravoStatus(hostCallbackID string) (bravoStatus, error) {
 		return status, errUnmarshal
 	}
 	status.Providers = summarizeBravoProviders(cfg, authResp.Files, time.Now())
+	status.AdaptiveAllocator = adaptiveShadowSummary(cfg, adaptiveShadowAuthIndexes(authResp.Files), time.Now())
 	for _, provider := range status.Providers {
 		status.Cooldowns += provider.Cooldown
 	}
@@ -574,6 +580,9 @@ func redactedBravoConfig(cfg pluginConfig) map[string]any {
 		"compact_bypass_cooldown_seconds":        cfg.CompactBypassCooldownSeconds,
 		"fallback_hedge_delay_seconds":           cfg.FallbackHedgeDelaySeconds,
 		"allocator_mode":                         cfg.AllocatorMode,
+		"adaptive_allocator_mode":                cfg.AdaptiveAllocatorMode,
+		"adaptive_cooling_half_life_seconds":     cfg.AdaptiveCoolingHalfLifeSeconds,
+		"adaptive_cooling_max_age_seconds":       cfg.AdaptiveCoolingMaxAgeSeconds,
 		"quota_refresh_seconds":                  cfg.QuotaRefreshSeconds,
 		"quota_usage_refresh_seconds":            cfg.QuotaUsageRefreshSeconds,
 		"quota_usage_max_stale_seconds":          cfg.QuotaUsageMaxStaleSeconds,

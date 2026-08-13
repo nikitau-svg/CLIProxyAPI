@@ -7,8 +7,16 @@
 - The limits response contains only locally persisted, provider-confirmed quota
   windows and project-local 30-day analytics. Reading it performs no provider
   I/O.
-- A project receives at most one fresh limits response per hour. Repeated calls
-  return typed `429`, `Retry-After`, and `next_allowed_at`.
+- A project receives a fresh local limits response at most once every five
+  minutes. Repeated calls return the cached response with HTTP 200 and perform
+  no provider I/O.
+- The limits response expresses project consumption in subscription-quota
+  percentage points, separately for session, weekly and model-weekly windows.
+  It includes average/peak pace, physical/logical model, effort and tariff
+  dimensions, plus confidence-gated subscription-capacity advice.
+- Management analytics may rank projects by attributed share of each independent
+  pool window. Provider drop not safely attributable to a local project remains
+  `external_or_estimator_gap`.
 - Route output is limited by the project model allowlist and contains the
   effective preferred/fallback candidate order after overrides. It never
   contains credential identities.
@@ -23,7 +31,8 @@
 2. Confirm 30-day usage summary, daily series, provider and model breakdown.
 3. Confirm account names, emails, auth indices, outside-pool credentials, raw
    provider errors, and key material are absent.
-4. Confirm one-hour rate limiting and exact `Retry-After`.
+4. Confirm five-minute cached HTTP 200 behavior and zero provider calls on both
+   cache miss and hit.
 5. Confirm model allowlist and effective override order in project routes.
 6. Confirm both public routes use ordinary API authentication and fail closed
    when Bravo is unavailable.
@@ -31,6 +40,11 @@
    persisting plaintext project keys.
 8. Run the Bravo full suite, race suite, core API tests, UI tests/typecheck/
    production build, and `git diff --check`.
+9. Reconcile deterministic provider drops against two projects, an anonymous
+   local commitment and external residual; confirm windows remain independent.
+10. Confirm reset/increase intervals are skipped, project rankings and model /
+    effort shares are stable, raw credential identities never leave management
+    state, and persisted aggregates survive restart.
 
 ## Isolated canary
 

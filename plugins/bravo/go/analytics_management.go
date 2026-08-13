@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 const (
@@ -124,6 +126,7 @@ type analyticsResponse struct {
 	CoverageFrom          *time.Time                           `json:"coverage_from"`
 	BreakdownCoverageFrom *time.Time                           `json:"breakdown_coverage_from"`
 	Summary               analyticsMetrics                     `json:"summary"`
+	QuotaConsumption      quotaConsumptionAnalyticsView        `json:"quota_consumption"`
 	Series                []analyticsSeriesPoint               `json:"series"`
 	SubscriptionTimeline  []analyticsSubscriptionTimelinePoint `json:"subscription_timeline"`
 	Breakdown             analyticsBreakdown                   `json:"breakdown"`
@@ -146,8 +149,12 @@ func handleAnalyticsManagement(req rpcManagementRequest) ([]byte, error) {
 	if errQuery != nil {
 		return analyticsFailureJSON(http.StatusBadRequest, "bravo_analytics_query_invalid", errQuery.Error())
 	}
-	presentations := analyticsSubscriptionPresentations(req.HostCallbackID)
-	return managementJSON(http.StatusOK, collectAnalyticsWithPresentations(query, time.Now().UTC(), presentations))
+	presentations, auths := analyticsSubscriptionContext(req.HostCallbackID)
+	response := collectAnalyticsWithPresentations(query, time.Now().UTC(), presentations)
+	if len(auths) > 0 {
+		annotateProjectQuotaCapacity(loadedConfig(), auths, &response.QuotaConsumption)
+	}
+	return managementJSON(http.StatusOK, response)
 }
 
 func parseAnalyticsQuery(values url.Values, now time.Time) (analyticsQuery, error) {
@@ -356,6 +363,7 @@ func collectAnalyticsWithPresentations(
 		CoverageFrom:          coverage,
 		BreakdownCoverageFrom: breakdownCoverage,
 		Summary:               analyticsMetricsFromCounters(summary),
+		QuotaConsumption:      collectQuotaConsumptionLocked(state, query, generatedAt, true),
 		Series:                buildAnalyticsSeries(selected, query),
 		SubscriptionTimeline:  buildAnalyticsSubscriptionTimeline(state, query, presentations),
 		Breakdown:             buildAnalyticsBreakdown(state, query, presentations),
@@ -363,15 +371,15 @@ func collectAnalyticsWithPresentations(
 	}
 }
 
-func analyticsSubscriptionPresentations(hostCallbackID string) map[string]subscriptionPresentation {
+func analyticsSubscriptionContext(hostCallbackID string) (map[string]subscriptionPresentation, []pluginapi.HostAuthFileEntry) {
 	if strings.TrimSpace(hostCallbackID) == "" {
-		return nil
+		return nil, nil
 	}
 	auths, errList := listHostAuths(hostCallbackID)
 	if errList != nil {
 		// Analytics remains available if host metadata is temporarily unavailable.
 		// The redacted subscription ID still gives clients a stable join key.
-		return nil
+		return nil, nil
 	}
 	presentations := make(map[string]subscriptionPresentation, len(auths))
 	for _, auth := range auths {
@@ -381,7 +389,7 @@ func analyticsSubscriptionPresentations(hostCallbackID string) map[string]subscr
 		}
 		presentations[authIndex] = subscriptionPresentationFor(auth, quotaSnapshot(authIndex))
 	}
-	return presentations
+	return presentations, auths
 }
 
 func selectAnalyticsAggregates(state *persistedUsageState, query analyticsQuery) []*usageAggregate {

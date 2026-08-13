@@ -76,9 +76,25 @@ Code.
 /status
 ```
 
-## Команда `/bravo-limits`
+## Лимиты прямо в Claude Code
 
-Начиная с Bravo 0.8.11 можно добавить локальный skill:
+Самый дешёвый и надёжный способ — встроенный shell mode Claude Code. Введите
+строку, начинающуюся с `!`: она выполняется локально и **не вызывает Claude,
+Codex или любой другой модельный маршрут**:
+
+```bash
+!curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
+```
+
+Это работает даже тогда, когда текущий модельный контекст уже не помещается.
+Вывод будет добавлен в transcript, поэтому перед следующим обычным запросом
+всё равно может потребоваться встроенная команда `/compact`.
+
+Если важна именно короткая команда `/bravo-limits`, запускайте skill только в
+изолированном fork-контексте на Haiku. Обычный inline skill повторно отправляет
+модели всю текущую переписку и на большой сессии способен получить
+`bravo_context_window_exceeded`. Вариант ниже не получает историю основной
+сессии, но расходует один небольшой вызов Haiku для возврата текста:
 
 ```bash
 mkdir -p ~/.claude/skills/bravo-limits
@@ -88,38 +104,48 @@ cat > ~/.claude/skills/bravo-limits/SKILL.md <<'EOF'
 name: bravo-limits
 description: Показывает текущие лимиты и время их сброса для активного проекта Bravo
 disable-model-invocation: true
+context: fork
+agent: Explore
+model: haiku
+effort: low
+background: false
+allowed-tools: Bash(curl *)
 ---
 
-Покажи пользователю следующий статус лимитов без пересказа и домыслов:
+Верни пользователю следующий статус дословно, без анализа, пересказа и дополнительных действий:
 
-!`curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"`
+!`curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"`
 EOF
 ```
 
-После этого пользователь вызывает:
+`background: false` требует Claude Code 2.1.218 или новее. При настройке
+`ANTHROPIC_DEFAULT_HAIKU_MODEL=bravo/haiku` поле `model: haiku` использует
+именно маршрут `bravo/haiku`.
 
-```text
-/bravo-limits
-```
-
-Ручной текстовый запрос эквивалентен skill:
+Ту же проверку можно выполнить в обычном терминале вне Claude Code:
 
 ```bash
-curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" \
+curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" \
   -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 ```
 
 JSON для автоматизации:
 
 ```bash
-curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=json" \
+curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=json" \
   -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 ```
 
 Ответ содержит только текущий проект: доступность провайдеров, подтверждённые
 окна и время сброса, а в JSON — usage за последние 30 дней с дневным рядом и
-разбивкой по provider/model. Свежий результат разрешён один раз в час на
-проект; повторный запрос получает `429` и время следующего обновления.
+разбивкой по provider/model. В ветке адаптивного preview также возвращается
+`quota_consumption`: примерный расход проектом процентных пунктов каждого
+отдельного окна подписки, средний и пиковый темп, доля пула, физические модели,
+effort и осторожная оценка требуемой ёмкости. Пять часов, неделя и модельное
+окно не складываются между собой; при недостатке наблюдений ответ прямо пишет,
+что рекомендации ещё рано применять. Свежий снимок собирается один раз в 5 минут на проект;
+повторный запрос получает сохранённый результат с `HTTP 200` и не запускает
+никаких дополнительных обращений к подпискам.
 
 ## Прозрачность маршрутов
 
@@ -127,7 +153,7 @@ curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=json" \
 без management key:
 
 ```bash
-curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/routes" \
+curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/routes" \
   -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 ```
 
@@ -150,7 +176,8 @@ curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/routes" \
 2. задайте его allowed subscription pool и model allowlist;
 3. безопасно передайте сотруднику base URL и показанный один раз `brv_...`;
 4. отправьте ему этот документ и предложите проверить `/v1/bravo/routes`;
-5. после установки skill предложите выполнить `/bravo-limits`;
+5. предложите проверить лимиты через прямой shell mode `!curl ...` либо через
+   изолированный `/bravo-limits` на Haiku;
 6. при увольнении или компрометации перевыпустите/отключите только его ключ.
 
 Так сотрудник самостоятельно видит, на каких логических моделях строить CLI,

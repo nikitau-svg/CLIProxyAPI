@@ -15,11 +15,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-func TestProjectLimitsReturnsConfirmedResetsUsageAndRateLimit(t *testing.T) {
+func TestProjectLimitsReturnsConfirmedResetsUsageAndHourlyCache(t *testing.T) {
 	restoreUsage := isolateBravoUsageState(t)
 	defer restoreUsage()
-	resetProjectLimitsRateForTest()
-	t.Cleanup(resetProjectLimitsRateForTest)
+	resetAdaptiveShadowForTest()
+	t.Cleanup(resetAdaptiveShadowForTest)
+	resetProjectLimitsCacheForTest()
+	t.Cleanup(resetProjectLimitsCacheForTest)
 
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
 	previousNow := projectLimitsNow
@@ -50,11 +52,15 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndRateLimit(t *testing.T) {
 		ConfirmedAt: now,
 	})
 	recordAnalyticsUsage(bravoUsageState, now.Add(-24*time.Hour), "prj_limits", "claude-private", "claude", "claude-fable-5", "bravo/fable", 123)
+	recordAdaptiveShadowCommit("claude-private", 2, now)
+	recordAdaptiveShadowCommit("outside-private", 9, now)
 
+	hostCalls := 0
 	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
 		if method != pluginabi.MethodHostAuthList {
 			t.Fatalf("unexpected host method %q", method)
 		}
+		hostCalls++
 		return mustBravoJSON(t, hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{
 			{AuthIndex: "claude-private", Provider: "claude", Name: "must-not-leak@example.test"},
 			{AuthIndex: "codex-private", Provider: "codex", Name: "also-secret@example.test"},
@@ -69,12 +75,25 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndRateLimit(t *testing.T) {
 	if !strings.Contains(headers.Get("Content-Type"), "application/json") {
 		t.Fatalf("content type = %q", headers.Get("Content-Type"))
 	}
+	if headers.Get("X-Bravo-Cache") != "MISS" {
+		t.Fatalf("cache header = %q, want MISS", headers.Get("X-Bravo-Cache"))
+	}
 	var response projectLimitsResponse
 	if errUnmarshal := json.Unmarshal(body, &response); errUnmarshal != nil {
 		t.Fatal(errUnmarshal)
 	}
 	if response.Project.ID != "prj_limits" || response.Usage.Summary.Requests != 1 || response.Usage.Summary.TotalTokens != 123 {
 		t.Fatalf("response = %#v", response)
+	}
+	if response.Cached || response.NextRefreshAt != now.Add(5*time.Minute) || response.RefreshSeconds != 300 {
+		t.Fatalf("fresh cache metadata = %#v", response)
+	}
+	if response.SchemaVersion != 3 || response.AdaptiveAllocator.Mode != "observe" ||
+		response.AdaptiveAllocator.RoutingEnforced || response.AdaptiveAllocator.AdditionalProviderRequests {
+		t.Fatalf("adaptive project view = %#v", response.AdaptiveAllocator)
+	}
+	if response.AdaptiveAllocator.TrackedAccounts != 1 || response.AdaptiveAllocator.RawPendingPercent != 2 {
+		t.Fatalf("adaptive project scope = %#v, want only allowed account aggregate", response.AdaptiveAllocator)
 	}
 	claude := findProjectLimitProvider(t, response.Providers, "claude")
 	if claude.Status == "available" || claude.AccountsTotal != 1 {
@@ -92,23 +111,84 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndRateLimit(t *testing.T) {
 		t.Fatalf("response leaked account identity: %s", raw)
 	}
 
-	status, headers, body = callProjectKeyEndpoint(t, http.MethodGet, projectLimitsPath, plaintext, nil)
-	if status != http.StatusTooManyRequests || headers.Get("Retry-After") != "3600" || !strings.Contains(string(body), "bravo_project_limits_rate_limited") {
-		t.Fatalf("rate limit status=%d headers=%v body=%s", status, headers, body)
-	}
-
-	resetProjectLimitsRateForTest()
 	status, headers, body = callProjectKeyEndpoint(t, http.MethodGet, projectLimitsPath, plaintext, url.Values{"format": {"text"}})
 	if status != http.StatusOK || !strings.Contains(headers.Get("Content-Type"), "text/plain") {
 		t.Fatalf("text status=%d headers=%v body=%s", status, headers, body)
 	}
-	for _, expected := range []string{"Проект Bravo: Limits test", "сброс через 3 ч", "Usage за 30 дней: 1 запросов"} {
+	if headers.Get("X-Bravo-Cache") != "HIT" || hostCalls != 1 {
+		t.Fatalf("cached request headers=%v hostCalls=%d", headers, hostCalls)
+	}
+	for _, expected := range []string{"Проект Bravo: Limits test", "Источник: кэш", "всегда возвращает этот результат с HTTP 200", "сброс через 3 ч", "Адаптивный allocator: observe", "дополнительных запросов к подпискам: нет", "Usage за 30 дней: 1 запросов"} {
 		if !strings.Contains(string(body), expected) {
 			t.Fatalf("text body %q does not contain %q", body, expected)
 		}
 	}
 	if raw := string(body); strings.Contains(raw, "private") || strings.Contains(raw, "example.test") {
 		t.Fatalf("text response leaked account identity: %s", raw)
+	}
+	status, headers, body = callProjectKeyEndpoint(t, http.MethodGet, projectLimitsPath, plaintext, url.Values{"format": {"json"}})
+	if status != http.StatusOK || headers.Get("X-Bravo-Cache") != "HIT" || hostCalls != 1 {
+		t.Fatalf("cached JSON status=%d headers=%v hostCalls=%d body=%s", status, headers, hostCalls, body)
+	}
+	if errUnmarshal := json.Unmarshal(body, &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !response.Cached || !response.GeneratedAt.Equal(now) {
+		t.Fatalf("cached JSON response = %#v", response)
+	}
+
+	now = now.Add(5*time.Minute + time.Second)
+	status, headers, body = callProjectKeyEndpoint(t, http.MethodGet, projectLimitsPath, plaintext, url.Values{"format": {"json"}})
+	if status != http.StatusOK || headers.Get("X-Bravo-Cache") != "MISS" || hostCalls != 2 {
+		t.Fatalf("refreshed request status=%d headers=%v hostCalls=%d body=%s", status, headers, hostCalls, body)
+	}
+	if errUnmarshal := json.Unmarshal(body, &response); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if response.Cached || !response.GeneratedAt.Equal(now) {
+		t.Fatalf("refreshed response = %#v", response)
+	}
+}
+
+func TestProjectLimitsRejectsInvalidFormatBeforeHostIO(t *testing.T) {
+	resetProjectLimitsCacheForTest()
+	t.Cleanup(resetProjectLimitsCacheForTest)
+	const plaintext = "brv_project_limits_invalid_format"
+	cfg := projectLimitsTestConfig(t, plaintext)
+	previousConfig := loadedConfig()
+	currentConfig.Store(cfg)
+	t.Cleanup(func() { currentConfig.Store(previousConfig) })
+
+	hostCalls := 0
+	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
+		hostCalls++
+		return nil, nil
+	})
+	status, _, body := callProjectKeyEndpoint(t, http.MethodGet, projectLimitsPath, plaintext, url.Values{"format": {"xml"}})
+	if status != http.StatusBadRequest || !strings.Contains(string(body), "bravo_project_limits_format_invalid") {
+		t.Fatalf("status=%d body=%s", status, body)
+	}
+	if hostCalls != 0 {
+		t.Fatalf("invalid format performed %d host calls", hostCalls)
+	}
+}
+
+func TestProjectLimitsCacheCoalescesConcurrentRefresh(t *testing.T) {
+	resetProjectLimitsCacheForTest()
+	t.Cleanup(resetProjectLimitsCacheForTest)
+	now := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+
+	if _, hit, wait := lookupProjectLimitsCache("same-project", now); hit || wait != nil {
+		t.Fatalf("first lookup hit=%v wait=%v", hit, wait != nil)
+	}
+	if _, hit, wait := lookupProjectLimitsCache("same-project", now); hit || wait == nil {
+		t.Fatalf("concurrent lookup hit=%v wait=%v", hit, wait != nil)
+	}
+	response := projectLimitsResponse{Object: "bravo.project_limits", GeneratedAt: now}
+	finishProjectLimitsCache("same-project", response, now.Add(5*time.Minute), true)
+	got, hit, wait := lookupProjectLimitsCache("same-project", now)
+	if !hit || wait != nil || got.GeneratedAt != now {
+		t.Fatalf("cached lookup got=%#v hit=%v wait=%v", got, hit, wait != nil)
 	}
 }
 
@@ -155,6 +235,10 @@ func TestProjectRoutesReturnsOnlyAllowedEffectiveRoutes(t *testing.T) {
 	}
 	if len(response.Routes) != 1 || response.Routes[0].ID != "fable" || response.Routes[0].Source != "override" {
 		t.Fatalf("routes = %#v", response.Routes)
+	}
+	if response.SchemaVersion != 2 || response.Policy.AdaptiveAllocatorMode != "observe" ||
+		response.Policy.AdaptiveRoutingEnforced || response.Policy.AdaptiveAdditionalProviderRequests {
+		t.Fatalf("adaptive route policy = %#v", response.Policy)
 	}
 	if got := response.Routes[0].Candidates; len(got) != 1 || got[0].Order != 1 || got[0].Provider != "codex" || got[0].PhysicalModel != "gpt-5.6-sol" {
 		t.Fatalf("candidates = %#v", got)

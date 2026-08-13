@@ -10,8 +10,62 @@ import (
 const bravoTraceIDHeader = "X-Bravo-Trace-Id"
 
 type routeTraceRecorder struct {
-	trace    routeTrace
-	finished bool
+	trace                          routeTrace
+	finished                       bool
+	adaptiveAuditDisabled          bool
+	adaptiveAuditAttempts          []adaptiveShadowAuditAttempt
+	adaptiveAuditExecutionAttempts int
+	adaptiveAuditOmittedAttempts   int
+}
+
+func (recorder *routeTraceRecorder) disableAdaptiveAudit() {
+	if recorder == nil || recorder.finished {
+		return
+	}
+	recorder.adaptiveAuditDisabled = true
+}
+
+func (recorder *routeTraceRecorder) captureAdaptiveAuditAttempt(
+	attempt executionAttempt,
+	started time.Time,
+	status int,
+	success bool,
+	outcome string,
+	errorCode string,
+) {
+	if recorder == nil || recorder.finished || recorder.adaptiveAuditDisabled ||
+		!attempt.AdaptiveShadow || !attempt.AdaptiveProviderDispatched {
+		return
+	}
+	recorder.adaptiveAuditExecutionAttempts++
+	if len(recorder.adaptiveAuditAttempts) >= adaptiveShadowAuditAttemptsPerRecord {
+		recorder.adaptiveAuditOmittedAttempts++
+		return
+	}
+	recorder.adaptiveAuditAttempts = append(recorder.adaptiveAuditAttempts, adaptiveShadowAuditAttempt{
+		Provider:            normalizeProvider(attempt.Candidate.Provider),
+		Model:               strings.TrimSpace(attempt.Candidate.Model),
+		Primary:             attempt.Primary,
+		Decision:            attempt.AdaptiveShadowDecision,
+		EstimateConfidence:  attempt.AdaptiveEstimateConfidence,
+		ReservationPercent:  attempt.AdaptiveReservationPercent,
+		PendingPercent:      attempt.AdaptiveShadowPendingPercent,
+		SafeHeadroomBefore:  attempt.AdaptiveShadowHeadroomBefore,
+		SafeHeadroomAfter:   attempt.AdaptiveShadowHeadroomAfter,
+		Outcome:             outcome,
+		Status:              status,
+		Success:             success,
+		ProviderAcceptance:  adaptiveShadowProviderAcceptance(attempt),
+		LatencyMilliseconds: time.Since(started).Milliseconds(),
+		ErrorCode:           errorCode,
+	})
+}
+
+func adaptiveShadowProviderAcceptance(attempt executionAttempt) string {
+	if attempt.AdaptiveProviderAccepted {
+		return "confirmed"
+	}
+	return "unknown"
 }
 
 func newRouteTraceRecorder(
@@ -137,6 +191,7 @@ func (recorder *routeTraceRecorder) failureWithCommit(
 	if recorder == nil || recorder.finished {
 		return
 	}
+	recorder.captureAdaptiveAuditAttempt(attempt, started, status, false, "failed", failure.Code)
 	decision := ""
 	if committed {
 		decision = "stop_committed"
@@ -178,6 +233,7 @@ func (recorder *routeTraceRecorder) success(
 	if recorder == nil || recorder.finished {
 		return
 	}
+	recorder.captureAdaptiveAuditAttempt(attempt, started, status, true, "succeeded", "")
 	recorder.appendAttempt(routeTraceAttempt{
 		At:              started.UTC(),
 		Provider:        normalizeProvider(attempt.Candidate.Provider),
@@ -198,6 +254,7 @@ func (recorder *routeTraceRecorder) superseded(attempt executionAttempt, started
 	if recorder == nil || recorder.finished {
 		return
 	}
+	recorder.captureAdaptiveAuditAttempt(attempt, started, 499, false, "superseded", "bravo_attempt_superseded")
 	recorder.appendAttempt(routeTraceAttempt{
 		At:              started.UTC(),
 		Provider:        normalizeProvider(attempt.Candidate.Provider),
@@ -249,6 +306,23 @@ func (recorder *routeTraceRecorder) finish(success bool, status int, failure exe
 		localized := clientExecutionFailureRU(failure)
 		recorder.trace.FinalCode = localized.Code
 		recorder.trace.FinalMessage = localized.Message
+	}
+	if !recorder.adaptiveAuditDisabled && len(recorder.adaptiveAuditAttempts) > 0 {
+		enqueueAdaptiveShadowAudit(adaptiveShadowAuditRecord{
+			SchemaVersion:              adaptiveShadowAuditSchemaVersion,
+			At:                         recorder.trace.CompletedAt,
+			TraceID:                    recorder.trace.TraceID,
+			LogicalModel:               recorder.trace.LogicalModel,
+			Stream:                     recorder.trace.Stream,
+			Success:                    success,
+			Status:                     status,
+			ActualExecutionAttempts:    recorder.adaptiveAuditExecutionAttempts,
+			OmittedAttempts:            recorder.adaptiveAuditOmittedAttempts,
+			FallbackUsed:               recorder.adaptiveAuditExecutionAttempts > 1,
+			RoutingEnforced:            false,
+			AdditionalProviderRequests: 0,
+			Attempts:                   recorder.adaptiveAuditAttempts,
+		})
 	}
 	if success {
 		bravoRouteTraces.append(recorder.trace)

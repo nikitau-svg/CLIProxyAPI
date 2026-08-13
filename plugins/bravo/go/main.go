@@ -117,6 +117,7 @@ func cliproxyPluginShutdown() {
 	quotaPollingConfigured.Store(false)
 	stopQuotaPolling()
 	quotaRefreshRuntimeWG.Wait()
+	closeAdaptiveShadowAuditStore()
 	flushUsageState()
 }
 
@@ -174,6 +175,9 @@ func pluginRegistration() registration {
 				{Name: "fallback_hedge_delay_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Delay before one cross-provider streaming-bootstrap hedge. Zero disables hedging."},
 				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "Private persistent Bravo usage and quota snapshot."},
 				{Name: "allocator_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Allocator mode: off, observe, or enforce."},
+				{Name: "adaptive_allocator_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Adaptive 0.9 preview: off or observe. Observe never changes routing and adds no provider requests."},
+				{Name: "adaptive_cooling_half_life_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Half-life for shadow commitments and learned uncertainty."},
+				{Name: "adaptive_cooling_max_age_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Hard maximum age after which shadow state has fully cooled."},
 				{Name: "quota_refresh_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Confirmed quota cache lifetime."},
 				{Name: "quota_usage_refresh_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Provider-confirmed usage refresh interval."},
 				{Name: "quota_usage_max_stale_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum age for stale quota to authorize secondary routing."},

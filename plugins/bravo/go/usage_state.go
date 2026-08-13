@@ -138,6 +138,9 @@ type persistedUsageState struct {
 	ProjectSubscriptionModelTotals map[string]*projectSubscriptionModelUsageAggregate `json:"project_subscription_model_totals"`
 	Quotas                         map[string]*credentialQuotaState                   `json:"quotas"`
 	Cooldowns                      map[string]*persistedCooldownEntry                 `json:"cooldowns,omitempty"`
+	QuotaObservations              map[string]*quotaObservationUsageAggregate         `json:"quota_observations,omitempty"`
+	QuotaProjectAttributions       map[string]*quotaProjectUsageAggregate             `json:"quota_project_attributions,omitempty"`
+	QuotaAttributionStartedAt      time.Time                                          `json:"quota_attribution_started_at,omitempty"`
 	DimensionalStartedAt           time.Time                                          `json:"dimensional_started_at,omitempty"`
 	UpdatedAt                      time.Time                                          `json:"updated_at,omitempty"`
 }
@@ -163,6 +166,8 @@ func newPersistedUsageState() persistedUsageState {
 		ProjectSubscriptionModelTotals: make(map[string]*projectSubscriptionModelUsageAggregate),
 		Quotas:                         make(map[string]*credentialQuotaState),
 		Cooldowns:                      make(map[string]*persistedCooldownEntry),
+		QuotaObservations:              make(map[string]*quotaObservationUsageAggregate),
+		QuotaProjectAttributions:       make(map[string]*quotaProjectUsageAggregate),
 	}
 }
 
@@ -323,6 +328,7 @@ func normalizePersistedUsageState(state *persistedUsageState) {
 	if state.Quotas == nil {
 		state.Quotas = make(map[string]*credentialQuotaState)
 	}
+	normalizeQuotaConsumptionState(state)
 	normalizedCooldowns := make(map[string]*persistedCooldownEntry, len(state.Cooldowns))
 	for _, persisted := range state.Cooldowns {
 		entry, ok := runtimeCooldownFromPersisted(persisted)
@@ -417,6 +423,7 @@ func prunePersistedUsageState(state *persistedUsageState, reference time.Time) {
 			pruneUsageAggregate(&aggregate.Usage, reference)
 		}
 	}
+	pruneQuotaConsumptionState(state, reference)
 	for key, entry := range state.Cooldowns {
 		if entry == nil || !entry.Until.After(reference) {
 			delete(state.Cooldowns, key)

@@ -138,12 +138,63 @@ GET /v1/bravo/routes
 ```
 
 `limits` returns confirmed provider reset windows plus project-only usage for
-the latest 30 days (daily series and provider/model breakdown). A project may
-request one fresh limits result per hour; excess calls receive `429` and
-`Retry-After`. It performs no provider request. `routes` returns the effective
-logical routes allowed by this key, their preferred/fallback order, physical
-provider/model, effort, capabilities, and whether each route comes from the
-built-in default or an operator override.
+the latest 30 days (daily series and provider/model breakdown). A project gets
+one fresh limits result every five minutes; repeated calls receive the cached
+snapshot with HTTP 200 and `cached: true`. It performs no provider request.
+`routes` returns the effective logical routes allowed by this key, their
+preferred/fallback order, physical provider/model, effort, capabilities, and
+whether each route comes from the built-in default or an operator override. In
+the 0.9 preview both responses also state that the adaptive allocator is
+`shadow_only`, has no routing
+authority, and generates no additional provider requests.
+
+## Adaptive allocator 0.9 preview
+
+The first 0.9 phase deliberately observes without enforcing. It estimates the
+possible quota cost of the request that Bravo actually attempts, then compares
+that estimate only with quota snapshots produced by the existing background
+poller. It does not wake the poller, shorten its interval, call a subscription,
+withhold an account, reorder a route, or change fallback behavior.
+
+Shadow commitments and learned uncertainty have a five-minute half-life by
+default and become exactly inert after thirty minutes. Runtime state is bounded
+and is intentionally discarded on restart. The standard Management Center,
+`/v1/bravo/limits`, and `/v1/bravo/routes` show the current mode and aggregate
+cooling state without credential identities.
+
+Every real inference attempt also feeds a separate privacy-safe shadow audit.
+The request path performs only a non-blocking enqueue; JSON encoding, disk
+writes, `fsync`, and rotation happen in one telemetry worker. The queue is
+bounded to 1024 records, memory to 4096 records, and disk to two JSONL files of
+4 MiB each (8 MiB total). Queue overflow or an unwritable disk drops telemetry
+and raises a warning, but never blocks a model request or changes routing. The
+records contain the logical/physical model, shadow decision and numeric
+headroom, provider outcome, latency, and sanitized error code. They never
+contain project IDs, credential IDs, keys, headers, prompts, request bodies, or
+model responses.
+
+The authenticated Management API exposes a 1–168 hour report in JSON or
+Russian text:
+
+```text
+GET /v0/management/bravo/adaptive-audit?hours=24&recent=20&format=json
+GET /v0/management/bravo/adaptive-audit?hours=24&recent=0&format=text
+```
+
+The same 24-hour summary is visible in the existing subscription page. It
+reports actual requests/execution attempts/fallbacks, shadow `would_admit` and
+`would_withhold` decisions, successful attempts shadow would have withheld,
+quota failures shadow would have admitted, queue/disk loss, and the invariant
+zero routing changes/zero extra provider requests. A clean report becomes
+`ready_for_review` only after at least 100 requests spanning at least six hours,
+with no unknown shadow decisions; this is evidence for a human decision, never
+automatic promotion.
+
+`adaptive_allocator_mode` accepts only `off` or `observe` in this preview.
+`assist` and `enforce` are rejected at configuration time, so a partial rollout
+cannot accidentally turn telemetry into a routing gate. The full contract and
+promotion gates are documented in
+[`docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md`](docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md).
 
 ## Per-project prompt caching
 
@@ -279,6 +330,7 @@ The authenticated allocator endpoints are:
 
 ```text
 GET   /v0/management/bravo/subscriptions
+GET   /v0/management/bravo/adaptive-audit
 PATCH /v0/management/bravo/subscriptions
 PATCH /v0/management/bravo/tariffs
 POST  /v0/management/bravo/quotas/refresh
@@ -303,6 +355,15 @@ attempts, not time to first token:
 ```text
 GET /v0/management/bravo/analytics
 ```
+
+In the adaptive 0.9 preview the analytics payload also includes
+`quota_consumption`. It attributes provider-confirmed percentage-point drops to
+projects, physical/logical models, effort, and configured tariff. Session,
+weekly, and model-weekly windows remain separate. The management view exposes a
+per-window project ranking and shared-pool residual; project-key limits expose
+only the caller's project. Residual observed burn is named
+`external_or_estimator_gap` because the proxy cannot prove whether it came from
+outside Bravo or from estimator error.
 
 Subscription responses expose the operator-authored `note` separately and a
 deterministic `display_name`. The display name prefers the note and otherwise

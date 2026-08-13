@@ -83,6 +83,7 @@ Bravo не вводит продуктового ограничения на ч�
 
 | Линия | Статус | Что это |
 | --- | --- | --- |
+| **Bravo 0.9.0-preview.3** | shadow preview | Безопасная 0.8.11 плюс адаптивный сбор и рейтинг расхода подписок. Режим только наблюдает: он не блокирует запросы, не меняет порядок маршрутов и не создаёт дополнительных обращений к провайдерам. |
 | **Bravo 0.8.11** | stable | Текущая безопасная линия: все исправления 0.8.10 плюс проектные API лимитов и прозрачных маршрутов. Новый адаптивный allocator сюда намеренно не входит. |
 | **Bravo 0.8.10** | previous stable | Предыдущий стабильный снимок: [`59fc4f02`](https://github.com/nikitau-svg/CLIProxyAPI/commit/59fc4f0260831a192aac782cdea3950d91d0d4d6). |
 | **CLIProxyAPI v7.2.94** | pinned upstream | Точная внешняя основа, от которой ведётся Bravo. |
@@ -256,17 +257,18 @@ Completions и OpenAI Responses. Полное объяснение ключей,
 Начиная с Bravo **0.8.11**, ключ проекта получает две read-only ручки:
 
 ```bash
-curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" \
+curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" \
   -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 
-curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/routes" \
+curl --fail-with-body -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/routes" \
   -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 ```
 
 `limits` показывает доступность Claude/Codex, окна и время сброса, а JSON-вид
 дополнительно содержит usage проекта за 30 дней. Результат обновляется не чаще
-одного раза в час на проект. `routes` объясняет, какие физические модели стоят
-за разрешёнными этому ключу `bravo/*`, их порядок и capabilities.
+одного раза в 5 минут на проект; повторные вызовы всегда получают сохранённый
+снимок с HTTP 200, а не ошибку. `routes` объясняет, какие физические модели
+стоят за разрешёнными этому ключу `bravo/*`, их порядок и capabilities.
 
 Эти команды можно отдавать коллегам вместе с **их собственным** проектным
 ключом: так каждый строит свой CLI и агентов по фактическим возможностям пула,
@@ -282,7 +284,7 @@ Bravo и не выполняют provider-запрос при вызове.
 | --- | --- |
 | Понять, что даёт fork, на чём он основан и какие ветки использовать | [`docs/BRAVO_PROJECT_RU.md`](docs/BRAVO_PROJECT_RU.md) |
 | Установить чистый сервер | [`AWS_INSTALL_RU.md`](AWS_INSTALL_RU.md) |
-| Настроить Claude Code, agent teams, `/bravo-limits` и командный onboarding | [`CLAUDE_CODE_BRAVO_RU.md`](CLAUDE_CODE_BRAVO_RU.md) |
+| Настроить Claude Code, agent teams, прямую проверку лимитов без модели и командный onboarding | [`CLAUDE_CODE_BRAVO_RU.md`](CLAUDE_CODE_BRAVO_RU.md) |
 | Создать проектный ключ и настроить модели/fallback | [`BRAVO_MODELS_AND_KEYS_RU.md`](BRAVO_MODELS_AND_KEYS_RU.md) |
 | Понять устройство плагина Bravo | [`plugins/bravo/README.md`](plugins/bravo/README.md) |
 | Внести изменение или оформить баг | [`CONTRIBUTING.md`](CONTRIBUTING.md) |

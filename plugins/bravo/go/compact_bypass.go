@@ -170,6 +170,9 @@ func compactBypassQuotaEligible(
 func acquireExecutionAttemptLease(attempt executionAttempt) (func(bool), bool, *executionFailure) {
 	if !attempt.CompactBypass {
 		release, acquired := acquireAttemptLease(attempt)
+		if acquired {
+			release = wrapAdaptiveShadowLease(attempt, release)
+		}
 		return release, acquired, nil
 	}
 	cooldown := time.Duration(attempt.CompactBypassCooldownSeconds) * time.Second
@@ -189,12 +192,13 @@ func acquireExecutionAttemptLease(attempt executionAttempt) (func(bool), bool, *
 		}
 		return func(bool) {}, false, &failure
 	}
-	return func(commit bool) {
+	combined := func(commit bool) {
 		release(commit, time.Now())
 		if commit {
 			logCompactBypassUsage(attempt)
 		}
-	}, true, nil
+	}
+	return wrapAdaptiveShadowLease(attempt, combined), true, nil
 }
 
 func reserveCompactBypass(

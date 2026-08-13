@@ -275,6 +275,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			}
 			return nil, nil, false
 		}
+		attempt.AdaptiveProviderDispatched = true
 		providerCalls++
 		run := launchBravoStreamAttempt(
 			req,
@@ -381,6 +382,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			case result := <-primaryResults:
 				primaryResults = nil
 				if result.response != nil {
+					primary.attempt.AdaptiveProviderAccepted = true
 					stopHedgeTimer()
 					finished, winnerFailure := forwardBravoStreamWinner(
 						primary,
@@ -456,6 +458,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			case result := <-hedgeResults:
 				hedgeResults = nil
 				if result.response != nil {
+					hedge.attempt.AdaptiveProviderAccepted = true
 					finished, winnerFailure := forwardBravoStreamWinner(
 						hedge,
 						result.response,
@@ -622,6 +625,7 @@ func forwardBravoStreamWinner(
 	}
 	_ = closeHostModelStream(response.StreamID, run.callbackID)
 	run.closeScope()
+	run.attempt.AdaptiveProviderAccepted = true
 	run.release(true)
 	if !run.finalized.CompareAndSwap(false, true) {
 		return true, nil

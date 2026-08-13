@@ -368,6 +368,9 @@ func applyQuotaRefreshSuccess(authIndex, resource, provider string, refreshed cr
 		refreshed.WorkspaceLabel = current.WorkspaceLabel
 	}
 	storeQuotaSnapshot(authIndex, refreshed)
+	// The adaptive preview only consumes this already-fetched snapshot. It never
+	// triggers or accelerates polling and therefore adds zero provider requests.
+	reconcileAdaptiveShadow(loadedConfig(), authIndex, current, refreshed, confirmedAt)
 	clearPendingReservation(authIndex, pendingAtStart)
 }
 

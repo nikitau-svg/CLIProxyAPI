@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -14,28 +16,43 @@ import (
 )
 
 const (
-	projectLimitsPath         = "/v0/management/bravo/project-limits"
-	projectLimitsPublicPath   = "/v1/bravo/limits"
-	projectLimitsRateInterval = time.Hour
-	projectLimitsUsageWindow  = 30 * 24 * time.Hour
-	projectLimitsRateMaxKeys  = 4096
+	projectLimitsPath            = "/v0/management/bravo/project-limits"
+	projectLimitsPublicPath      = "/v1/bravo/limits"
+	projectLimitsRefreshInterval = 5 * time.Minute
+	projectLimitsUsageWindow     = 30 * 24 * time.Hour
+	projectLimitsCacheMaxKeys    = 4096
 )
 
 var projectLimitsNow = func() time.Time { return time.Now().UTC() }
 
-var projectLimitsRate = struct {
+type projectLimitsCacheEntry struct {
+	Response  projectLimitsResponse
+	ExpiresAt time.Time
+}
+
+type projectLimitsCacheFlight struct {
+	Done chan struct{}
+}
+
+var projectLimitsCache = struct {
 	sync.Mutex
-	Next map[string]time.Time
-}{Next: make(map[string]time.Time)}
+	Entries map[string]projectLimitsCacheEntry
+	Flights map[string]*projectLimitsCacheFlight
+}{
+	Entries: make(map[string]projectLimitsCacheEntry),
+	Flights: make(map[string]*projectLimitsCacheFlight),
+}
 
 type projectLimitsDocumentation struct {
-	Endpoint             string   `json:"endpoint"`
-	Method               string   `json:"method"`
-	Formats              []string `json:"formats"`
-	RateLimitSeconds     int64    `json:"rate_limit_seconds"`
-	JSONCommandTemplate  string   `json:"json_command_template"`
-	TextCommandTemplate  string   `json:"text_command_template"`
-	AuthenticationHeader string   `json:"authentication_header"`
+	Endpoint               string   `json:"endpoint"`
+	Method                 string   `json:"method"`
+	Formats                []string `json:"formats"`
+	RateLimitSeconds       int64    `json:"rate_limit_seconds"`
+	RefreshIntervalSeconds int64    `json:"refresh_interval_seconds"`
+	RepeatedRequests       string   `json:"repeated_requests"`
+	JSONCommandTemplate    string   `json:"json_command_template"`
+	TextCommandTemplate    string   `json:"text_command_template"`
+	AuthenticationHeader   string   `json:"authentication_header"`
 }
 
 type projectLimitsProjectView struct {
@@ -76,15 +93,20 @@ type projectLimitsUsageView struct {
 }
 
 type projectLimitsResponse struct {
-	SchemaVersion     int                        `json:"schema_version"`
-	Object            string                     `json:"object"`
-	Project           projectLimitsProjectView   `json:"project"`
-	GeneratedAt       time.Time                  `json:"generated_at"`
-	NextAllowedAt     time.Time                  `json:"next_allowed_at"`
-	RateLimitSeconds  int64                      `json:"rate_limit_seconds"`
-	SnapshotFreshness string                     `json:"snapshot_freshness"`
-	Providers         []projectLimitProviderView `json:"providers"`
-	Usage             projectLimitsUsageView     `json:"usage"`
+	SchemaVersion     int                           `json:"schema_version"`
+	Object            string                        `json:"object"`
+	Project           projectLimitsProjectView      `json:"project"`
+	Cached            bool                          `json:"cached"`
+	GeneratedAt       time.Time                     `json:"generated_at"`
+	NextAllowedAt     time.Time                     `json:"next_allowed_at"`
+	NextRefreshAt     time.Time                     `json:"next_refresh_at"`
+	RateLimitSeconds  int64                         `json:"rate_limit_seconds"`
+	RefreshSeconds    int64                         `json:"refresh_interval_seconds"`
+	SnapshotFreshness string                        `json:"snapshot_freshness"`
+	Providers         []projectLimitProviderView    `json:"providers"`
+	AdaptiveAllocator adaptiveShadowPublicView      `json:"adaptive_allocator"`
+	QuotaConsumption  quotaConsumptionAnalyticsView `json:"quota_consumption"`
+	Usage             projectLimitsUsageView        `json:"usage"`
 }
 
 type projectLimitWindowAccumulator struct {
@@ -112,13 +134,15 @@ type projectLimitProviderAccumulator struct {
 
 func projectLimitsDocs() projectLimitsDocumentation {
 	return projectLimitsDocumentation{
-		Endpoint:             projectLimitsPublicPath,
-		Method:               http.MethodGet,
-		Formats:              []string{"json", "text"},
-		RateLimitSeconds:     int64(projectLimitsRateInterval / time.Second),
-		JSONCommandTemplate:  "curl -sS '<BRAVO_BASE_URL>/v1/bravo/limits?format=json' -H 'Authorization: Bearer <PROJECT_KEY>'",
-		TextCommandTemplate:  "curl -sS '<BRAVO_BASE_URL>/v1/bravo/limits?format=text' -H 'Authorization: Bearer <PROJECT_KEY>'",
-		AuthenticationHeader: "Authorization: Bearer <PROJECT_KEY>",
+		Endpoint:               projectLimitsPublicPath,
+		Method:                 http.MethodGet,
+		Formats:                []string{"json", "text"},
+		RateLimitSeconds:       int64(projectLimitsRefreshInterval / time.Second),
+		RefreshIntervalSeconds: int64(projectLimitsRefreshInterval / time.Second),
+		RepeatedRequests:       "cached_http_200",
+		JSONCommandTemplate:    "curl --fail-with-body -sS '<BRAVO_BASE_URL>/v1/bravo/limits?format=json' -H 'Authorization: Bearer <PROJECT_KEY>'",
+		TextCommandTemplate:    "curl --fail-with-body -sS '<BRAVO_BASE_URL>/v1/bravo/limits?format=text' -H 'Authorization: Bearer <PROJECT_KEY>'",
+		AuthenticationHeader:   "Authorization: Bearer <PROJECT_KEY>",
 	}
 }
 
@@ -130,6 +154,10 @@ func handleProjectLimits(req rpcManagementRequest) ([]byte, error) {
 	if req.Method != http.MethodGet {
 		return projectLimitsError(http.StatusMethodNotAllowed, "bravo_project_limits_method_not_allowed", "Статус проекта поддерживает только GET.", time.Time{})
 	}
+	format := strings.ToLower(strings.TrimSpace(firstQueryValue(req.Query, "format")))
+	if format != "" && format != "json" && format != "text" {
+		return projectLimitsError(http.StatusBadRequest, "bravo_project_limits_format_invalid", "Формат должен быть json или text.", time.Time{})
+	}
 	cfg := loadedConfig()
 	plaintext := requestCredential(req.Headers, req.Query)
 	project, authenticated := matchSmartKey(cfg, plaintext)
@@ -137,66 +165,96 @@ func handleProjectLimits(req rpcManagementRequest) ([]byte, error) {
 		return projectLimitsError(http.StatusUnauthorized, "bravo_smart_key_required", "Для получения лимитов нужен действующий ключ проекта Bravo.", time.Time{})
 	}
 	now := projectLimitsNow().UTC()
-	allowed, nextAllowed := acquireProjectLimitsRate(project.ID, now)
-	if !allowed {
-		return projectLimitsError(
-			http.StatusTooManyRequests,
-			"bravo_project_limits_rate_limited",
-			"Статус этого проекта можно обновлять не чаще одного раза в час.",
-			nextAllowed,
-		)
+	cacheKey, errFingerprint := projectLimitsCacheKey(cfg, project)
+	if errFingerprint != nil {
+		return projectLimitsError(http.StatusInternalServerError, "bravo_project_limits_cache_unavailable", "Не удалось подготовить локальный снимок лимитов. Повторите запрос.", time.Time{})
+	}
+	for {
+		response, hit, wait := lookupProjectLimitsCache(cacheKey, now)
+		if hit {
+			response.Cached = true
+			return renderProjectLimitsResponse(format, response, "HIT")
+		}
+		if wait == nil {
+			break
+		}
+		<-wait
 	}
 	auths, errList := listHostAuths(req.HostCallbackID)
 	if errList != nil {
-		releaseProjectLimitsRate(project.ID, nextAllowed)
+		finishProjectLimitsCache(cacheKey, projectLimitsResponse{}, time.Time{}, false)
 		return projectHostFailureJSON(errList)
 	}
 	auths = filterProjectAllowedAuths(project, auths)
+	nextAllowed := now.Add(projectLimitsRefreshInterval)
 	response := buildProjectLimitsResponse(cfg, project, auths, now, nextAllowed)
-	format := strings.ToLower(strings.TrimSpace(firstQueryValue(req.Query, "format")))
-	switch format {
-	case "", "json":
-		return projectLimitsJSON(http.StatusOK, response, 0)
-	case "text":
-		return projectLimitsText(http.StatusOK, renderProjectLimitsText(response), 0)
-	default:
-		releaseProjectLimitsRate(project.ID, nextAllowed)
-		return projectLimitsError(http.StatusBadRequest, "bravo_project_limits_format_invalid", "Формат должен быть json или text.", time.Time{})
-	}
+	finishProjectLimitsCache(cacheKey, response, nextAllowed, true)
+	return renderProjectLimitsResponse(format, response, "MISS")
 }
 
-func acquireProjectLimitsRate(projectID string, now time.Time) (bool, time.Time) {
-	projectID = strings.TrimSpace(projectID)
-	projectLimitsRate.Lock()
-	defer projectLimitsRate.Unlock()
-	for key, value := range projectLimitsRate.Next {
-		if !value.After(now) {
-			delete(projectLimitsRate.Next, key)
+func projectLimitsCacheKey(cfg pluginConfig, project smartKeyConfig) (string, error) {
+	projectConfig := cfg
+	projectConfig.SmartKeys = []smartKeyConfig{project}
+	encoded, errMarshal := json.Marshal(projectConfig)
+	if errMarshal != nil {
+		return "", errMarshal
+	}
+	fingerprint := sha256.Sum256(encoded)
+	return strings.TrimSpace(project.ID) + ":" + fmt.Sprintf("%x", fingerprint[:]), nil
+}
+
+func lookupProjectLimitsCache(cacheKey string, now time.Time) (projectLimitsResponse, bool, <-chan struct{}) {
+	projectLimitsCache.Lock()
+	defer projectLimitsCache.Unlock()
+	for key, entry := range projectLimitsCache.Entries {
+		if !entry.ExpiresAt.After(now) {
+			delete(projectLimitsCache.Entries, key)
 		}
 	}
-	if next := projectLimitsRate.Next[projectID]; next.After(now) {
-		return false, next
+	if entry, ok := projectLimitsCache.Entries[cacheKey]; ok && entry.ExpiresAt.After(now) {
+		return entry.Response, true, nil
 	}
-	if len(projectLimitsRate.Next) >= projectLimitsRateMaxKeys {
-		return false, now.Add(projectLimitsRateInterval)
+	if flight := projectLimitsCache.Flights[cacheKey]; flight != nil {
+		return projectLimitsResponse{}, false, flight.Done
 	}
-	next := now.Add(projectLimitsRateInterval)
-	projectLimitsRate.Next[projectID] = next
-	return true, next
+	projectLimitsCache.Flights[cacheKey] = &projectLimitsCacheFlight{Done: make(chan struct{})}
+	return projectLimitsResponse{}, false, nil
 }
 
-func releaseProjectLimitsRate(projectID string, expected time.Time) {
-	projectLimitsRate.Lock()
-	if projectLimitsRate.Next[projectID].Equal(expected) {
-		delete(projectLimitsRate.Next, projectID)
+func finishProjectLimitsCache(cacheKey string, response projectLimitsResponse, expiresAt time.Time, store bool) {
+	projectLimitsCache.Lock()
+	if store {
+		for len(projectLimitsCache.Entries) >= projectLimitsCacheMaxKeys {
+			oldestKey := ""
+			var oldestExpiry time.Time
+			for key, entry := range projectLimitsCache.Entries {
+				if oldestKey == "" || entry.ExpiresAt.Before(oldestExpiry) {
+					oldestKey = key
+					oldestExpiry = entry.ExpiresAt
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(projectLimitsCache.Entries, oldestKey)
+		}
+		projectLimitsCache.Entries[cacheKey] = projectLimitsCacheEntry{Response: response, ExpiresAt: expiresAt}
 	}
-	projectLimitsRate.Unlock()
+	if flight := projectLimitsCache.Flights[cacheKey]; flight != nil {
+		delete(projectLimitsCache.Flights, cacheKey)
+		close(flight.Done)
+	}
+	projectLimitsCache.Unlock()
 }
 
-func resetProjectLimitsRateForTest() {
-	projectLimitsRate.Lock()
-	projectLimitsRate.Next = make(map[string]time.Time)
-	projectLimitsRate.Unlock()
+func resetProjectLimitsCacheForTest() {
+	projectLimitsCache.Lock()
+	projectLimitsCache.Entries = make(map[string]projectLimitsCacheEntry)
+	for key, flight := range projectLimitsCache.Flights {
+		delete(projectLimitsCache.Flights, key)
+		close(flight.Done)
+	}
+	projectLimitsCache.Unlock()
 }
 
 func buildProjectLimitsResponse(
@@ -222,15 +280,25 @@ func buildProjectLimitsResponse(
 		Interval:  analyticsIntervalDay,
 		ProjectID: project.ID,
 	}, now)
+	quotaConsumption := collectQuotaConsumption(analyticsQuery{
+		From: now.Add(-projectLimitsUsageWindow), To: now,
+		Interval: analyticsIntervalHour, ProjectID: project.ID,
+	}, now, false)
+	annotateProjectQuotaCapacity(cfg, auths, &quotaConsumption)
 	return projectLimitsResponse{
-		SchemaVersion:     1,
+		SchemaVersion:     3,
 		Object:            "bravo.project_limits",
 		Project:           projectLimitsProjectView{ID: project.ID, Name: project.Name},
+		Cached:            false,
 		GeneratedAt:       now,
 		NextAllowedAt:     nextAllowed,
-		RateLimitSeconds:  int64(projectLimitsRateInterval / time.Second),
+		NextRefreshAt:     nextAllowed,
+		RateLimitSeconds:  int64(projectLimitsRefreshInterval / time.Second),
+		RefreshSeconds:    int64(projectLimitsRefreshInterval / time.Second),
 		SnapshotFreshness: freshness,
 		Providers:         providers,
+		AdaptiveAllocator: adaptiveShadowSummary(cfg, adaptiveShadowAuthIndexes(auths), now),
+		QuotaConsumption:  quotaConsumption,
 		Usage: projectLimitsUsageView{
 			PeriodDays: int(projectLimitsUsageWindow / (24 * time.Hour)),
 			From:       analytics.From,
@@ -241,6 +309,73 @@ func buildProjectLimitsResponse(
 			Models:     analytics.Breakdown.Models,
 		},
 	}
+}
+
+func annotateProjectQuotaCapacity(cfg pluginConfig, auths []pluginapi.HostAuthFileEntry, view *quotaConsumptionAnalyticsView) {
+	if view == nil {
+		return
+	}
+	countsByProject := make(map[string]map[string]int)
+	countsForProject := func(projectID string) map[string]int {
+		if existing, ok := countsByProject[projectID]; ok {
+			return existing
+		}
+		projectAuths := auths
+		if project, ok := findProjectByID(cfg, projectID); ok {
+			projectAuths = filterProjectAllowedAuths(project, auths)
+		}
+		counts := make(map[string]int)
+		for _, auth := range projectAuths {
+			authIndex := strings.TrimSpace(auth.AuthIndex)
+			subscription := subscriptionPolicy(cfg, authIndex)
+			if authIndex == "" || !subscriptionEnabled(subscription) {
+				continue
+			}
+			quota := normalizedQuotaState(quotaSnapshot(authIndex))
+			provider := normalizeProvider(firstNonEmpty(auth.Provider, auth.Type, quota.Provider))
+			tariff := effectiveTariff(cfg, subscription, provider, quota)
+			for _, kind := range []string{pluginapi.HostAuthQuotaWindowKindSession, pluginapi.HostAuthQuotaWindowKindWeekly} {
+				counts[projectQuotaCapacityKey(provider, tariff.ID, kind, "")]++
+			}
+			for _, modelWindow := range quota.ModelWeekly {
+				counts[projectQuotaCapacityKey(provider, tariff.ID, pluginapi.HostAuthQuotaWindowKindModelWeekly, modelWindow.Model)]++
+			}
+		}
+		countsByProject[projectID] = counts
+		return counts
+	}
+	for windowIndex := range view.Windows {
+		window := &view.Windows[windowIndex]
+		for projectIndex := range window.Projects {
+			project := &window.Projects[projectIndex]
+			counts := countsForProject(project.ProjectID)
+			for planIndex := range project.Plans {
+				plan := &project.Plans[planIndex]
+				plan.CurrentSubscriptions = counts[projectQuotaCapacityKey(window.Provider, plan.TariffID, window.Kind, window.QuotaModel)]
+				plan.EstimatedAdditionalAtPeakPace = math.Max(plan.EstimatedSubscriptionsAtPeakPace-float64(plan.CurrentSubscriptions), 0)
+				plan.EstimatedSpareAtPeakPace = math.Max(float64(plan.CurrentSubscriptions)-plan.EstimatedSubscriptionsAtPeakPace, 0)
+				switch {
+				case window.Confidence == "collecting" || window.Confidence == "low":
+					plan.SuggestedAction = "Собираем подтверждённые снимки; менять число подписок пока рано."
+				case plan.EstimatedAdditionalAtPeakPace >= 0.25:
+					plan.SuggestedAction = fmt.Sprintf(
+						"При таком пиковом темпе проекту может не хватать примерно %.1f подписки тарифа %s.",
+						plan.EstimatedAdditionalAtPeakPace, plan.TariffID,
+					)
+				case plan.EstimatedSpareAtPeakPace >= 1:
+					plan.SuggestedAction = "У проекта есть заметный запас ёмкости; перед перераспределением проверьте общий рейтинг пула."
+				default:
+					plan.SuggestedAction = "Текущая ёмкость соответствует наблюдаемому темпу."
+				}
+			}
+		}
+	}
+}
+
+func projectQuotaCapacityKey(provider, tariffID, kind, quotaModel string) string {
+	return strings.Join([]string{
+		normalizeProvider(provider), strings.TrimSpace(tariffID), strings.TrimSpace(kind), strings.ToLower(strings.TrimSpace(quotaModel)),
+	}, "\x1f")
 }
 
 func buildProjectLimitProviders(
@@ -481,18 +616,32 @@ func projectLimitsJSON(status int, value any, retryAfter int64) ([]byte, error) 
 	if errMarshal != nil {
 		return nil, errMarshal
 	}
-	return projectLimitsResponseEnvelope(status, "application/json; charset=utf-8", body, retryAfter)
+	return projectLimitsResponseEnvelope(status, "application/json; charset=utf-8", body, retryAfter, "")
 }
 
 func projectLimitsText(status int, value string, retryAfter int64) ([]byte, error) {
-	return projectLimitsResponseEnvelope(status, "text/plain; charset=utf-8", []byte(value), retryAfter)
+	return projectLimitsResponseEnvelope(status, "text/plain; charset=utf-8", []byte(value), retryAfter, "")
 }
 
-func projectLimitsResponseEnvelope(status int, contentType string, body []byte, retryAfter int64) ([]byte, error) {
+func renderProjectLimitsResponse(format string, response projectLimitsResponse, cacheStatus string) ([]byte, error) {
+	if format == "text" {
+		return projectLimitsResponseEnvelope(http.StatusOK, "text/plain; charset=utf-8", []byte(renderProjectLimitsText(response)), 0, cacheStatus)
+	}
+	body, errMarshal := json.Marshal(response)
+	if errMarshal != nil {
+		return nil, errMarshal
+	}
+	return projectLimitsResponseEnvelope(http.StatusOK, "application/json; charset=utf-8", body, 0, cacheStatus)
+}
+
+func projectLimitsResponseEnvelope(status int, contentType string, body []byte, retryAfter int64, cacheStatus string) ([]byte, error) {
 	headers := http.Header{
 		"Content-Type":           []string{contentType},
 		"X-Content-Type-Options": []string{"nosniff"},
 		"Cache-Control":          []string{"no-store"},
+	}
+	if cacheStatus != "" {
+		headers.Set("X-Bravo-Cache", cacheStatus)
 	}
 	if retryAfter > 0 {
 		headers.Set("Retry-After", strconv.FormatInt(retryAfter, 10))
@@ -504,6 +653,11 @@ func renderProjectLimitsText(response projectLimitsResponse) string {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "Проект Bravo: %s\n", response.Project.Name)
 	fmt.Fprintf(&builder, "Снимок: %s (%s)\n", response.GeneratedAt.Format(time.RFC3339), response.SnapshotFreshness)
+	if response.Cached {
+		fmt.Fprintf(&builder, "Источник: кэш. Новый локальный снимок будет собран после %s; до этого команда всегда возвращает этот результат с HTTP 200.\n", response.NextRefreshAt.Format(time.RFC3339))
+	} else {
+		fmt.Fprintf(&builder, "Источник: свежий локальный снимок. Повторные команды до %s вернут его из кэша с HTTP 200.\n", response.NextRefreshAt.Format(time.RFC3339))
+	}
 	for _, provider := range response.Providers {
 		fmt.Fprintf(&builder, "\n%s: %s, доступно %d/%d подписок\n", strings.ToUpper(provider.Provider), projectLimitStatusRU(provider.Status), provider.AccountsAvailable, provider.AccountsTotal)
 		for _, window := range provider.Windows {
@@ -519,6 +673,11 @@ func renderProjectLimitsText(response projectLimitsResponse) string {
 			builder.WriteByte('\n')
 		}
 	}
+	fmt.Fprintf(&builder, "\nАдаптивный allocator: %s (%s). Маршруты не блокирует; дополнительных запросов к подпискам: нет. Оценка полностью остывает не позднее чем через %s.\n",
+		response.AdaptiveAllocator.Mode,
+		response.AdaptiveAllocator.Effect,
+		formatProjectLimitDuration(time.Duration(response.AdaptiveAllocator.CoolingMaxAgeSeconds)*time.Second),
+	)
 	fmt.Fprintf(&builder, "\nUsage за %d дней: %d запросов, %d токенов, ошибок %d (%.1f%%)\n",
 		response.Usage.PeriodDays,
 		response.Usage.Summary.Requests,
@@ -526,7 +685,43 @@ func renderProjectLimitsText(response projectLimitsResponse) string {
 		response.Usage.Summary.Failures,
 		response.Usage.Summary.FailureRatePercent,
 	)
-	fmt.Fprintf(&builder, "Следующее обновление разрешено: %s\n", response.NextAllowedAt.Format(time.RFC3339))
+	if len(response.QuotaConsumption.Windows) == 0 {
+		fmt.Fprintln(&builder, "Расход лимитов подписок: пока собираем подтверждённые снимки.")
+	} else {
+		fmt.Fprintln(&builder, "Расход лимитов подписок (оценка в процентных пунктах, окна не суммируются):")
+		for _, window := range response.QuotaConsumption.Windows {
+			for _, project := range window.Projects {
+				fmt.Fprintf(&builder, "  %s / %s: %.2f п.п., средний темп %.2f п.п./ч, пик %.2f п.п./ч",
+					strings.ToUpper(window.Provider), projectLimitWindowNameRU(projectLimitWindowView{Kind: window.Kind, Model: window.QuotaModel}),
+					project.AttributedPercent, project.AveragePPPerHour, project.PeakHourlyPP,
+				)
+				if project.ShareOfAttributedPoolPercent > 0 {
+					fmt.Fprintf(&builder, ", доля локального пула %.1f%%", project.ShareOfAttributedPoolPercent)
+				}
+				builder.WriteByte('\n')
+				if len(project.Models) > 0 {
+					top := project.Models[0]
+					fmt.Fprintf(&builder, "    Главный потребитель: %s", friendlyModelName(firstNonEmpty(top.LogicalModel, top.Model)))
+					if top.Effort != "" {
+						fmt.Fprintf(&builder, " (%s)", top.Effort)
+					}
+					fmt.Fprintf(&builder, " — %.1f%% расхода проекта.\n", top.ShareOfProjectPercent)
+				}
+				for _, plan := range project.Plans {
+					fmt.Fprintf(&builder, "    План %s: сейчас %d подписок; оценка потребности %.2f в среднем / %.2f на пике. %s\n",
+						plan.TariffID, plan.CurrentSubscriptions,
+						plan.EstimatedSubscriptionsAtAveragePace,
+						plan.EstimatedSubscriptionsAtPeakPace,
+						plan.SuggestedAction,
+					)
+				}
+				for _, signal := range project.Signals {
+					fmt.Fprintf(&builder, "    Подсказка: %s\n", signal)
+				}
+			}
+		}
+	}
+	fmt.Fprintf(&builder, "Следующее обновление снимка: %s\n", response.NextRefreshAt.Format(time.RFC3339))
 	return builder.String()
 }
 

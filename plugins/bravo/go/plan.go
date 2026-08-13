@@ -58,6 +58,13 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		// ordering, and every off/observe/enforce allocator branch.
 		authResp.Files = filterProjectAllowedAuths(project, authResp.Files)
 	}
+	shadowEnabled := authenticatedProject && cfg.AdaptiveAllocatorMode == "observe"
+	var shadowFeatures adaptiveShadowRequestFeatures
+	if shadowEnabled {
+		// This is local, read-only request inspection. It neither waits for nor
+		// schedules quota/provider I/O.
+		shadowFeatures = buildAdaptiveShadowRequestFeatures(executionBodyView(req))
+	}
 	plan := make([]executionAttempt, 0)
 	// Every candidate that drops out records why. An empty plan is reported as
 	// "no healthy account", which is only one of the reasons a candidate can
@@ -137,9 +144,15 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		// Degrade to the authorized, healthy pool instead of answering 503.
 		if fallback := allocatorBypassPlan(logicalName, model, contract, authResp.Files, rejections, sticky, now); len(fallback) > 0 {
 			logAllocatorBypass(logicalName, rejections)
+			if shadowEnabled {
+				fallback = annotateAdaptiveShadowPlan(cfg, project, authResp.Files, fallback, shadowFeatures, now)
+			}
 			return fallback, nil
 		}
 		return nil, noEligibleCandidateError(logicalName, contract, rejections)
+	}
+	if shadowEnabled {
+		plan = annotateAdaptiveShadowPlan(cfg, project, authResp.Files, plan, shadowFeatures, now)
 	}
 	if len(rejections) > 0 {
 		plan[0].PreflightRejections = append([]candidateRejection(nil), rejections...)

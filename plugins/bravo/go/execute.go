@@ -138,6 +138,7 @@ func execute(raw []byte) ([]byte, error) {
 		if !acquired {
 			continue
 		}
+		attempt.AdaptiveProviderDispatched = true
 		providerCalls++
 		started := time.Now()
 		responseRaw, errCall := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{
@@ -164,6 +165,7 @@ func execute(raw []byte) ([]byte, error) {
 		// A host response means the provider accepted the attempt. Keep the
 		// reservation until the next confirmed quota snapshot, even when the
 		// response itself is malformed or unsuccessful.
+		attempt.AdaptiveProviderAccepted = true
 		releaseLease(true)
 
 		var response pluginapi.HostModelExecutionResponse

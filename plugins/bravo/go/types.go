@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.8.11"
+	pluginVersion    = "0.9.0-preview.3"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -97,6 +97,9 @@ type pluginConfig struct {
 	FallbackHedgeDelaySeconds         int                     `yaml:"fallback_hedge_delay_seconds" json:"fallback_hedge_delay_seconds"`
 	StatePath                         string                  `yaml:"state_path" json:"state_path"`
 	AllocatorMode                     string                  `yaml:"allocator_mode" json:"allocator_mode"`
+	AdaptiveAllocatorMode             string                  `yaml:"adaptive_allocator_mode" json:"adaptive_allocator_mode"`
+	AdaptiveCoolingHalfLifeSeconds    int                     `yaml:"adaptive_cooling_half_life_seconds" json:"adaptive_cooling_half_life_seconds"`
+	AdaptiveCoolingMaxAgeSeconds      int                     `yaml:"adaptive_cooling_max_age_seconds" json:"adaptive_cooling_max_age_seconds"`
 	QuotaRefreshSeconds               int                     `yaml:"quota_refresh_seconds" json:"quota_refresh_seconds"`
 	QuotaUsageRefreshSeconds          int                     `yaml:"quota_usage_refresh_seconds" json:"quota_usage_refresh_seconds"`
 	QuotaUsageMaxStaleSeconds         int                     `yaml:"quota_usage_max_stale_seconds" json:"quota_usage_max_stale_seconds"`
@@ -195,6 +198,15 @@ type executionAttempt struct {
 	CompactBypassKey             string
 	CompactBypassCooldownSeconds int
 	PreflightRejections          []candidateRejection
+	AdaptiveShadow               bool
+	AdaptiveReservationPercent   float64
+	AdaptiveEstimateConfidence   string
+	AdaptiveShadowDecision       string
+	AdaptiveShadowPendingPercent float64
+	AdaptiveShadowHeadroomBefore float64
+	AdaptiveShadowHeadroomAfter  float64
+	AdaptiveProviderDispatched   bool
+	AdaptiveProviderAccepted     bool
 }
 
 type attemptRecord struct {

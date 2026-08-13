@@ -39,9 +39,13 @@ type projectRouteCandidateView struct {
 }
 
 type projectRoutePolicyView struct {
-	CandidateOrder string `json:"candidate_order"`
-	AccountScope   string `json:"account_scope"`
-	FallbackUntil  string `json:"fallback_until"`
+	CandidateOrder                     string `json:"candidate_order"`
+	AccountScope                       string `json:"account_scope"`
+	FallbackUntil                      string `json:"fallback_until"`
+	AdaptiveAllocatorMode              string `json:"adaptive_allocator_mode"`
+	AdaptiveAllocatorEffect            string `json:"adaptive_allocator_effect"`
+	AdaptiveRoutingEnforced            bool   `json:"adaptive_routing_enforced"`
+	AdaptiveAdditionalProviderRequests bool   `json:"adaptive_additional_provider_requests"`
 }
 
 type projectRoutesResponse struct {
@@ -104,15 +108,19 @@ func handleProjectRoutes(req rpcManagementRequest) ([]byte, error) {
 		})
 	}
 	return projectLimitsJSON(http.StatusOK, projectRoutesResponse{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Object:        "bravo.project_routes",
 		Project:       projectLimitsProjectView{ID: project.ID, Name: project.Name},
 		GeneratedAt:   projectLimitsNow().UTC(),
 		Prefix:        cfg.Prefix,
 		Policy: projectRoutePolicyView{
-			CandidateOrder: "listed_order",
-			AccountScope:   "project_allowed_pool",
-			FallbackUntil:  "first_response_payload",
+			CandidateOrder:                     "listed_order",
+			AccountScope:                       "project_allowed_pool",
+			FallbackUntil:                      "first_response_payload",
+			AdaptiveAllocatorMode:              cfg.AdaptiveAllocatorMode,
+			AdaptiveAllocatorEffect:            adaptiveShadowEffect(cfg),
+			AdaptiveRoutingEnforced:            false,
+			AdaptiveAdditionalProviderRequests: false,
 		},
 		Routes: routes,
 	}, 0)
