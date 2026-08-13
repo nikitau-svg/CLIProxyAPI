@@ -85,7 +85,7 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndHourlyCache(t *testing.T) {
 	if response.Project.ID != "prj_limits" || response.Usage.Summary.Requests != 1 || response.Usage.Summary.TotalTokens != 123 {
 		t.Fatalf("response = %#v", response)
 	}
-	if response.Cached || response.NextRefreshAt != now.Add(time.Hour) || response.RefreshSeconds != 3600 {
+	if response.Cached || response.NextRefreshAt != now.Add(5*time.Minute) || response.RefreshSeconds != 300 {
 		t.Fatalf("fresh cache metadata = %#v", response)
 	}
 	if response.SchemaVersion != 2 || response.AdaptiveAllocator.Mode != "observe" ||
@@ -137,7 +137,7 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndHourlyCache(t *testing.T) {
 		t.Fatalf("cached JSON response = %#v", response)
 	}
 
-	now = now.Add(time.Hour + time.Second)
+	now = now.Add(5*time.Minute + time.Second)
 	status, headers, body = callProjectKeyEndpoint(t, http.MethodGet, projectLimitsPath, plaintext, url.Values{"format": {"json"}})
 	if status != http.StatusOK || headers.Get("X-Bravo-Cache") != "MISS" || hostCalls != 2 {
 		t.Fatalf("refreshed request status=%d headers=%v hostCalls=%d body=%s", status, headers, hostCalls, body)
@@ -185,7 +185,7 @@ func TestProjectLimitsCacheCoalescesConcurrentRefresh(t *testing.T) {
 		t.Fatalf("concurrent lookup hit=%v wait=%v", hit, wait != nil)
 	}
 	response := projectLimitsResponse{Object: "bravo.project_limits", GeneratedAt: now}
-	finishProjectLimitsCache("same-project", response, now.Add(time.Hour), true)
+	finishProjectLimitsCache("same-project", response, now.Add(5*time.Minute), true)
 	got, hit, wait := lookupProjectLimitsCache("same-project", now)
 	if !hit || wait != nil || got.GeneratedAt != now {
 		t.Fatalf("cached lookup got=%#v hit=%v wait=%v", got, hit, wait != nil)

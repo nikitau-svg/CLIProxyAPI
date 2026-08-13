@@ -17,7 +17,7 @@ import (
 const (
 	projectLimitsPath            = "/v0/management/bravo/project-limits"
 	projectLimitsPublicPath      = "/v1/bravo/limits"
-	projectLimitsRefreshInterval = time.Hour
+	projectLimitsRefreshInterval = 5 * time.Minute
 	projectLimitsUsageWindow     = 30 * 24 * time.Hour
 	projectLimitsCacheMaxKeys    = 4096
 )

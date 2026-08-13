@@ -138,8 +138,8 @@ GET /v1/bravo/routes
 ```
 
 `limits` returns confirmed provider reset windows plus project-only usage for
-the latest 30 days (daily series and provider/model breakdown). A project may
-request one fresh limits result per hour; repeated calls receive the cached
+the latest 30 days (daily series and provider/model breakdown). A project gets
+one fresh limits result every five minutes; repeated calls receive the cached
 snapshot with HTTP 200 and `cached: true`. It performs no provider request.
 `routes` returns the effective logical routes allowed by this key, their
 preferred/fallback order, physical provider/model, effort, capabilities, and
