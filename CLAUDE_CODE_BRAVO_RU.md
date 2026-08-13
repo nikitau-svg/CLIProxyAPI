@@ -76,33 +76,27 @@ Code.
 /status
 ```
 
-## Команда `/bravo-limits`
+## Лимиты прямо в Claude Code — без обращения к модели
 
-Начиная с Bravo 0.8.11 можно добавить локальный skill:
+Не оформляйте проверку лимитов как skill или пользовательскую slash-команду.
+Skill остаётся модельным prompt: Claude Code добавляет его в текущую переписку
+и отправляет весь актуальный контекст выбранной модели. Поэтому в уже большой
+сессии `/bravo-limits` способен получить `bravo_context_window_exceeded` ещё
+до показа результата `curl`.
+
+Вместо этого используйте встроенный shell mode Claude Code. Введите строку,
+начинающуюся с `!`: она выполняется локально и **не вызывает Claude, Codex или
+любой другой модельный маршрут**:
 
 ```bash
-mkdir -p ~/.claude/skills/bravo-limits
-
-cat > ~/.claude/skills/bravo-limits/SKILL.md <<'EOF'
----
-name: bravo-limits
-description: Показывает текущие лимиты и время их сброса для активного проекта Bravo
-disable-model-invocation: true
----
-
-Покажи пользователю следующий статус лимитов без пересказа и домыслов:
-
-!`curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"`
-EOF
+!curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}"
 ```
 
-После этого пользователь вызывает:
+Это работает даже тогда, когда текущий модельный контекст уже не помещается.
+Вывод будет добавлен в transcript, поэтому перед следующим обычным запросом
+всё равно может потребоваться встроенная команда `/compact`.
 
-```text
-/bravo-limits
-```
-
-Ручной текстовый запрос эквивалентен skill:
+Ту же проверку можно выполнить в обычном терминале вне Claude Code:
 
 ```bash
 curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/limits?format=text" \
@@ -150,7 +144,8 @@ curl -sS "${ANTHROPIC_BASE_URL%/}/v1/bravo/routes" \
 2. задайте его allowed subscription pool и model allowlist;
 3. безопасно передайте сотруднику base URL и показанный один раз `brv_...`;
 4. отправьте ему этот документ и предложите проверить `/v1/bravo/routes`;
-5. после установки skill предложите выполнить `/bravo-limits`;
+5. предложите проверить лимиты через прямой shell mode `!curl ...`, а не через
+   model-based skill;
 6. при увольнении или компрометации перевыпустите/отключите только его ключ.
 
 Так сотрудник самостоятельно видит, на каких логических моделях строить CLI,

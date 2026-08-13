@@ -282,7 +282,7 @@ Bravo и не выполняют provider-запрос при вызове.
 | --- | --- |
 | Понять, что даёт fork, на чём он основан и какие ветки использовать | [`docs/BRAVO_PROJECT_RU.md`](docs/BRAVO_PROJECT_RU.md) |
 | Установить чистый сервер | [`AWS_INSTALL_RU.md`](AWS_INSTALL_RU.md) |
-| Настроить Claude Code, agent teams, `/bravo-limits` и командный onboarding | [`CLAUDE_CODE_BRAVO_RU.md`](CLAUDE_CODE_BRAVO_RU.md) |
+| Настроить Claude Code, agent teams, прямую проверку лимитов без модели и командный onboarding | [`CLAUDE_CODE_BRAVO_RU.md`](CLAUDE_CODE_BRAVO_RU.md) |
 | Создать проектный ключ и настроить модели/fallback | [`BRAVO_MODELS_AND_KEYS_RU.md`](BRAVO_MODELS_AND_KEYS_RU.md) |
 | Понять устройство плагина Bravo | [`plugins/bravo/README.md`](plugins/bravo/README.md) |
 | Внести изменение или оформить баг | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
