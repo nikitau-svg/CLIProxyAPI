@@ -730,13 +730,14 @@ func buildQuotaConsumptionProjectView(
 	durationHours float64,
 	confidence string,
 ) quotaConsumptionProjectView {
+	average := project.Counters.AttributedPercent / durationHours
 	view := quotaConsumptionProjectView{
 		ProjectID:                   project.ProjectID,
 		Commitments:                 project.Counters.Commitments,
 		EstimatedPercent:            project.Counters.EstimatedPercent,
 		AttributedPercent:           project.Counters.AttributedPercent,
-		AveragePPPerHour:            project.Counters.AttributedPercent / durationHours,
-		PeakHourlyPP:                peakQuotaProjectPercent(project.Hourly),
+		AveragePPPerHour:            average,
+		PeakHourlyPP:                peakQuotaProjectPace(project.Hourly, average),
 		SubscriptionWindowsConsumed: project.Counters.AttributedPercent / 100,
 		BaseX1EquivalentWindows:     project.Counters.BaseX1EquivalentPercent / 100,
 		Models:                      []quotaConsumptionModelView{}, Plans: []quotaConsumptionPlanCapacityView{}, Signals: []string{},
@@ -766,7 +767,7 @@ func buildQuotaConsumptionProjectView(
 	windowHours := quotaCapacityWindowHours(window.Kind)
 	for _, plan := range project.Plans {
 		average := plan.Counters.AttributedPercent / durationHours
-		peak := peakQuotaProjectPercent(plan.Hourly)
+		peak := peakQuotaProjectPace(plan.Hourly, average)
 		view.Plans = append(view.Plans, quotaConsumptionPlanCapacityView{
 			TariffID: plan.TariffID, Multiplier: plan.Multiplier,
 			AttributedPercent:       plan.Counters.AttributedPercent,
@@ -898,6 +899,16 @@ func peakQuotaProjectPercent(hourly map[string]quotaProjectCounters) float64 {
 		peak = math.Max(peak, value.AttributedPercent)
 	}
 	return peak
+}
+
+// Hour buckets are stored as percentage-point totals. During the first
+// partially observed hour that raw total can be smaller than the correctly
+// normalised average pace (for example, 3pp collected over 20 minutes is
+// 9pp/h, not a 3pp/h peak). An hourly peak can never be below the average over
+// the same interval, so keep that invariant until complete hour buckets are
+// available.
+func peakQuotaProjectPace(hourly map[string]quotaProjectCounters, averagePPPerHour float64) float64 {
+	return math.Max(peakQuotaProjectPercent(hourly), averagePPPerHour)
 }
 
 func quotaConsumptionWindowKey(provider, kind, quotaModel string) string {
