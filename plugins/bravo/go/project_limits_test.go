@@ -88,7 +88,7 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndHourlyCache(t *testing.T) {
 	if response.Cached || response.NextRefreshAt != now.Add(5*time.Minute) || response.RefreshSeconds != 300 {
 		t.Fatalf("fresh cache metadata = %#v", response)
 	}
-	if response.SchemaVersion != 2 || response.AdaptiveAllocator.Mode != "observe" ||
+	if response.SchemaVersion != 3 || response.AdaptiveAllocator.Mode != "observe" ||
 		response.AdaptiveAllocator.RoutingEnforced || response.AdaptiveAllocator.AdditionalProviderRequests {
 		t.Fatalf("adaptive project view = %#v", response.AdaptiveAllocator)
 	}

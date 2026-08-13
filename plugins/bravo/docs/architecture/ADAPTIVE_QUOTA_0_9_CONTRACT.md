@@ -24,9 +24,10 @@ collect evidence for a later allocator, not to activate one implicitly.
 5. Every commitment and learned uplift cools exponentially. Default half-life is
    five minutes and the hard maximum age is thirty minutes. At maximum age its
    effect is exactly zero; no adaptive decision can remain sticky forever.
-6. Phase-1 state is runtime-only. A restart intentionally cold-starts the shadow
-   estimator and cannot reopen or close a production route because the estimator
-   has no routing authority.
+6. Phase-1 routing state is runtime-only. A restart intentionally cold-starts
+   the shadow estimator and cannot reopen or close a production route because
+   the estimator has no routing authority. Reconciled, aggregate consumption
+   analytics may persist because it has no routing authority.
 7. Public project views expose only aggregate values after the project's allowed
    account pool is applied. Credential identities are not returned.
 8. The durable shadow audit is telemetry-only. Enqueue is non-blocking; queue,
@@ -57,9 +58,20 @@ A provider-confirmed quota observation may reconcile only shadow commitments at
 or before its strictly newer observation timestamp. Commits after that timestamp
 remain. Failed, equal, older or unknown observations do not clear shadow state.
 
-This preview does not claim exact attribution for provider activity made outside
-Bravo. Such activity can make learned calibration conservative; cooling bounds
-that effect.
+For each independently confirmed session, weekly and model-weekly window, Bravo
+also records the observed percentage-point drop. Completed local attempts in the
+same observation interval are attributed to projects, physical/logical models,
+effort and tariff in proportion to their adaptive estimates. If estimates exceed
+the observed drop, attribution is scaled down. If the observed drop exceeds all
+local estimates, the residual is reported as `external_or_estimator_gap`; it is
+never silently assigned to a project or claimed to be known external traffic.
+Intervals containing a reset or an unexplained increase are excluded.
+
+Session, weekly and model-weekly percentage points are separate constraints and
+must never be summed into a single consumption percentage. Capacity estimates
+may express attributed use as subscription-window equivalents, average/peak
+percentage points per hour and x1-equivalent capacity. They remain advisory and
+carry a confidence state until enough confirmed observations exist.
 
 ## Observability
 
@@ -72,6 +84,14 @@ Bravo status response disclose:
 - cooling half-life and hard maximum age;
 - bounded aggregate commitment, effective pending and learned-scale values;
 - saturation/drop counters without credential identities.
+
+The management analytics response and the project limits response additionally
+contain 30-day quota-consumption analytics. Management may show shared-pool
+observed and unattributed aggregates plus a per-window project ranking. A
+project-key response exposes only that project's rows and never credential or
+neighbouring-project identities. Model/effort shares and subscription-capacity
+recommendations are advisory; low-confidence data explicitly recommends
+continued collection rather than reallocation.
 
 `GET /v0/management/bravo/adaptive-audit` adds a bounded 1–168 hour audit report
 and an optional limited recent-record sample. It is built exclusively from real

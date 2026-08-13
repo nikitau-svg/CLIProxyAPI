@@ -37,8 +37,15 @@ type adaptiveShadowEstimate struct {
 }
 
 type adaptiveShadowCommit struct {
-	At      time.Time
-	Percent float64
+	At           time.Time
+	Percent      float64
+	ProjectID    string
+	Provider     string
+	Model        string
+	LogicalModel string
+	Effort       string
+	TariffID     string
+	Multiplier   float64
 }
 
 type adaptiveShadowAccount struct {
@@ -239,24 +246,51 @@ func wrapAdaptiveShadowLease(attempt executionAttempt, release func(bool)) func(
 	var once sync.Once
 	return func(commit bool) {
 		once.Do(func() {
-			release(commit)
 			if commit {
-				recordAdaptiveShadowCommit(
-					strings.TrimSpace(attempt.Auth.AuthIndex),
-					attempt.AdaptiveReservationPercent,
-					adaptiveShadowNow(),
-				)
+				recordAdaptiveShadowAttemptCommit(attempt, adaptiveShadowNow())
 			}
+			release(commit)
 		})
 	}
 }
 
-func recordAdaptiveShadowCommit(authIndex string, percent float64, at time.Time) {
-	authIndex = strings.TrimSpace(authIndex)
+func recordAdaptiveShadowAttemptCommit(attempt executionAttempt, at time.Time) {
+	authIndex := strings.TrimSpace(attempt.Auth.AuthIndex)
+	percent := attempt.AdaptiveReservationPercent
 	if authIndex == "" || percent <= 0 || math.IsNaN(percent) || math.IsInf(percent, 0) {
 		return
 	}
-	at = at.UTC()
+	cfg := loadedConfig()
+	quota := normalizedQuotaState(quotaSnapshot(authIndex))
+	subscription := subscriptionPolicy(cfg, authIndex)
+	tariff := effectiveTariff(cfg, subscription, firstNonEmpty(attempt.Auth.Provider, attempt.Auth.Type), quota)
+	item := adaptiveShadowCommit{
+		At:           at.UTC(),
+		Percent:      percent,
+		ProjectID:    strings.TrimSpace(attempt.ProjectID),
+		Provider:     normalizeProvider(firstNonEmpty(attempt.Candidate.Provider, attempt.Auth.Provider, attempt.Auth.Type)),
+		Model:        strings.TrimSpace(attempt.Candidate.Model),
+		LogicalModel: strings.TrimSpace(attempt.LogicalModel),
+		Effort:       normalizeEffort(firstNonEmpty(attempt.EffectiveEffort, attempt.Candidate.Effort, attempt.RequestedEffort)),
+		TariffID:     tariff.ID,
+		Multiplier:   math.Max(tariff.Multiplier, 1),
+	}
+	recordAdaptiveShadowCommitValue(authIndex, item)
+}
+
+func recordAdaptiveShadowCommit(authIndex string, percent float64, at time.Time) {
+	recordAdaptiveShadowCommitValue(authIndex, adaptiveShadowCommit{At: at.UTC(), Percent: percent, Multiplier: 1})
+}
+
+func recordAdaptiveShadowCommitValue(authIndex string, item adaptiveShadowCommit) {
+	authIndex = strings.TrimSpace(authIndex)
+	if authIndex == "" || item.Percent <= 0 || math.IsNaN(item.Percent) || math.IsInf(item.Percent, 0) {
+		return
+	}
+	item.At = item.At.UTC()
+	if item.Multiplier <= 0 || math.IsNaN(item.Multiplier) || math.IsInf(item.Multiplier, 0) {
+		item.Multiplier = 1
+	}
 	adaptiveShadowRuntime.Lock()
 	defer adaptiveShadowRuntime.Unlock()
 	account := adaptiveShadowRuntime.Accounts[authIndex]
@@ -269,8 +303,8 @@ func recordAdaptiveShadowCommit(authIndex string, percent float64, at time.Time)
 		account = &adaptiveShadowAccount{LearnedScale: 1}
 		adaptiveShadowRuntime.Accounts[authIndex] = account
 	}
-	account.Commits = append(account.Commits, adaptiveShadowCommit{At: at, Percent: percent})
-	account.UpdatedAt = at
+	account.Commits = append(account.Commits, item)
+	account.UpdatedAt = item.At
 	boundAdaptiveShadowCommits(account)
 }
 
@@ -307,38 +341,48 @@ func reconcileAdaptiveShadow(
 	}
 	observedAt = observedAt.UTC()
 	adaptiveShadowRuntime.Lock()
-	defer adaptiveShadowRuntime.Unlock()
 	account := adaptiveShadowRuntime.Accounts[authIndex]
-	if account == nil {
-		return
-	}
-	pruneAdaptiveShadowAccount(account, cfg, observedAt)
+	covered := make([]adaptiveShadowCommit, 0)
 	predicted := 0.0
-	remaining := account.Commits[:0]
-	for _, item := range account.Commits {
-		if !item.At.After(observedAt) {
-			predicted += item.Percent
-			continue
+	if account != nil {
+		pruneAdaptiveShadowAccount(account, cfg, observedAt)
+		remaining := account.Commits[:0]
+		for _, item := range account.Commits {
+			if !item.At.After(observedAt) {
+				if item.At.After(previousAt) {
+					predicted += item.Percent
+					covered = append(covered, item)
+				}
+				continue
+			}
+			remaining = append(remaining, item)
 		}
-		remaining = append(remaining, item)
+		account.Commits = remaining
+		if !account.OverflowAt.IsZero() && !account.OverflowAt.After(observedAt) {
+			if account.OverflowAt.After(previousAt) {
+				predicted += account.OverflowPercent
+				covered = append(covered, adaptiveShadowCommit{
+					At: account.OverflowAt, Percent: account.OverflowPercent, Multiplier: 1,
+				})
+			}
+			account.OverflowAt = time.Time{}
+			account.OverflowPercent = 0
+		}
+		actual := math.Max(
+			math.Max(previous.Session.RemainingPercent-refreshed.Session.RemainingPercent, 0),
+			math.Max(previous.Weekly.RemainingPercent-refreshed.Weekly.RemainingPercent, 0),
+		)
+		if predicted > 0 && actual > 0 {
+			current := effectiveAdaptiveShadowLearnedScale(account, cfg, observedAt)
+			ratio := math.Min(math.Max(actual/predicted, 1), adaptiveShadowMaximumLearnedScale)
+			account.LearnedScale = math.Max(current, ratio)
+			account.LearnedAt = observedAt
+		}
+		account.UpdatedAt = observedAt
 	}
-	account.Commits = remaining
-	if !account.OverflowAt.IsZero() && !account.OverflowAt.After(observedAt) {
-		predicted += account.OverflowPercent
-		account.OverflowAt = time.Time{}
-		account.OverflowPercent = 0
-	}
-	actual := math.Max(
-		math.Max(previous.Session.RemainingPercent-refreshed.Session.RemainingPercent, 0),
-		math.Max(previous.Weekly.RemainingPercent-refreshed.Weekly.RemainingPercent, 0),
-	)
-	if predicted > 0 && actual > 0 {
-		current := effectiveAdaptiveShadowLearnedScale(account, cfg, observedAt)
-		ratio := math.Min(math.Max(actual/predicted, 1), adaptiveShadowMaximumLearnedScale)
-		account.LearnedScale = math.Max(current, ratio)
-		account.LearnedAt = observedAt
-	}
-	account.UpdatedAt = observedAt
+	adaptiveShadowRuntime.Unlock()
+
+	recordQuotaConsumptionReconciliation(authIndex, previous, refreshed, previousAt, observedAt, covered)
 }
 
 func adaptiveShadowLearnedScale(authIndex string, cfg pluginConfig, now time.Time) float64 {

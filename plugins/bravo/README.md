@@ -356,6 +356,15 @@ attempts, not time to first token:
 GET /v0/management/bravo/analytics
 ```
 
+In the adaptive 0.9 preview the analytics payload also includes
+`quota_consumption`. It attributes provider-confirmed percentage-point drops to
+projects, physical/logical models, effort, and configured tariff. Session,
+weekly, and model-weekly windows remain separate. The management view exposes a
+per-window project ranking and shared-pool residual; project-key limits expose
+only the caller's project. Residual observed burn is named
+`external_or_estimator_gap` because the proxy cannot prove whether it came from
+outside Bravo or from estimator error.
+
 Subscription responses expose the operator-authored `note` separately and a
 deterministic `display_name`. The display name prefers the note and otherwise
 combines workspace and email; the legacy `label` remains the same display name

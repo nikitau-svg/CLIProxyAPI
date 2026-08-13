@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -92,19 +93,20 @@ type projectLimitsUsageView struct {
 }
 
 type projectLimitsResponse struct {
-	SchemaVersion     int                        `json:"schema_version"`
-	Object            string                     `json:"object"`
-	Project           projectLimitsProjectView   `json:"project"`
-	Cached            bool                       `json:"cached"`
-	GeneratedAt       time.Time                  `json:"generated_at"`
-	NextAllowedAt     time.Time                  `json:"next_allowed_at"`
-	NextRefreshAt     time.Time                  `json:"next_refresh_at"`
-	RateLimitSeconds  int64                      `json:"rate_limit_seconds"`
-	RefreshSeconds    int64                      `json:"refresh_interval_seconds"`
-	SnapshotFreshness string                     `json:"snapshot_freshness"`
-	Providers         []projectLimitProviderView `json:"providers"`
-	AdaptiveAllocator adaptiveShadowPublicView   `json:"adaptive_allocator"`
-	Usage             projectLimitsUsageView     `json:"usage"`
+	SchemaVersion     int                           `json:"schema_version"`
+	Object            string                        `json:"object"`
+	Project           projectLimitsProjectView      `json:"project"`
+	Cached            bool                          `json:"cached"`
+	GeneratedAt       time.Time                     `json:"generated_at"`
+	NextAllowedAt     time.Time                     `json:"next_allowed_at"`
+	NextRefreshAt     time.Time                     `json:"next_refresh_at"`
+	RateLimitSeconds  int64                         `json:"rate_limit_seconds"`
+	RefreshSeconds    int64                         `json:"refresh_interval_seconds"`
+	SnapshotFreshness string                        `json:"snapshot_freshness"`
+	Providers         []projectLimitProviderView    `json:"providers"`
+	AdaptiveAllocator adaptiveShadowPublicView      `json:"adaptive_allocator"`
+	QuotaConsumption  quotaConsumptionAnalyticsView `json:"quota_consumption"`
+	Usage             projectLimitsUsageView        `json:"usage"`
 }
 
 type projectLimitWindowAccumulator struct {
@@ -278,8 +280,13 @@ func buildProjectLimitsResponse(
 		Interval:  analyticsIntervalDay,
 		ProjectID: project.ID,
 	}, now)
+	quotaConsumption := collectQuotaConsumption(analyticsQuery{
+		From: now.Add(-projectLimitsUsageWindow), To: now,
+		Interval: analyticsIntervalHour, ProjectID: project.ID,
+	}, now, false)
+	annotateProjectQuotaCapacity(cfg, auths, &quotaConsumption)
 	return projectLimitsResponse{
-		SchemaVersion:     2,
+		SchemaVersion:     3,
 		Object:            "bravo.project_limits",
 		Project:           projectLimitsProjectView{ID: project.ID, Name: project.Name},
 		Cached:            false,
@@ -291,6 +298,7 @@ func buildProjectLimitsResponse(
 		SnapshotFreshness: freshness,
 		Providers:         providers,
 		AdaptiveAllocator: adaptiveShadowSummary(cfg, adaptiveShadowAuthIndexes(auths), now),
+		QuotaConsumption:  quotaConsumption,
 		Usage: projectLimitsUsageView{
 			PeriodDays: int(projectLimitsUsageWindow / (24 * time.Hour)),
 			From:       analytics.From,
@@ -301,6 +309,73 @@ func buildProjectLimitsResponse(
 			Models:     analytics.Breakdown.Models,
 		},
 	}
+}
+
+func annotateProjectQuotaCapacity(cfg pluginConfig, auths []pluginapi.HostAuthFileEntry, view *quotaConsumptionAnalyticsView) {
+	if view == nil {
+		return
+	}
+	countsByProject := make(map[string]map[string]int)
+	countsForProject := func(projectID string) map[string]int {
+		if existing, ok := countsByProject[projectID]; ok {
+			return existing
+		}
+		projectAuths := auths
+		if project, ok := findProjectByID(cfg, projectID); ok {
+			projectAuths = filterProjectAllowedAuths(project, auths)
+		}
+		counts := make(map[string]int)
+		for _, auth := range projectAuths {
+			authIndex := strings.TrimSpace(auth.AuthIndex)
+			subscription := subscriptionPolicy(cfg, authIndex)
+			if authIndex == "" || !subscriptionEnabled(subscription) {
+				continue
+			}
+			quota := normalizedQuotaState(quotaSnapshot(authIndex))
+			provider := normalizeProvider(firstNonEmpty(auth.Provider, auth.Type, quota.Provider))
+			tariff := effectiveTariff(cfg, subscription, provider, quota)
+			for _, kind := range []string{pluginapi.HostAuthQuotaWindowKindSession, pluginapi.HostAuthQuotaWindowKindWeekly} {
+				counts[projectQuotaCapacityKey(provider, tariff.ID, kind, "")]++
+			}
+			for _, modelWindow := range quota.ModelWeekly {
+				counts[projectQuotaCapacityKey(provider, tariff.ID, pluginapi.HostAuthQuotaWindowKindModelWeekly, modelWindow.Model)]++
+			}
+		}
+		countsByProject[projectID] = counts
+		return counts
+	}
+	for windowIndex := range view.Windows {
+		window := &view.Windows[windowIndex]
+		for projectIndex := range window.Projects {
+			project := &window.Projects[projectIndex]
+			counts := countsForProject(project.ProjectID)
+			for planIndex := range project.Plans {
+				plan := &project.Plans[planIndex]
+				plan.CurrentSubscriptions = counts[projectQuotaCapacityKey(window.Provider, plan.TariffID, window.Kind, window.QuotaModel)]
+				plan.EstimatedAdditionalAtPeakPace = math.Max(plan.EstimatedSubscriptionsAtPeakPace-float64(plan.CurrentSubscriptions), 0)
+				plan.EstimatedSpareAtPeakPace = math.Max(float64(plan.CurrentSubscriptions)-plan.EstimatedSubscriptionsAtPeakPace, 0)
+				switch {
+				case window.Confidence == "collecting" || window.Confidence == "low":
+					plan.SuggestedAction = "Собираем подтверждённые снимки; менять число подписок пока рано."
+				case plan.EstimatedAdditionalAtPeakPace >= 0.25:
+					plan.SuggestedAction = fmt.Sprintf(
+						"При таком пиковом темпе проекту может не хватать примерно %.1f подписки тарифа %s.",
+						plan.EstimatedAdditionalAtPeakPace, plan.TariffID,
+					)
+				case plan.EstimatedSpareAtPeakPace >= 1:
+					plan.SuggestedAction = "У проекта есть заметный запас ёмкости; перед перераспределением проверьте общий рейтинг пула."
+				default:
+					plan.SuggestedAction = "Текущая ёмкость соответствует наблюдаемому темпу."
+				}
+			}
+		}
+	}
+}
+
+func projectQuotaCapacityKey(provider, tariffID, kind, quotaModel string) string {
+	return strings.Join([]string{
+		normalizeProvider(provider), strings.TrimSpace(tariffID), strings.TrimSpace(kind), strings.ToLower(strings.TrimSpace(quotaModel)),
+	}, "\x1f")
 }
 
 func buildProjectLimitProviders(
@@ -610,6 +685,42 @@ func renderProjectLimitsText(response projectLimitsResponse) string {
 		response.Usage.Summary.Failures,
 		response.Usage.Summary.FailureRatePercent,
 	)
+	if len(response.QuotaConsumption.Windows) == 0 {
+		fmt.Fprintln(&builder, "Расход лимитов подписок: пока собираем подтверждённые снимки.")
+	} else {
+		fmt.Fprintln(&builder, "Расход лимитов подписок (оценка в процентных пунктах, окна не суммируются):")
+		for _, window := range response.QuotaConsumption.Windows {
+			for _, project := range window.Projects {
+				fmt.Fprintf(&builder, "  %s / %s: %.2f п.п., средний темп %.2f п.п./ч, пик %.2f п.п./ч",
+					strings.ToUpper(window.Provider), projectLimitWindowNameRU(projectLimitWindowView{Kind: window.Kind, Model: window.QuotaModel}),
+					project.AttributedPercent, project.AveragePPPerHour, project.PeakHourlyPP,
+				)
+				if project.ShareOfAttributedPoolPercent > 0 {
+					fmt.Fprintf(&builder, ", доля локального пула %.1f%%", project.ShareOfAttributedPoolPercent)
+				}
+				builder.WriteByte('\n')
+				if len(project.Models) > 0 {
+					top := project.Models[0]
+					fmt.Fprintf(&builder, "    Главный потребитель: %s", friendlyModelName(firstNonEmpty(top.LogicalModel, top.Model)))
+					if top.Effort != "" {
+						fmt.Fprintf(&builder, " (%s)", top.Effort)
+					}
+					fmt.Fprintf(&builder, " — %.1f%% расхода проекта.\n", top.ShareOfProjectPercent)
+				}
+				for _, plan := range project.Plans {
+					fmt.Fprintf(&builder, "    План %s: сейчас %d подписок; оценка потребности %.2f в среднем / %.2f на пике. %s\n",
+						plan.TariffID, plan.CurrentSubscriptions,
+						plan.EstimatedSubscriptionsAtAveragePace,
+						plan.EstimatedSubscriptionsAtPeakPace,
+						plan.SuggestedAction,
+					)
+				}
+				for _, signal := range project.Signals {
+					fmt.Fprintf(&builder, "    Подсказка: %s\n", signal)
+				}
+			}
+		}
+	}
 	fmt.Fprintf(&builder, "Следующее обновление снимка: %s\n", response.NextRefreshAt.Format(time.RFC3339))
 	return builder.String()
 }
