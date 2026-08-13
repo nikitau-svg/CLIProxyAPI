@@ -139,12 +139,13 @@ GET /v1/bravo/routes
 
 `limits` returns confirmed provider reset windows plus project-only usage for
 the latest 30 days (daily series and provider/model breakdown). A project may
-request one fresh limits result per hour; excess calls receive `429` and
-`Retry-After`. It performs no provider request. `routes` returns the effective
-logical routes allowed by this key, their preferred/fallback order, physical
-provider/model, effort, capabilities, and whether each route comes from the
-built-in default or an operator override. In the 0.9 preview both responses
-also state that the adaptive allocator is `shadow_only`, has no routing
+request one fresh limits result per hour; repeated calls receive the cached
+snapshot with HTTP 200 and `cached: true`. It performs no provider request.
+`routes` returns the effective logical routes allowed by this key, their
+preferred/fallback order, physical provider/model, effort, capabilities, and
+whether each route comes from the built-in default or an operator override. In
+the 0.9 preview both responses also state that the adaptive allocator is
+`shadow_only`, has no routing
 authority, and generates no additional provider requests.
 
 ## Adaptive allocator 0.9 preview
