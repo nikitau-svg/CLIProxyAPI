@@ -17,6 +17,7 @@ const (
 	adaptiveShadowMaximumLearnedScale       = 8.0
 	adaptiveShadowMaximumAccounts           = 4096
 	adaptiveShadowMaximumCommitsPerAccount  = 256
+	adaptiveShadowMaximumOverflowModels     = 64
 	adaptiveShadowDecisionAdmit             = "would_admit"
 	adaptiveShadowDecisionWithhold          = "would_withhold"
 	adaptiveShadowDecisionUnknown           = "unknown"
@@ -25,36 +26,52 @@ const (
 var adaptiveShadowNow = func() time.Time { return time.Now().UTC() }
 
 type adaptiveShadowRequestFeatures struct {
-	EstimatedTokens float64
-	ContextFactor   float64
-	OutputTrusted   bool
+	InputTokens          float64
+	DeclaredOutputTokens float64
+	EstimatedTokens      float64
+	ContextFactor        float64
+	OutputTrusted        bool
 }
 
 type adaptiveShadowEstimate struct {
-	ReservationPercent float64
-	LearnedScale       float64
-	Confidence         string
+	ReservationPercent            float64
+	SessionReservationPercent     float64
+	WeeklyReservationPercent      float64
+	ModelWeeklyReservationPercent float64
+	ModelWeeklyName               string
+	PredictedTokens               float64
+	LearnedScale                  float64
+	Confidence                    string
 }
 
 type adaptiveShadowCommit struct {
-	At           time.Time
-	Percent      float64
-	ProjectID    string
-	Provider     string
-	Model        string
-	LogicalModel string
-	Effort       string
-	TariffID     string
-	Multiplier   float64
+	At                 time.Time
+	Percent            float64
+	ProjectID          string
+	Provider           string
+	Model              string
+	LogicalModel       string
+	Effort             string
+	TariffID           string
+	Multiplier         float64
+	TokenUnits         float64
+	SessionPercent     float64
+	WeeklyPercent      float64
+	ModelWeeklyPercent float64
+	ModelWeeklyName    string
 }
 
 type adaptiveShadowAccount struct {
-	Commits         []adaptiveShadowCommit
-	OverflowAt      time.Time
-	OverflowPercent float64
-	LearnedScale    float64
-	LearnedAt       time.Time
-	UpdatedAt       time.Time
+	Commits                           []adaptiveShadowCommit
+	OverflowAt                        time.Time
+	OverflowPercent                   float64
+	OverflowSessionPercent            float64
+	OverflowWeeklyPercent             float64
+	OverflowModelWeeklyPercent        map[string]float64
+	OverflowUnknownModelWeeklyPercent float64
+	LearnedScale                      float64
+	LearnedAt                         time.Time
+	UpdatedAt                         time.Time
 }
 
 var adaptiveShadowRuntime = struct {
@@ -68,21 +85,22 @@ var adaptiveShadowRuntime = struct {
 // identity. It is safe to expose through a project-scoped endpoint after the
 // caller's allowed account pool has been applied.
 type adaptiveShadowPublicView struct {
-	Mode                       string  `json:"mode"`
-	Effect                     string  `json:"effect"`
-	RoutingEnforced            bool    `json:"routing_enforced"`
-	AdditionalProviderRequests bool    `json:"additional_provider_requests"`
-	QuotaSnapshotSource        string  `json:"quota_snapshot_source"`
-	CoolingHalfLifeSeconds     int     `json:"cooling_half_life_seconds"`
-	CoolingMaxAgeSeconds       int     `json:"cooling_max_age_seconds"`
-	TrackedAccounts            int     `json:"tracked_accounts"`
-	TrackedCommitments         int     `json:"tracked_commitments"`
-	RawPendingPercent          float64 `json:"raw_pending_percent"`
-	EffectivePendingPercent    float64 `json:"effective_pending_percent"`
-	MaximumLearnedScale        float64 `json:"maximum_learned_scale"`
-	Saturated                  bool    `json:"saturated"`
-	DroppedAccounts            uint64  `json:"dropped_accounts"`
-	Note                       string  `json:"note"`
+	Mode                       string                             `json:"mode"`
+	Effect                     string                             `json:"effect"`
+	RoutingEnforced            bool                               `json:"routing_enforced"`
+	AdditionalProviderRequests bool                               `json:"additional_provider_requests"`
+	QuotaSnapshotSource        string                             `json:"quota_snapshot_source"`
+	CoolingHalfLifeSeconds     int                                `json:"cooling_half_life_seconds"`
+	CoolingMaxAgeSeconds       int                                `json:"cooling_max_age_seconds"`
+	TrackedAccounts            int                                `json:"tracked_accounts"`
+	TrackedCommitments         int                                `json:"tracked_commitments"`
+	RawPendingPercent          float64                            `json:"raw_pending_percent"`
+	EffectivePendingPercent    float64                            `json:"effective_pending_percent"`
+	MaximumLearnedScale        float64                            `json:"maximum_learned_scale"`
+	Saturated                  bool                               `json:"saturated"`
+	DroppedAccounts            uint64                             `json:"dropped_accounts"`
+	TokenCalibration           adaptiveTokenCalibrationPublicView `json:"token_calibration"`
+	Note                       string                             `json:"note"`
 }
 
 func adaptiveShadowEffect(cfg pluginConfig) string {
@@ -97,8 +115,11 @@ func buildAdaptiveShadowRequestFeatures(body []byte) adaptiveShadowRequestFeatur
 	// context factor. Scanning the remaining multi-megabyte prompt cannot raise
 	// the reservation, so stop here instead of spending linear CPU on it.
 	if len(body) >= adaptiveShadowContextCapBodyBytes {
-		tokens := math.Max(float64(len(body))/4, 1024)
-		return adaptiveShadowRequestFeatures{EstimatedTokens: tokens, ContextFactor: 8, OutputTrusted: false}
+		input := math.Max(float64(len(body))/4, 1024)
+		return adaptiveShadowRequestFeatures{
+			InputTokens: input, DeclaredOutputTokens: adaptiveShadowMaximumOutputTokens,
+			EstimatedTokens: input + adaptiveShadowMaximumOutputTokens, ContextFactor: 8, OutputTrusted: false,
+		}
 	}
 	output, trusted := adaptiveShadowDeclaredOutputTokens(body)
 	if !trusted {
@@ -106,9 +127,11 @@ func buildAdaptiveShadowRequestFeatures(body []byte) adaptiveShadowRequestFeatur
 	}
 	tokens := math.Max(float64(len(body))/4+output, 1024)
 	return adaptiveShadowRequestFeatures{
-		EstimatedTokens: tokens,
-		ContextFactor:   math.Min(math.Max(math.Sqrt(math.Max(tokens, 8192)/8192), 1), 8),
-		OutputTrusted:   trusted,
+		InputTokens:          math.Max(float64(len(body))/4, 1),
+		DeclaredOutputTokens: output,
+		EstimatedTokens:      tokens,
+		ContextFactor:        math.Min(math.Max(math.Sqrt(math.Max(tokens, 8192)/8192), 1), 8),
+		OutputTrusted:        trusted,
 	}
 }
 
@@ -117,6 +140,7 @@ func adaptiveShadowEstimateFor(
 	auth pluginapi.HostAuthFileEntry,
 	item candidate,
 	tariff tariffConfig,
+	quota credentialQuotaState,
 	features adaptiveShadowRequestFeatures,
 	now time.Time,
 ) adaptiveShadowEstimate {
@@ -136,7 +160,42 @@ func adaptiveShadowEstimateFor(
 	if learned > 1.000001 {
 		confidence += "+cooled_provider_calibration"
 	}
-	return adaptiveShadowEstimate{ReservationPercent: value, LearnedScale: learned, Confidence: confidence}
+	estimate := adaptiveShadowEstimate{
+		ReservationPercent: value, SessionReservationPercent: value, WeeklyReservationPercent: value,
+		PredictedTokens: features.EstimatedTokens,
+		LearnedScale:    learned, Confidence: confidence,
+	}
+	for _, window := range quota.ModelWeekly {
+		if quotaModelMatches(item.Model, window.Model) {
+			estimate.ModelWeeklyReservationPercent = value
+			estimate.ModelWeeklyName = strings.ToLower(strings.TrimSpace(window.Model))
+			break
+		}
+	}
+	token := adaptiveTokenCalibrationFor(
+		strings.TrimSpace(auth.AuthIndex),
+		normalizeProvider(firstNonEmpty(item.Provider, auth.Provider, auth.Type)),
+		item.Model, item.Effort, tariff.ID, quota, features, now,
+	)
+	if token.Session.Available {
+		estimate.SessionReservationPercent = token.Session.Percent
+	}
+	if token.Weekly.Available {
+		estimate.WeeklyReservationPercent = token.Weekly.Percent
+	}
+	if token.ModelWeekly.Available {
+		estimate.ModelWeeklyReservationPercent = token.ModelWeekly.Percent
+		estimate.ModelWeeklyName = token.ModelWeeklyName
+	}
+	if token.Session.Available || token.Weekly.Available || token.ModelWeekly.Available {
+		estimate.ReservationPercent = math.Max(
+			estimate.SessionReservationPercent,
+			math.Max(estimate.WeeklyReservationPercent, estimate.ModelWeeklyReservationPercent),
+		)
+		estimate.PredictedTokens = token.PredictedTokens
+		estimate.Confidence = token.Confidence
+	}
+	return estimate
 }
 
 func annotateAdaptiveShadowPlan(
@@ -163,9 +222,14 @@ func annotateAdaptiveShadowPlan(
 		if attempts[index].EffectiveEffort != "" {
 			item.Effort = attempts[index].EffectiveEffort
 		}
-		estimate := adaptiveShadowEstimateFor(cfg, attempts[index].Auth, item, tariff, features, now)
+		estimate := adaptiveShadowEstimateFor(cfg, attempts[index].Auth, item, tariff, quota, features, now)
 		attempts[index].AdaptiveShadow = true
 		attempts[index].AdaptiveReservationPercent = estimate.ReservationPercent
+		attempts[index].AdaptiveSessionReservationPercent = estimate.SessionReservationPercent
+		attempts[index].AdaptiveWeeklyReservationPercent = estimate.WeeklyReservationPercent
+		attempts[index].AdaptiveModelWeeklyReservationPercent = estimate.ModelWeeklyReservationPercent
+		attempts[index].AdaptiveModelWeeklyName = estimate.ModelWeeklyName
+		attempts[index].AdaptivePredictedTokens = estimate.PredictedTokens
 		attempts[index].AdaptiveEstimateConfidence = estimate.Confidence
 		// These fields are metadata only for unmanaged legacy attempts. Setting
 		// them makes the shadow decision auditable without changing acquisition.
@@ -200,28 +264,61 @@ func adaptiveShadowDecisionFor(
 	now time.Time,
 ) (string, float64, float64, float64) {
 	authIndex := strings.TrimSpace(attempt.Auth.AuthIndex)
-	pending := adaptiveShadowEffectivePendingFor(authIndex, cfg, now)
+	sessionPending := adaptiveShadowEffectivePendingForWindow(authIndex, pluginapi.HostAuthQuotaWindowKindSession, "", cfg, now)
+	weeklyKind, quotaModel := adaptiveShadowWeeklyWindow(quota, attempt.Candidate.Model)
+	weeklyPending := adaptiveShadowEffectivePendingForWindow(authIndex, weeklyKind, quotaModel, cfg, now)
 	if quotaRoutingConfidenceAt(quota, attempt.Candidate.Model, cfg, now) != "confirmed" {
-		return adaptiveShadowDecisionUnknown, adaptiveShadowRound(pending), 0, 0
+		return adaptiveShadowDecisionUnknown, adaptiveShadowRound(math.Max(sessionPending, weeklyPending)), 0, 0
 	}
 	session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
 	sessionFloor, weeklyFloor := tariff.SessionFloorPercent, tariff.WeeklyFloorPercent
 	if attempt.Primary {
 		sessionFloor, weeklyFloor = 0, 0
 	}
-	before := math.Min(
-		session.RemainingPercent-sessionFloor,
-		weekly.RemainingPercent-weeklyFloor,
-	) - pending
-	after := before - reservation
+	sessionReservation := attempt.AdaptiveSessionReservationPercent
+	if sessionReservation <= 0 {
+		sessionReservation = reservation
+	}
+	weeklyReservation := attempt.AdaptiveWeeklyReservationPercent
+	if weeklyKind == pluginapi.HostAuthQuotaWindowKindModelWeekly && attempt.AdaptiveModelWeeklyReservationPercent > 0 {
+		weeklyReservation = attempt.AdaptiveModelWeeklyReservationPercent
+	}
+	if weeklyReservation <= 0 {
+		weeklyReservation = reservation
+	}
+	sessionBefore := session.RemainingPercent - sessionFloor - sessionPending
+	weeklyBefore := weekly.RemainingPercent - weeklyFloor - weeklyPending
+	before := math.Min(sessionBefore, weeklyBefore)
+	after := math.Min(sessionBefore-sessionReservation, weeklyBefore-weeklyReservation)
 	decision := adaptiveShadowDecisionAdmit
 	if after <= 0 {
 		decision = adaptiveShadowDecisionWithhold
 	}
-	return decision, adaptiveShadowRound(pending), adaptiveShadowRound(before), adaptiveShadowRound(after)
+	return decision, adaptiveShadowRound(math.Max(sessionPending, weeklyPending)), adaptiveShadowRound(before), adaptiveShadowRound(after)
+}
+
+func adaptiveShadowWeeklyWindow(quota credentialQuotaState, model string) (string, string) {
+	weekly := normalizeQuotaWindow(quota.Weekly)
+	kind, quotaModel := pluginapi.HostAuthQuotaWindowKindWeekly, ""
+	for _, candidate := range quota.ModelWeekly {
+		if !quotaModelMatches(model, candidate.Model) {
+			continue
+		}
+		window := normalizeQuotaWindow(candidate.quotaWindowState)
+		if window.RemainingPercent < weekly.RemainingPercent {
+			weekly = window
+			kind = pluginapi.HostAuthQuotaWindowKindModelWeekly
+			quotaModel = strings.ToLower(strings.TrimSpace(candidate.Model))
+		}
+	}
+	return kind, quotaModel
 }
 
 func adaptiveShadowEffectivePendingFor(authIndex string, cfg pluginConfig, now time.Time) float64 {
+	return adaptiveShadowEffectivePendingForWindow(authIndex, "", "", cfg, now)
+}
+
+func adaptiveShadowEffectivePendingForWindow(authIndex, kind, quotaModel string, cfg pluginConfig, now time.Time) float64 {
 	if authIndex == "" {
 		return 0
 	}
@@ -232,9 +329,42 @@ func adaptiveShadowEffectivePendingFor(authIndex string, cfg pluginConfig, now t
 		return 0
 	}
 	pruneAdaptiveShadowAccount(account, cfg, now)
-	effective := adaptiveShadowCommitWeight(account.OverflowPercent, account.OverflowAt, cfg, now)
+	overflow := account.OverflowPercent
+	switch kind {
+	case pluginapi.HostAuthQuotaWindowKindSession:
+		overflow = account.OverflowSessionPercent
+	case pluginapi.HostAuthQuotaWindowKindWeekly:
+		overflow = account.OverflowWeeklyPercent
+	case pluginapi.HostAuthQuotaWindowKindModelWeekly:
+		overflow = account.OverflowUnknownModelWeeklyPercent
+		for model, percent := range account.OverflowModelWeeklyPercent {
+			if strings.EqualFold(model, quotaModel) || quotaModelMatches(model, quotaModel) {
+				overflow += percent
+			}
+		}
+	}
+	effective := adaptiveShadowCommitWeight(overflow, account.OverflowAt, cfg, now)
 	for _, item := range account.Commits {
-		effective += adaptiveShadowCommitWeight(item.Percent, item.At, cfg, now)
+		percent := item.Percent
+		switch kind {
+		case pluginapi.HostAuthQuotaWindowKindSession:
+			if item.SessionPercent > 0 {
+				percent = item.SessionPercent
+			}
+		case pluginapi.HostAuthQuotaWindowKindWeekly:
+			if item.WeeklyPercent > 0 {
+				percent = item.WeeklyPercent
+			}
+		case pluginapi.HostAuthQuotaWindowKindModelWeekly:
+			if item.ModelWeeklyPercent > 0 &&
+				(strings.EqualFold(strings.TrimSpace(item.ModelWeeklyName), strings.TrimSpace(quotaModel)) ||
+					(item.ModelWeeklyName == "" && quotaModelMatches(item.Model, quotaModel))) {
+				percent = item.ModelWeeklyPercent
+			} else {
+				continue
+			}
+		}
+		effective += adaptiveShadowCommitWeight(percent, item.At, cfg, now)
 	}
 	return effective
 }
@@ -265,15 +395,20 @@ func recordAdaptiveShadowAttemptCommit(attempt executionAttempt, at time.Time) {
 	subscription := subscriptionPolicy(cfg, authIndex)
 	tariff := effectiveTariff(cfg, subscription, firstNonEmpty(attempt.Auth.Provider, attempt.Auth.Type), quota)
 	item := adaptiveShadowCommit{
-		At:           at.UTC(),
-		Percent:      percent,
-		ProjectID:    strings.TrimSpace(attempt.ProjectID),
-		Provider:     normalizeProvider(firstNonEmpty(attempt.Candidate.Provider, attempt.Auth.Provider, attempt.Auth.Type)),
-		Model:        strings.TrimSpace(attempt.Candidate.Model),
-		LogicalModel: strings.TrimSpace(attempt.LogicalModel),
-		Effort:       normalizeEffort(firstNonEmpty(attempt.EffectiveEffort, attempt.Candidate.Effort, attempt.RequestedEffort)),
-		TariffID:     tariff.ID,
-		Multiplier:   math.Max(tariff.Multiplier, 1),
+		At:                 at.UTC(),
+		Percent:            percent,
+		ProjectID:          strings.TrimSpace(attempt.ProjectID),
+		Provider:           normalizeProvider(firstNonEmpty(attempt.Candidate.Provider, attempt.Auth.Provider, attempt.Auth.Type)),
+		Model:              strings.TrimSpace(attempt.Candidate.Model),
+		LogicalModel:       strings.TrimSpace(attempt.LogicalModel),
+		Effort:             normalizeEffort(firstNonEmpty(attempt.EffectiveEffort, attempt.Candidate.Effort, attempt.RequestedEffort)),
+		TariffID:           tariff.ID,
+		Multiplier:         math.Max(tariff.Multiplier, 1),
+		TokenUnits:         math.Max(attempt.AdaptivePredictedTokens, 0),
+		SessionPercent:     attempt.AdaptiveSessionReservationPercent,
+		WeeklyPercent:      attempt.AdaptiveWeeklyReservationPercent,
+		ModelWeeklyPercent: attempt.AdaptiveModelWeeklyReservationPercent,
+		ModelWeeklyName:    attempt.AdaptiveModelWeeklyName,
 	}
 	recordAdaptiveShadowCommitValue(authIndex, item)
 }
@@ -315,6 +450,35 @@ func boundAdaptiveShadowCommits(account *adaptiveShadowAccount) {
 	overflowCount := len(account.Commits) - adaptiveShadowMaximumCommitsPerAccount + 1
 	for _, item := range account.Commits[:overflowCount] {
 		account.OverflowPercent += item.Percent
+		sessionPercent := item.SessionPercent
+		if sessionPercent <= 0 {
+			sessionPercent = item.Percent
+		}
+		account.OverflowSessionPercent += sessionPercent
+		weeklyPercent := item.WeeklyPercent
+		if weeklyPercent <= 0 {
+			weeklyPercent = item.Percent
+		}
+		account.OverflowWeeklyPercent += weeklyPercent
+		if item.ModelWeeklyPercent > 0 {
+			model := strings.ToLower(strings.TrimSpace(firstNonEmpty(item.ModelWeeklyName, item.Model)))
+			if model == "" {
+				account.OverflowUnknownModelWeeklyPercent += item.ModelWeeklyPercent
+			} else {
+				if account.OverflowModelWeeklyPercent == nil {
+					account.OverflowModelWeeklyPercent = make(map[string]float64)
+				}
+				if _, exists := account.OverflowModelWeeklyPercent[model]; exists ||
+					len(account.OverflowModelWeeklyPercent) < adaptiveShadowMaximumOverflowModels {
+					account.OverflowModelWeeklyPercent[model] += item.ModelWeeklyPercent
+				} else {
+					// Telemetry remains bounded. Unknown overflow is conservatively
+					// applied to model-weekly windows only; it never contaminates
+					// session or global-weekly pending.
+					account.OverflowUnknownModelWeeklyPercent += item.ModelWeeklyPercent
+				}
+			}
+		}
 		// Using the newest coalesced timestamp makes decay conservative: the
 		// aggregate never cools faster than any item it replaced.
 		if item.At.After(account.OverflowAt) {
@@ -340,6 +504,7 @@ func reconcileAdaptiveShadow(
 		return
 	}
 	observedAt = observedAt.UTC()
+	tokenEvents := reconcileAdaptiveTokenCalibration(cfg, authIndex, previous, refreshed, previousAt, observedAt)
 	adaptiveShadowRuntime.Lock()
 	account := adaptiveShadowRuntime.Accounts[authIndex]
 	covered := make([]adaptiveShadowCommit, 0)
@@ -382,7 +547,10 @@ func reconcileAdaptiveShadow(
 	}
 	adaptiveShadowRuntime.Unlock()
 
-	recordQuotaConsumptionReconciliation(authIndex, previous, refreshed, previousAt, observedAt, covered)
+	recordQuotaConsumptionReconciliation(
+		authIndex, previous, refreshed, previousAt, observedAt,
+		applyAdaptiveTokenWeightsToShadowCommits(covered, tokenEvents),
+	)
 }
 
 func adaptiveShadowLearnedScale(authIndex string, cfg pluginConfig, now time.Time) float64 {
@@ -440,6 +608,10 @@ func pruneAdaptiveShadowAccount(account *adaptiveShadowAccount, cfg pluginConfig
 	if !account.OverflowAt.After(cutoff) {
 		account.OverflowAt = time.Time{}
 		account.OverflowPercent = 0
+		account.OverflowSessionPercent = 0
+		account.OverflowWeeklyPercent = 0
+		account.OverflowModelWeeklyPercent = nil
+		account.OverflowUnknownModelWeeklyPercent = 0
 	}
 	if !account.LearnedAt.After(cutoff) {
 		account.LearnedScale = 1
@@ -448,6 +620,7 @@ func pruneAdaptiveShadowAccount(account *adaptiveShadowAccount, cfg pluginConfig
 }
 
 func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time) adaptiveShadowPublicView {
+	tokenCalibration := adaptiveTokenCalibrationSummary(authIndexes, now)
 	allowed := make(map[string]struct{}, len(authIndexes))
 	for _, authIndex := range authIndexes {
 		if authIndex = strings.TrimSpace(authIndex); authIndex != "" {
@@ -464,6 +637,7 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 		CoolingHalfLifeSeconds:     cfg.AdaptiveCoolingHalfLifeSeconds,
 		CoolingMaxAgeSeconds:       cfg.AdaptiveCoolingMaxAgeSeconds,
 		MaximumLearnedScale:        1,
+		TokenCalibration:           tokenCalibration,
 		Note:                       "Теневой расчёт не блокирует запросы и не меняет маршруты; он не выполняет дополнительных обращений к подпискам.",
 	}
 	adaptiveShadowRuntime.Lock()
@@ -560,6 +734,7 @@ func resetAdaptiveShadowForTest() {
 	adaptiveShadowRuntime.Saturated = false
 	adaptiveShadowRuntime.DroppedAccounts = 0
 	adaptiveShadowRuntime.Unlock()
+	resetAdaptiveTokenCalibrationForTest()
 }
 
 // adaptiveShadowDeclaredOutputTokens is a bounded-allocation top-level JSON

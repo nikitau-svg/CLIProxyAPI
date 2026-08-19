@@ -87,6 +87,12 @@ func renderAdaptiveShadowAuditText(report adaptiveShadowAuditReport, hours int) 
 		report.WouldAdmitAttempts, report.WouldWithholdAttempts, report.UnknownDecisionAttempts)
 	fmt.Fprintf(&out, "Расхождения: успешных при would_withhold %d; quota-ошибок при would_admit %d\n",
 		report.SuccessfulWouldWithhold, report.QuotaFailuresWouldAdmit)
+	fmt.Fprintf(&out, "Токен-калибровка: попыток %d; пропустить %d; удержать %d; ложных удержаний %d; пропущенных quota-ошибок %d; cold/legacy %d\n",
+		report.TokenCalibratedAttempts, report.TokenCalibratedWouldAdmit, report.TokenCalibratedWouldWithhold,
+		report.SuccessfulTokenCalibratedWithhold, report.TokenCalibratedQuotaFailuresOnAdmit,
+		report.LegacyShapeEstimateAttempts)
+	fmt.Fprintf(&out, "Вердикт новой формулы: %s — %s\n",
+		report.TokenCalibrationVerdict, report.TokenCalibrationVerdictMessage)
 	fmt.Fprintf(&out, "Дополнительные обращения к подпискам/провайдерам: %d; применённых изменений маршрута: %d\n",
 		report.AdditionalProviderRequests, report.RoutingChangesApplied)
 	fmt.Fprintf(&out, "Телеметрия: очередь %d/%d; потеряно %d; ошибок записи %d; диск %d/%d байт\n",

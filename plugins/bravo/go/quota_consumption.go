@@ -299,10 +299,13 @@ func buildQuotaConsumptionWindow(
 		mutation quotaProjectMutation
 		count    int64
 		percent  float64
+		weight   float64
 	}
 	groups := make(map[string]*groupedCommit)
 	totalEstimated := 0.0
 	unassignedEstimated := 0.0
+	totalWeight := 0.0
+	unassignedWeight := 0.0
 	for _, commit := range commits {
 		if kind == pluginapi.HostAuthQuotaWindowKindModelWeekly && !quotaModelMatches(commit.Model, quotaModel) {
 			continue
@@ -311,9 +314,15 @@ func buildQuotaConsumptionWindow(
 			continue
 		}
 		totalEstimated += commit.Percent
+		weight := commit.TokenUnits
+		if weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+			weight = commit.Percent
+		}
+		totalWeight += weight
 		projectID := strings.TrimSpace(commit.ProjectID)
 		if projectID == "" || !validProjectID(projectID) {
 			unassignedEstimated += commit.Percent
+			unassignedWeight += weight
 			continue
 		}
 		multiplier := commit.Multiplier
@@ -335,6 +344,7 @@ func buildQuotaConsumptionWindow(
 		}
 		group.count++
 		group.percent += commit.Percent
+		group.weight += weight
 	}
 	observation.Counters.EstimatedLocalPercent = totalEstimated
 	scale := 1.0
@@ -343,11 +353,17 @@ func buildQuotaConsumptionWindow(
 	}
 	attributedLocal := totalEstimated * scale
 	attributedUnassigned := unassignedEstimated * scale
+	if totalWeight > 0 {
+		attributedUnassigned = attributedLocal * unassignedWeight / totalWeight
+	}
 	observation.Counters.AttributedLocalUnassignedPercent = attributedUnassigned
 	observation.Counters.ExternalOrEstimatorGapPercent = math.Max(drop-attributedLocal, 0)
 	mutations := make([]quotaProjectMutation, 0, len(groups))
 	for _, group := range groups {
 		attributed := group.percent * scale
+		if totalWeight > 0 {
+			attributed = attributedLocal * group.weight / totalWeight
+		}
 		group.mutation.Counters = quotaProjectCounters{
 			Commitments:             group.count,
 			EstimatedPercent:        group.percent,

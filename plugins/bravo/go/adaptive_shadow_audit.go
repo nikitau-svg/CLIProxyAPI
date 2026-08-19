@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,21 +28,26 @@ const (
 )
 
 type adaptiveShadowAuditAttempt struct {
-	Provider            string  `json:"provider"`
-	Model               string  `json:"model"`
-	Primary             bool    `json:"primary"`
-	Decision            string  `json:"decision"`
-	EstimateConfidence  string  `json:"estimate_confidence"`
-	ReservationPercent  float64 `json:"reservation_percent"`
-	PendingPercent      float64 `json:"pending_percent"`
-	SafeHeadroomBefore  float64 `json:"safe_headroom_before"`
-	SafeHeadroomAfter   float64 `json:"safe_headroom_after"`
-	Outcome             string  `json:"outcome"`
-	Status              int     `json:"status"`
-	Success             bool    `json:"success"`
-	ProviderAcceptance  string  `json:"provider_acceptance"`
-	LatencyMilliseconds int64   `json:"latency_ms"`
-	ErrorCode           string  `json:"error_code,omitempty"`
+	Provider                      string  `json:"provider"`
+	Model                         string  `json:"model"`
+	Primary                       bool    `json:"primary"`
+	Decision                      string  `json:"decision"`
+	EstimateConfidence            string  `json:"estimate_confidence"`
+	ReservationPercent            float64 `json:"reservation_percent"`
+	SessionReservationPercent     float64 `json:"session_reservation_percent,omitempty"`
+	WeeklyReservationPercent      float64 `json:"weekly_reservation_percent,omitempty"`
+	ModelWeeklyReservationPercent float64 `json:"model_weekly_reservation_percent,omitempty"`
+	ModelWeeklyName               string  `json:"model_weekly_name,omitempty"`
+	PredictedTokens               float64 `json:"predicted_tokens,omitempty"`
+	PendingPercent                float64 `json:"pending_percent"`
+	SafeHeadroomBefore            float64 `json:"safe_headroom_before"`
+	SafeHeadroomAfter             float64 `json:"safe_headroom_after"`
+	Outcome                       string  `json:"outcome"`
+	Status                        int     `json:"status"`
+	Success                       bool    `json:"success"`
+	ProviderAcceptance            string  `json:"provider_acceptance"`
+	LatencyMilliseconds           int64   `json:"latency_ms"`
+	ErrorCode                     string  `json:"error_code,omitempty"`
 }
 
 type adaptiveShadowAuditRecord struct {
@@ -61,40 +67,50 @@ type adaptiveShadowAuditRecord struct {
 }
 
 type adaptiveShadowAuditReport struct {
-	SchemaVersion              int                         `json:"schema_version"`
-	Status                     string                      `json:"status"`
-	Verdict                    string                      `json:"verdict"`
-	VerdictMessage             string                      `json:"verdict_message"`
-	Mode                       string                      `json:"mode"`
-	Effect                     string                      `json:"effect"`
-	From                       time.Time                   `json:"from"`
-	To                         time.Time                   `json:"to"`
-	RequestsObserved           int                         `json:"requests_observed"`
-	SuccessfulRequests         int                         `json:"successful_requests"`
-	FailedRequests             int                         `json:"failed_requests"`
-	ActualExecutionAttempts    int                         `json:"actual_execution_attempts"`
-	RequestsWithFallback       int                         `json:"requests_with_fallback"`
-	CoverageSeconds            int64                       `json:"coverage_seconds"`
-	MinimumReviewRequests      int                         `json:"minimum_review_requests"`
-	MinimumReviewCoverage      int64                       `json:"minimum_review_coverage_seconds"`
-	WouldAdmitAttempts         int                         `json:"would_admit_attempts"`
-	WouldWithholdAttempts      int                         `json:"would_withhold_attempts"`
-	UnknownDecisionAttempts    int                         `json:"unknown_decision_attempts"`
-	SuccessfulWouldWithhold    int                         `json:"successful_would_withhold"`
-	QuotaFailuresWouldAdmit    int                         `json:"quota_failures_would_admit"`
-	RoutingChangesApplied      int                         `json:"routing_changes_applied"`
-	AdditionalProviderRequests int                         `json:"additional_provider_requests"`
-	QueueDepth                 int                         `json:"queue_depth"`
-	QueueCapacity              int                         `json:"queue_capacity"`
-	DroppedRecords             uint64                      `json:"dropped_records"`
-	WriteFailures              uint64                      `json:"write_failures"`
-	RotationFailures           uint64                      `json:"rotation_failures"`
-	RecordsInMemory            int                         `json:"records_in_memory"`
-	DiskBytes                  int64                       `json:"disk_bytes"`
-	DiskLimitBytes             int64                       `json:"disk_limit_bytes"`
-	LastEventAt                time.Time                   `json:"last_event_at,omitempty"`
-	Warning                    string                      `json:"warning,omitempty"`
-	Recent                     []adaptiveShadowAuditRecord `json:"recent,omitempty"`
+	SchemaVersion                       int                         `json:"schema_version"`
+	Status                              string                      `json:"status"`
+	Verdict                             string                      `json:"verdict"`
+	VerdictMessage                      string                      `json:"verdict_message"`
+	Mode                                string                      `json:"mode"`
+	Effect                              string                      `json:"effect"`
+	From                                time.Time                   `json:"from"`
+	To                                  time.Time                   `json:"to"`
+	RequestsObserved                    int                         `json:"requests_observed"`
+	SuccessfulRequests                  int                         `json:"successful_requests"`
+	FailedRequests                      int                         `json:"failed_requests"`
+	ActualExecutionAttempts             int                         `json:"actual_execution_attempts"`
+	RequestsWithFallback                int                         `json:"requests_with_fallback"`
+	CoverageSeconds                     int64                       `json:"coverage_seconds"`
+	MinimumReviewRequests               int                         `json:"minimum_review_requests"`
+	MinimumReviewCoverage               int64                       `json:"minimum_review_coverage_seconds"`
+	WouldAdmitAttempts                  int                         `json:"would_admit_attempts"`
+	WouldWithholdAttempts               int                         `json:"would_withhold_attempts"`
+	UnknownDecisionAttempts             int                         `json:"unknown_decision_attempts"`
+	SuccessfulWouldWithhold             int                         `json:"successful_would_withhold"`
+	QuotaFailuresWouldAdmit             int                         `json:"quota_failures_would_admit"`
+	TokenCalibratedAttempts             int                         `json:"token_calibrated_attempts"`
+	TokenCalibratedWouldAdmit           int                         `json:"token_calibrated_would_admit"`
+	TokenCalibratedWouldWithhold        int                         `json:"token_calibrated_would_withhold"`
+	TokenCalibratedUnknown              int                         `json:"token_calibrated_unknown"`
+	SuccessfulTokenCalibratedWithhold   int                         `json:"successful_token_calibrated_would_withhold"`
+	TokenCalibratedQuotaFailuresOnAdmit int                         `json:"token_calibrated_quota_failures_would_admit"`
+	TokenCalibratedCoverageSeconds      int64                       `json:"token_calibrated_coverage_seconds"`
+	TokenCalibrationVerdict             string                      `json:"token_calibration_verdict"`
+	TokenCalibrationVerdictMessage      string                      `json:"token_calibration_verdict_message"`
+	LegacyShapeEstimateAttempts         int                         `json:"legacy_shape_estimate_attempts"`
+	RoutingChangesApplied               int                         `json:"routing_changes_applied"`
+	AdditionalProviderRequests          int                         `json:"additional_provider_requests"`
+	QueueDepth                          int                         `json:"queue_depth"`
+	QueueCapacity                       int                         `json:"queue_capacity"`
+	DroppedRecords                      uint64                      `json:"dropped_records"`
+	WriteFailures                       uint64                      `json:"write_failures"`
+	RotationFailures                    uint64                      `json:"rotation_failures"`
+	RecordsInMemory                     int                         `json:"records_in_memory"`
+	DiskBytes                           int64                       `json:"disk_bytes"`
+	DiskLimitBytes                      int64                       `json:"disk_limit_bytes"`
+	LastEventAt                         time.Time                   `json:"last_event_at,omitempty"`
+	Warning                             string                      `json:"warning,omitempty"`
+	Recent                              []adaptiveShadowAuditRecord `json:"recent,omitempty"`
 }
 
 type adaptiveShadowAuditStore struct {
@@ -455,6 +471,8 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 	report.RecordsInMemory = len(records)
 	report.DiskBytes = store.currentBytes.Load() + store.rotatedBytes.Load()
 	var firstEventAt time.Time
+	var firstTokenCalibratedAt time.Time
+	var lastTokenCalibratedAt time.Time
 	for _, record := range records {
 		if record.At.Before(report.From) || record.At.After(now.Add(time.Minute)) {
 			continue
@@ -476,19 +494,46 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 			firstEventAt = record.At
 		}
 		for _, attempt := range record.Attempts {
+			tokenCalibrated := strings.HasPrefix(attempt.EstimateConfidence, "token_calibrated_")
+			if tokenCalibrated {
+				report.TokenCalibratedAttempts++
+				if firstTokenCalibratedAt.IsZero() || record.At.Before(firstTokenCalibratedAt) {
+					firstTokenCalibratedAt = record.At
+				}
+				if record.At.After(lastTokenCalibratedAt) {
+					lastTokenCalibratedAt = record.At
+				}
+			} else {
+				report.LegacyShapeEstimateAttempts++
+			}
 			switch attempt.Decision {
 			case adaptiveShadowDecisionAdmit:
 				report.WouldAdmitAttempts++
+				if tokenCalibrated {
+					report.TokenCalibratedWouldAdmit++
+				}
 			case adaptiveShadowDecisionWithhold:
 				report.WouldWithholdAttempts++
+				if tokenCalibrated {
+					report.TokenCalibratedWouldWithhold++
+				}
 			default:
 				report.UnknownDecisionAttempts++
+				if tokenCalibrated {
+					report.TokenCalibratedUnknown++
+				}
 			}
 			if attempt.Success && attempt.Decision == adaptiveShadowDecisionWithhold {
 				report.SuccessfulWouldWithhold++
+				if tokenCalibrated {
+					report.SuccessfulTokenCalibratedWithhold++
+				}
 			}
 			if attempt.Decision == adaptiveShadowDecisionAdmit && adaptiveShadowAuditQuotaFailure(attempt.ErrorCode) {
 				report.QuotaFailuresWouldAdmit++
+				if tokenCalibrated {
+					report.TokenCalibratedQuotaFailuresOnAdmit++
+				}
 			}
 		}
 		if recentLimit > 0 {
@@ -502,6 +547,11 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 	if !firstEventAt.IsZero() && report.LastEventAt.After(firstEventAt) {
 		report.CoverageSeconds = int64(report.LastEventAt.Sub(firstEventAt) / time.Second)
 	}
+	if !firstTokenCalibratedAt.IsZero() && lastTokenCalibratedAt.After(firstTokenCalibratedAt) {
+		report.TokenCalibratedCoverageSeconds = int64(lastTokenCalibratedAt.Sub(firstTokenCalibratedAt) / time.Second)
+	}
+	report.TokenCalibrationVerdict = "collecting"
+	report.TokenCalibrationVerdictMessage = "Полностью токен-калиброванных наблюдений пока недостаточно; маршрутизация остаётся прежней."
 	if report.DroppedRecords > 0 || report.WriteFailures > 0 || report.RotationFailures > 0 ||
 		store.diskDisabled.Load() || report.Warning != "" {
 		report.Status = "warning"
@@ -526,6 +576,25 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 			int(adaptiveShadowAuditReviewCoverage/time.Hour),
 		)
 	}
+	if report.Status == "warning" {
+		report.TokenCalibrationVerdict = "telemetry_degraded"
+		report.TokenCalibrationVerdictMessage = "Часть наблюдений потеряна; для новой формулы нужен новый чистый период сбора."
+	} else if report.SuccessfulTokenCalibratedWithhold > 0 || report.TokenCalibratedQuotaFailuresOnAdmit > 0 {
+		report.TokenCalibrationVerdict = "needs_review"
+		report.TokenCalibrationVerdictMessage = "Полностью токен-калиброванные решения расходятся с фактическим результатом; включать влияние нельзя."
+	} else if report.TokenCalibratedUnknown > 0 {
+		report.TokenCalibrationVerdictMessage = "Есть токен-калиброванные попытки без подтверждённой квоты; сбор продолжается."
+	} else if report.TokenCalibratedAttempts >= adaptiveShadowAuditReviewRequests &&
+		report.TokenCalibratedCoverageSeconds >= int64(adaptiveShadowAuditReviewCoverage/time.Second) {
+		report.TokenCalibrationVerdict = "ready_for_review"
+		report.TokenCalibrationVerdictMessage = "Расхождений новой формулы не обнаружено; можно проводить ручной аудит перед отдельной канарейкой."
+	} else if report.TokenCalibratedAttempts > 0 {
+		report.TokenCalibrationVerdictMessage = fmt.Sprintf(
+			"Сбор новой формулы продолжается: нужно не менее %d полностью калиброванных попыток за %d часов.",
+			adaptiveShadowAuditReviewRequests,
+			int(adaptiveShadowAuditReviewCoverage/time.Hour),
+		)
+	}
 	return report
 }
 
@@ -536,18 +605,20 @@ func currentAdaptiveShadowAuditReport(cfg pluginConfig, period time.Duration, re
 	store := currentAdaptiveShadowAuditStore()
 	if store == nil {
 		return adaptiveShadowAuditReport{
-			SchemaVersion:         adaptiveShadowAuditSchemaVersion,
-			Status:                "disabled",
-			Verdict:               "collecting",
-			VerdictMessage:        "Shadow-журнал ещё не инициализирован.",
-			Mode:                  cfg.AdaptiveAllocatorMode,
-			Effect:                adaptiveShadowEffect(cfg),
-			From:                  now.UTC().Add(-period),
-			To:                    now.UTC(),
-			QueueCapacity:         adaptiveShadowAuditQueueCapacity,
-			DiskLimitBytes:        adaptiveShadowAuditTotalBytes,
-			MinimumReviewRequests: adaptiveShadowAuditReviewRequests,
-			MinimumReviewCoverage: int64(adaptiveShadowAuditReviewCoverage / time.Second),
+			SchemaVersion:                  adaptiveShadowAuditSchemaVersion,
+			Status:                         "disabled",
+			Verdict:                        "collecting",
+			VerdictMessage:                 "Shadow-журнал ещё не инициализирован.",
+			TokenCalibrationVerdict:        "collecting",
+			TokenCalibrationVerdictMessage: "Токен-калибровка ещё не инициализирована.",
+			Mode:                           cfg.AdaptiveAllocatorMode,
+			Effect:                         adaptiveShadowEffect(cfg),
+			From:                           now.UTC().Add(-period),
+			To:                             now.UTC(),
+			QueueCapacity:                  adaptiveShadowAuditQueueCapacity,
+			DiskLimitBytes:                 adaptiveShadowAuditTotalBytes,
+			MinimumReviewRequests:          adaptiveShadowAuditReviewRequests,
+			MinimumReviewCoverage:          int64(adaptiveShadowAuditReviewCoverage / time.Second),
 		}
 	}
 	return store.report(cfg, period, recentLimit, now)
@@ -576,18 +647,30 @@ func sanitizeAdaptiveShadowAuditRecord(record adaptiveShadowAuditRecord) adaptiv
 		attempt.Model = adaptiveShadowAuditToken(attempt.Model, 160)
 		attempt.Decision = adaptiveShadowAuditToken(attempt.Decision, 32)
 		attempt.EstimateConfidence = adaptiveShadowAuditToken(attempt.EstimateConfidence, 96)
+		attempt.ModelWeeklyName = adaptiveShadowAuditToken(attempt.ModelWeeklyName, 96)
 		attempt.Outcome = adaptiveShadowAuditToken(attempt.Outcome, 32)
 		attempt.ProviderAcceptance = adaptiveShadowAuditToken(attempt.ProviderAcceptance, 16)
 		attempt.ErrorCode = adaptiveShadowAuditToken(attempt.ErrorCode, 96)
-		attempt.ReservationPercent = adaptiveShadowRound(attempt.ReservationPercent)
-		attempt.PendingPercent = adaptiveShadowRound(attempt.PendingPercent)
-		attempt.SafeHeadroomBefore = adaptiveShadowRound(attempt.SafeHeadroomBefore)
-		attempt.SafeHeadroomAfter = adaptiveShadowRound(attempt.SafeHeadroomAfter)
+		attempt.ReservationPercent = adaptiveShadowAuditNumber(attempt.ReservationPercent, 0, 100)
+		attempt.SessionReservationPercent = adaptiveShadowAuditNumber(attempt.SessionReservationPercent, 0, 100)
+		attempt.WeeklyReservationPercent = adaptiveShadowAuditNumber(attempt.WeeklyReservationPercent, 0, 100)
+		attempt.ModelWeeklyReservationPercent = adaptiveShadowAuditNumber(attempt.ModelWeeklyReservationPercent, 0, 100)
+		attempt.PredictedTokens = adaptiveShadowAuditNumber(attempt.PredictedTokens, 0, 2*adaptiveShadowMaximumOutputTokens)
+		attempt.PendingPercent = adaptiveShadowAuditNumber(attempt.PendingPercent, 0, 1_000_000)
+		attempt.SafeHeadroomBefore = adaptiveShadowAuditNumber(attempt.SafeHeadroomBefore, -1_000_000, 1_000_000)
+		attempt.SafeHeadroomAfter = adaptiveShadowAuditNumber(attempt.SafeHeadroomAfter, -1_000_000, 1_000_000)
 		if attempt.LatencyMilliseconds < 0 {
 			attempt.LatencyMilliseconds = 0
 		}
 	}
 	return record
+}
+
+func adaptiveShadowAuditNumber(value, minimum, maximum float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return adaptiveShadowRound(math.Min(math.Max(value, minimum), maximum))
 }
 
 func adaptiveShadowAuditToken(value string, maximum int) string {

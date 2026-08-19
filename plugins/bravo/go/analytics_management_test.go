@@ -373,12 +373,14 @@ func isolateBravoUsageState(t *testing.T) func() {
 	previousPath := bravoUsageState.path
 	previousState := bravoUsageState.state
 	previousTimer := bravoUsageState.saveTimer
+	previousPendingSince := bravoUsageState.savePendingSince
 	if previousTimer != nil {
 		previousTimer.Stop()
 	}
 	bravoUsageState.path = ""
 	bravoUsageState.state = newPersistedUsageState()
 	bravoUsageState.saveTimer = nil
+	bravoUsageState.savePendingSince = time.Time{}
 	bravoUsageState.mu.Unlock()
 	return func() {
 		bravoUsageState.mu.Lock()
@@ -388,6 +390,7 @@ func isolateBravoUsageState(t *testing.T) func() {
 		bravoUsageState.path = previousPath
 		bravoUsageState.state = previousState
 		bravoUsageState.saveTimer = previousTimer
+		bravoUsageState.savePendingSince = previousPendingSince
 		bravoUsageState.mu.Unlock()
 	}
 }

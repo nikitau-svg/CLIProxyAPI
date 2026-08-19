@@ -46,8 +46,8 @@ func TestAdaptiveShadowEstimateUsesRequestShapeWithoutWeakeningTariff(t *testing
 	tariff := tariffByID(cfg, "x5")
 	small := buildAdaptiveShadowRequestFeatures([]byte(`{"max_tokens":64,"messages":[]}`))
 	large := buildAdaptiveShadowRequestFeatures([]byte(`{"max_tokens":1048576,"messages":[]}`))
-	haiku := adaptiveShadowEstimateFor(cfg, auth, candidate{Model: "claude-haiku-4-5-20251001", Effort: "low"}, tariff, small, now)
-	fable := adaptiveShadowEstimateFor(cfg, auth, candidate{Model: "claude-fable-5", Effort: "max"}, tariff, large, now)
+	haiku := adaptiveShadowEstimateFor(cfg, auth, candidate{Model: "claude-haiku-4-5-20251001", Effort: "low"}, tariff, credentialQuotaState{}, small, now)
+	fable := adaptiveShadowEstimateFor(cfg, auth, candidate{Model: "claude-fable-5", Effort: "max"}, tariff, credentialQuotaState{}, large, now)
 	if haiku.ReservationPercent < tariff.ReservationPercent {
 		t.Fatalf("haiku reservation %.4f weakened tariff %.4f", haiku.ReservationPercent, tariff.ReservationPercent)
 	}

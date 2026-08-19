@@ -15,6 +15,7 @@ refs/*
 plugins/*
 !plugins/bravo/
 !plugins/bravo/**
+plugins/bravo/go/bravo-data/
 .canary-dist/
 examples/plugin/bin/*
 

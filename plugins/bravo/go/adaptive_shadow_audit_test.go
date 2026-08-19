@@ -32,19 +32,24 @@ func TestAdaptiveShadowAuditRecorderCapturesOnlyPrivacySafeActualAttempts(t *tes
 		LogicalModel: "bravo/fable",
 	}}
 	attempt := executionAttempt{
-		Candidate:                    candidate{Provider: "claude", Model: "claude-fable-5"},
-		Auth:                         pluginapi.HostAuthFileEntry{AuthIndex: "auth-secret-must-not-enter-audit"},
-		ProjectID:                    "project-secret-must-not-enter-audit",
-		Primary:                      false,
-		AdaptiveShadow:               true,
-		AdaptiveReservationPercent:   2.5,
-		AdaptiveEstimateConfidence:   "shape_estimate",
-		AdaptiveShadowDecision:       adaptiveShadowDecisionWithhold,
-		AdaptiveShadowPendingPercent: 4,
-		AdaptiveShadowHeadroomBefore: 2,
-		AdaptiveShadowHeadroomAfter:  -0.5,
-		AdaptiveProviderDispatched:   true,
-		AdaptiveProviderAccepted:     true,
+		Candidate:                             candidate{Provider: "claude", Model: "claude-fable-5"},
+		Auth:                                  pluginapi.HostAuthFileEntry{AuthIndex: "auth-secret-must-not-enter-audit"},
+		ProjectID:                             "project-secret-must-not-enter-audit",
+		Primary:                               false,
+		AdaptiveShadow:                        true,
+		AdaptiveReservationPercent:            2.5,
+		AdaptiveSessionReservationPercent:     2.5,
+		AdaptiveWeeklyReservationPercent:      0.4,
+		AdaptiveModelWeeklyReservationPercent: 1.1,
+		AdaptiveModelWeeklyName:               "fable",
+		AdaptivePredictedTokens:               8192,
+		AdaptiveEstimateConfidence:            "token_calibrated_complete",
+		AdaptiveShadowDecision:                adaptiveShadowDecisionWithhold,
+		AdaptiveShadowPendingPercent:          4,
+		AdaptiveShadowHeadroomBefore:          2,
+		AdaptiveShadowHeadroomAfter:           -0.5,
+		AdaptiveProviderDispatched:            true,
+		AdaptiveProviderAccepted:              true,
 	}
 	recorder.success(attempt, started, http.StatusOK)
 	recorder.finish(true, http.StatusOK, executionFailure{})
@@ -53,11 +58,15 @@ func TestAdaptiveShadowAuditRecorderCapturesOnlyPrivacySafeActualAttempts(t *tes
 	report := store.report(defaultPluginConfig(), 24*time.Hour, 10, time.Now().Add(time.Second))
 	if report.RequestsObserved != 1 || report.ActualExecutionAttempts != 1 ||
 		report.SuccessfulWouldWithhold != 1 || report.AdditionalProviderRequests != 0 ||
-		report.RoutingChangesApplied != 0 {
+		report.RoutingChangesApplied != 0 || report.TokenCalibratedAttempts != 1 ||
+		report.SuccessfulTokenCalibratedWithhold != 1 || report.LegacyShapeEstimateAttempts != 0 ||
+		report.TokenCalibrationVerdict != "needs_review" {
 		t.Fatalf("unexpected audit report: %#v", report)
 	}
 	if len(report.Recent) != 1 || len(report.Recent[0].Attempts) != 1 ||
-		report.Recent[0].Attempts[0].ProviderAcceptance != "confirmed" {
+		report.Recent[0].Attempts[0].ProviderAcceptance != "confirmed" ||
+		report.Recent[0].Attempts[0].PredictedTokens != 8192 ||
+		report.Recent[0].Attempts[0].WeeklyReservationPercent != 0.4 {
 		t.Fatalf("unexpected recent audit: %#v", report.Recent)
 	}
 	raw, errMarshal := json.Marshal(report.Recent)
@@ -76,6 +85,20 @@ func TestAdaptiveShadowAuditRecorderCapturesOnlyPrivacySafeActualAttempts(t *tes
 		if strings.Contains(string(raw), forbidden) {
 			t.Fatalf("shadow audit exposed forbidden value %q: %s", forbidden, raw)
 		}
+	}
+}
+
+func TestAdaptiveShadowAuditKeepsPartialCalibrationOutOfV2Cohort(t *testing.T) {
+	store := newAdaptiveShadowAuditStore(filepath.Join(t.TempDir(), "state.json"), 8)
+	at := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	record := adaptiveShadowAuditTestRecord(at, adaptiveShadowDecisionWithhold, true, "")
+	record.Attempts[0].EstimateConfidence = "partial_token_calibration_1_windows"
+	store.appendMemory(record)
+
+	report := store.report(defaultPluginConfig(), time.Hour, 0, at.Add(time.Minute))
+	if report.TokenCalibratedAttempts != 0 || report.LegacyShapeEstimateAttempts != 1 ||
+		report.TokenCalibrationVerdict != "collecting" {
+		t.Fatalf("partial calibration contaminated v2 cohort: %#v", report)
 	}
 }
 

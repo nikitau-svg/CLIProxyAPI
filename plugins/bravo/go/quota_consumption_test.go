@@ -146,6 +146,31 @@ func TestQuotaConsumptionSkipsProviderResetAndPersistsProjectDimensions(t *testi
 	}
 }
 
+func TestQuotaConsumptionAttributesSharedDropByTokenVolume(t *testing.T) {
+	previousAt := time.Date(2026, 8, 14, 7, 0, 0, 0, time.UTC)
+	observedAt := previousAt.Add(time.Hour)
+	before := quotaWindowState{RemainingPercent: 80}
+	after := quotaWindowState{RemainingPercent: 70}
+	commits := []adaptiveShadowCommit{
+		{At: previousAt.Add(time.Minute), Percent: 5, TokenUnits: 9000, ProjectID: "prj_large", Model: "claude-sonnet-5", Multiplier: 1},
+		{At: previousAt.Add(2 * time.Minute), Percent: 5, TokenUnits: 1000, ProjectID: "prj_small", Model: "claude-sonnet-5", Multiplier: 1},
+	}
+	observation, projects := buildQuotaConsumptionWindow(
+		"auth-private", "claude", pluginapi.HostAuthQuotaWindowKindSession, "",
+		before, after, previousAt, observedAt, commits,
+	)
+	if len(projects) != 2 || observation.Counters.AttributedProjectPercent != 10 {
+		t.Fatalf("token attribution = observation %#v projects %#v", observation, projects)
+	}
+	values := make(map[string]float64, len(projects))
+	for _, project := range projects {
+		values[project.ProjectID] = project.Counters.AttributedPercent
+	}
+	if values["prj_large"] != 9 || values["prj_small"] != 1 {
+		t.Fatalf("drop was not apportioned 90/10 by tokens: %#v", values)
+	}
+}
+
 func TestQuotaConsumptionHighConfidenceFlagsFableMaxAndCapacity(t *testing.T) {
 	project := &quotaConsumptionProjectAccumulator{
 		ProjectID: "prj_heavy",

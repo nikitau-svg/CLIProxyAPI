@@ -18,6 +18,7 @@ import (
 const (
 	usageStateSchemaVersion  = 3
 	usageSaveDebounce        = 250 * time.Millisecond
+	usageSaveMaximumDelay    = 30 * time.Second
 	sessionUsageWindow       = 5 * time.Hour
 	weeklyUsageWindow        = 7 * 24 * time.Hour
 	hourlyUsageRetention     = 31 * 24 * time.Hour
@@ -129,31 +130,42 @@ type persistedCooldownEntry struct {
 }
 
 type persistedUsageState struct {
-	SchemaVersion                  int                                                `json:"schema_version"`
-	GlobalTotal                    usageAggregate                                     `json:"global_total"`
-	AuthTotals                     map[string]*usageAggregate                         `json:"auth_totals"`
-	ProjectTotals                  map[string]*usageAggregate                         `json:"project_totals"`
-	ProviderTotals                 map[string]*usageAggregate                         `json:"provider_totals"`
-	ModelTotals                    map[string]*modelUsageAggregate                    `json:"model_totals"`
-	ProjectSubscriptionModelTotals map[string]*projectSubscriptionModelUsageAggregate `json:"project_subscription_model_totals"`
-	Quotas                         map[string]*credentialQuotaState                   `json:"quotas"`
-	Cooldowns                      map[string]*persistedCooldownEntry                 `json:"cooldowns,omitempty"`
-	QuotaObservations              map[string]*quotaObservationUsageAggregate         `json:"quota_observations,omitempty"`
-	QuotaProjectAttributions       map[string]*quotaProjectUsageAggregate             `json:"quota_project_attributions,omitempty"`
-	QuotaAttributionStartedAt      time.Time                                          `json:"quota_attribution_started_at,omitempty"`
-	DimensionalStartedAt           time.Time                                          `json:"dimensional_started_at,omitempty"`
-	UpdatedAt                      time.Time                                          `json:"updated_at,omitempty"`
+	SchemaVersion                     int                                                `json:"schema_version"`
+	GlobalTotal                       usageAggregate                                     `json:"global_total"`
+	AuthTotals                        map[string]*usageAggregate                         `json:"auth_totals"`
+	ProjectTotals                     map[string]*usageAggregate                         `json:"project_totals"`
+	ProviderTotals                    map[string]*usageAggregate                         `json:"provider_totals"`
+	ModelTotals                       map[string]*modelUsageAggregate                    `json:"model_totals"`
+	ProjectSubscriptionModelTotals    map[string]*projectSubscriptionModelUsageAggregate `json:"project_subscription_model_totals"`
+	Quotas                            map[string]*credentialQuotaState                   `json:"quotas"`
+	Cooldowns                         map[string]*persistedCooldownEntry                 `json:"cooldowns,omitempty"`
+	QuotaObservations                 map[string]*quotaObservationUsageAggregate         `json:"quota_observations,omitempty"`
+	QuotaProjectAttributions          map[string]*quotaProjectUsageAggregate             `json:"quota_project_attributions,omitempty"`
+	QuotaAttributionStartedAt         time.Time                                          `json:"quota_attribution_started_at,omitempty"`
+	AdaptiveTokenUsageProfiles        map[string]*persistedAdaptiveTokenUsageProfile     `json:"adaptive_token_usage_profiles,omitempty"`
+	AdaptiveTokenWindowProfiles       map[string]*persistedAdaptiveTokenWindowProfile    `json:"adaptive_token_window_profiles,omitempty"`
+	AdaptiveTokenCalibrationStartedAt time.Time                                          `json:"adaptive_token_calibration_started_at,omitempty"`
+	AdaptiveTokenDroppedProfiles      uint64                                             `json:"adaptive_token_dropped_profiles,omitempty"`
+	AdaptiveTokenCalibrationSaturated bool                                               `json:"adaptive_token_calibration_saturated,omitempty"`
+	DimensionalStartedAt              time.Time                                          `json:"dimensional_started_at,omitempty"`
+	UpdatedAt                         time.Time                                          `json:"updated_at,omitempty"`
 }
 
 type usageStateStore struct {
-	mu         sync.RWMutex
-	path       string
-	state      persistedUsageState
-	saveTimer  *time.Timer
-	generation atomic.Uint64
+	mu                        sync.RWMutex
+	path                      string
+	state                     persistedUsageState
+	saveTimer                 *time.Timer
+	savePendingSince          time.Time
+	generation                atomic.Uint64
+	snapshotMu                sync.Mutex
+	snapshotSequence          atomic.Uint64
+	persistedSnapshotSequence uint64
 }
 
 var bravoUsageState = &usageStateStore{}
+
+var usageSnapshotBeforePersist func()
 
 func newPersistedUsageState() persistedUsageState {
 	return persistedUsageState{
@@ -168,6 +180,8 @@ func newPersistedUsageState() persistedUsageState {
 		Cooldowns:                      make(map[string]*persistedCooldownEntry),
 		QuotaObservations:              make(map[string]*quotaObservationUsageAggregate),
 		QuotaProjectAttributions:       make(map[string]*quotaProjectUsageAggregate),
+		AdaptiveTokenUsageProfiles:     make(map[string]*persistedAdaptiveTokenUsageProfile),
+		AdaptiveTokenWindowProfiles:    make(map[string]*persistedAdaptiveTokenWindowProfile),
 	}
 }
 
@@ -176,6 +190,143 @@ func newUsageAggregate() usageAggregate {
 		Hourly: make(map[string]usageCounters),
 		Daily:  make(map[string]usageCounters),
 	}
+}
+
+func clonePersistedUsageState(source persistedUsageState) persistedUsageState {
+	cloned := source
+	cloned.GlobalTotal = cloneUsageAggregate(source.GlobalTotal)
+	cloned.AuthTotals = cloneUsageAggregateMap(source.AuthTotals)
+	cloned.ProjectTotals = cloneUsageAggregateMap(source.ProjectTotals)
+	cloned.ProviderTotals = cloneUsageAggregateMap(source.ProviderTotals)
+	cloned.ModelTotals = make(map[string]*modelUsageAggregate, len(source.ModelTotals))
+	for key, value := range source.ModelTotals {
+		if value == nil {
+			continue
+		}
+		copyValue := *value
+		copyValue.Usage = cloneUsageAggregate(value.Usage)
+		cloned.ModelTotals[key] = &copyValue
+	}
+	cloned.ProjectSubscriptionModelTotals = make(map[string]*projectSubscriptionModelUsageAggregate, len(source.ProjectSubscriptionModelTotals))
+	for key, value := range source.ProjectSubscriptionModelTotals {
+		if value == nil {
+			continue
+		}
+		copyValue := *value
+		copyValue.Usage = cloneUsageAggregate(value.Usage)
+		cloned.ProjectSubscriptionModelTotals[key] = &copyValue
+	}
+	cloned.Quotas = make(map[string]*credentialQuotaState, len(source.Quotas))
+	for key, value := range source.Quotas {
+		if value == nil {
+			continue
+		}
+		copyValue := *value
+		copyValue.ModelWeekly = append([]modelQuotaWindowState(nil), value.ModelWeekly...)
+		copyValue.UsageRefresh = cloneQuotaRefreshState(value.UsageRefresh)
+		copyValue.ProfileRefresh = cloneQuotaRefreshState(value.ProfileRefresh)
+		cloned.Quotas[key] = &copyValue
+	}
+	cloned.Cooldowns = make(map[string]*persistedCooldownEntry, len(source.Cooldowns))
+	for key, value := range source.Cooldowns {
+		if value == nil {
+			continue
+		}
+		copyValue := *value
+		if value.ProviderError != nil {
+			copyError := *value.ProviderError
+			copyValue.ProviderError = &copyError
+		}
+		cloned.Cooldowns[key] = &copyValue
+	}
+	cloned.QuotaObservations = make(map[string]*quotaObservationUsageAggregate, len(source.QuotaObservations))
+	for key, value := range source.QuotaObservations {
+		if value == nil {
+			continue
+		}
+		copyValue := *value
+		copyValue.Usage.Hourly = cloneQuotaObservationCounters(value.Usage.Hourly)
+		copyValue.Usage.Daily = cloneQuotaObservationCounters(value.Usage.Daily)
+		cloned.QuotaObservations[key] = &copyValue
+	}
+	cloned.QuotaProjectAttributions = make(map[string]*quotaProjectUsageAggregate, len(source.QuotaProjectAttributions))
+	for key, value := range source.QuotaProjectAttributions {
+		if value == nil {
+			continue
+		}
+		copyValue := *value
+		copyValue.Usage.Hourly = cloneQuotaProjectCounters(value.Usage.Hourly)
+		copyValue.Usage.Daily = cloneQuotaProjectCounters(value.Usage.Daily)
+		cloned.QuotaProjectAttributions[key] = &copyValue
+	}
+	cloned.AdaptiveTokenUsageProfiles = make(map[string]*persistedAdaptiveTokenUsageProfile, len(source.AdaptiveTokenUsageProfiles))
+	for key, value := range source.AdaptiveTokenUsageProfiles {
+		if value == nil {
+			continue
+		}
+		copyValue := *value
+		copyValue.CompletionBuckets = append([]float64(nil), value.CompletionBuckets...)
+		cloned.AdaptiveTokenUsageProfiles[key] = &copyValue
+	}
+	cloned.AdaptiveTokenWindowProfiles = make(map[string]*persistedAdaptiveTokenWindowProfile, len(source.AdaptiveTokenWindowProfiles))
+	for key, value := range source.AdaptiveTokenWindowProfiles {
+		if value == nil {
+			continue
+		}
+		copyValue := *value
+		cloned.AdaptiveTokenWindowProfiles[key] = &copyValue
+	}
+	return cloned
+}
+
+func cloneUsageAggregate(source usageAggregate) usageAggregate {
+	cloned := source
+	cloned.Hourly = make(map[string]usageCounters, len(source.Hourly))
+	for key, value := range source.Hourly {
+		cloned.Hourly[key] = value
+	}
+	cloned.Daily = make(map[string]usageCounters, len(source.Daily))
+	for key, value := range source.Daily {
+		cloned.Daily[key] = value
+	}
+	return cloned
+}
+
+func cloneUsageAggregateMap(source map[string]*usageAggregate) map[string]*usageAggregate {
+	cloned := make(map[string]*usageAggregate, len(source))
+	for key, value := range source {
+		if value == nil {
+			continue
+		}
+		copyValue := cloneUsageAggregate(*value)
+		cloned[key] = &copyValue
+	}
+	return cloned
+}
+
+func cloneQuotaRefreshState(source quotaRefreshState) quotaRefreshState {
+	cloned := source
+	if source.Error != nil {
+		copyError := *source.Error
+		cloned.Error = &copyError
+	}
+	return cloned
+}
+
+func cloneQuotaObservationCounters(source map[string]quotaObservationCounters) map[string]quotaObservationCounters {
+	cloned := make(map[string]quotaObservationCounters, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneQuotaProjectCounters(source map[string]quotaProjectCounters) map[string]quotaProjectCounters {
+	cloned := make(map[string]quotaProjectCounters, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func configureUsageState(path string) error {
@@ -329,6 +480,7 @@ func normalizePersistedUsageState(state *persistedUsageState) {
 		state.Quotas = make(map[string]*credentialQuotaState)
 	}
 	normalizeQuotaConsumptionState(state)
+	normalizeAdaptiveTokenCalibrationState(state)
 	normalizedCooldowns := make(map[string]*persistedCooldownEntry, len(state.Cooldowns))
 	for _, persisted := range state.Cooldowns {
 		entry, ok := runtimeCooldownFromPersisted(persisted)
@@ -424,6 +576,7 @@ func prunePersistedUsageState(state *persistedUsageState, reference time.Time) {
 		}
 	}
 	pruneQuotaConsumptionState(state, reference)
+	pruneAdaptiveTokenCalibrationState(state, reference)
 	for key, entry := range state.Cooldowns {
 		if entry == nil || !entry.Until.After(reference) {
 			delete(state.Cooldowns, key)
@@ -439,22 +592,53 @@ func (store *usageStateStore) scheduleSaveLocked() {
 	if store.path == "" {
 		return
 	}
+	now := time.Now().UTC()
+	if store.savePendingSince.IsZero() {
+		store.savePendingSince = now
+	}
+	delay := usageSaveDebounce
+	if remaining := usageSaveMaximumDelay - now.Sub(store.savePendingSince); remaining < delay {
+		delay = remaining
+	}
+	if delay < 0 {
+		delay = 0
+	}
 	if store.saveTimer != nil {
 		store.saveTimer.Stop()
 	}
-	store.saveTimer = time.AfterFunc(usageSaveDebounce, func() {
+	store.saveTimer = time.AfterFunc(delay, func() {
 		_ = store.flush()
 	})
 }
 
 func (store *usageStateStore) flush() error {
 	store.mu.Lock()
-	defer store.mu.Unlock()
 	if store.saveTimer != nil {
 		store.saveTimer.Stop()
 		store.saveTimer = nil
 	}
-	return store.saveLocked()
+	if store.path == "" {
+		store.mu.Unlock()
+		return nil
+	}
+	now := time.Now().UTC()
+	normalizePersistedUsageState(&store.state)
+	prunePersistedUsageState(&store.state, now)
+	store.state.UpdatedAt = now
+	snapshot := clonePersistedUsageState(store.state)
+	path := store.path
+	sequence := store.snapshotSequence.Add(1)
+	store.savePendingSince = time.Time{}
+	store.mu.Unlock()
+	errPersist := store.persistSnapshot(path, snapshot, sequence)
+	if errPersist != nil {
+		store.mu.Lock()
+		if store.path == path {
+			store.scheduleSaveLocked()
+		}
+		store.mu.Unlock()
+	}
+	return errPersist
 }
 
 func (store *usageStateStore) saveLocked() error {
@@ -465,11 +649,31 @@ func (store *usageStateStore) saveLocked() error {
 	normalizePersistedUsageState(&store.state)
 	prunePersistedUsageState(&store.state, now)
 	store.state.UpdatedAt = now
-	raw, errMarshal := json.MarshalIndent(store.state, "", "  ")
+	snapshot := clonePersistedUsageState(store.state)
+	sequence := store.snapshotSequence.Add(1)
+	errPersist := store.persistSnapshot(store.path, snapshot, sequence)
+	if errPersist == nil {
+		store.savePendingSince = time.Time{}
+	}
+	return errPersist
+}
+
+func (store *usageStateStore) persistSnapshot(path string, snapshot persistedUsageState, sequence uint64) error {
+	store.snapshotMu.Lock()
+	defer store.snapshotMu.Unlock()
+	// A newer captured state supersedes this writer even if goroutine
+	// scheduling delivered the older snapshot to the I/O lane later.
+	if sequence < store.snapshotSequence.Load() || sequence <= store.persistedSnapshotSequence {
+		return nil
+	}
+	if usageSnapshotBeforePersist != nil {
+		usageSnapshotBeforePersist()
+	}
+	raw, errMarshal := json.MarshalIndent(snapshot, "", "  ")
 	if errMarshal != nil {
 		return fmt.Errorf("encode state snapshot: %w", errMarshal)
 	}
-	dir := filepath.Dir(store.path)
+	dir := filepath.Dir(path)
 	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
 		return fmt.Errorf("create state directory: %w", errMkdir)
 	}
@@ -494,12 +698,13 @@ func (store *usageStateStore) saveLocked() error {
 	if errClose := temp.Close(); errClose != nil {
 		return fmt.Errorf("close state snapshot: %w", errClose)
 	}
-	if errRename := os.Rename(tempName, store.path); errRename != nil {
+	if errRename := os.Rename(tempName, path); errRename != nil {
 		return fmt.Errorf("replace state snapshot: %w", errRename)
 	}
-	if errChmod := os.Chmod(store.path, 0o600); errChmod != nil {
+	if errChmod := os.Chmod(path, 0o600); errChmod != nil {
 		return fmt.Errorf("chmod state snapshot: %w", errChmod)
 	}
+	store.persistedSnapshotSequence = sequence
 	return nil
 }
 
@@ -678,6 +883,7 @@ func handleUsageRecord(raw []byte) ([]byte, error) {
 }
 
 func (store *usageStateStore) record(record pluginapi.UsageRecord) {
+	tokenEvent, tokenEventOK := buildAdaptiveTokenUsageEvent(record)
 	authIndex := strings.TrimSpace(record.AuthIndex)
 	projectID := projectIDFromUsagePrincipal(record.APIKey)
 	if authIndex == "" && projectID == "" {
@@ -728,6 +934,9 @@ func (store *usageStateStore) record(record pluginapi.UsageRecord) {
 	}
 	if store.state.SchemaVersion == 0 {
 		store.state.SchemaVersion = usageStateSchemaVersion
+	}
+	if tokenEventOK {
+		recordAdaptiveTokenUsageProfileLocked(&store.state, tokenEvent)
 	}
 	if store.state.DimensionalStartedAt.IsZero() {
 		store.state.DimensionalStartedAt = at

@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.9.0-preview.4"
+	pluginVersion    = "0.9.0-preview.5"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -184,29 +184,34 @@ type candidate struct {
 }
 
 type executionAttempt struct {
-	LogicalModel                 string
-	Candidate                    candidate
-	Auth                         pluginapi.HostAuthFileEntry
-	RequestedEffort              string
-	EffectiveEffort              string
-	ProjectID                    string
-	Primary                      bool
-	AllocatorManaged             bool
-	ReservationPercent           float64
-	TariffID                     string
-	CompactBypass                bool
-	CompactBypassKey             string
-	CompactBypassCooldownSeconds int
-	PreflightRejections          []candidateRejection
-	AdaptiveShadow               bool
-	AdaptiveReservationPercent   float64
-	AdaptiveEstimateConfidence   string
-	AdaptiveShadowDecision       string
-	AdaptiveShadowPendingPercent float64
-	AdaptiveShadowHeadroomBefore float64
-	AdaptiveShadowHeadroomAfter  float64
-	AdaptiveProviderDispatched   bool
-	AdaptiveProviderAccepted     bool
+	LogicalModel                          string
+	Candidate                             candidate
+	Auth                                  pluginapi.HostAuthFileEntry
+	RequestedEffort                       string
+	EffectiveEffort                       string
+	ProjectID                             string
+	Primary                               bool
+	AllocatorManaged                      bool
+	ReservationPercent                    float64
+	TariffID                              string
+	CompactBypass                         bool
+	CompactBypassKey                      string
+	CompactBypassCooldownSeconds          int
+	PreflightRejections                   []candidateRejection
+	AdaptiveShadow                        bool
+	AdaptiveReservationPercent            float64
+	AdaptiveSessionReservationPercent     float64
+	AdaptiveWeeklyReservationPercent      float64
+	AdaptiveModelWeeklyReservationPercent float64
+	AdaptiveModelWeeklyName               string
+	AdaptivePredictedTokens               float64
+	AdaptiveEstimateConfidence            string
+	AdaptiveShadowDecision                string
+	AdaptiveShadowPendingPercent          float64
+	AdaptiveShadowHeadroomBefore          float64
+	AdaptiveShadowHeadroomAfter           float64
+	AdaptiveProviderDispatched            bool
+	AdaptiveProviderAccepted              bool
 }
 
 type attemptRecord struct {

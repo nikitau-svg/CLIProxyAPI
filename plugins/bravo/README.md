@@ -190,6 +190,20 @@ zero routing changes/zero extra provider requests. A clean report becomes
 with no unknown shadow decisions; this is evidence for a human decision, never
 automatic promotion.
 
+Preview.5 additionally calibrates the shadow estimate against actual usage
+tokens already emitted by normal inference. Session, weekly and model-weekly
+quota windows learn independent percentage-point-per-token rates; they are not
+summed or forced through one scalar. Until a profile has enough confirmed
+intervals the existing conservative shape estimate remains in use. The
+Management/project status exposes only aggregate per-window calibration rows,
+and the audit separates fully `token_calibrated_*` attempts from partial and
+cold/legacy ones, with an independent verdict for the new formula.
+Profiles are bounded, decay with a 24-hour half-life, survive restart, contain
+no prompts or responses, and still have no routing authority.
+The invariants and release gates are in
+[`docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md`](docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md)
+and [`ADAPTIVE_TOKEN_CALIBRATION_TEST_PLAN.md`](ADAPTIVE_TOKEN_CALIBRATION_TEST_PLAN.md).
+
 `adaptive_allocator_mode` accepts only `off` or `observe` in this preview.
 `assist` and `enforce` are rejected at configuration time, so a partial rollout
 cannot accidentally turn telemetry into a routing gate. The full contract and
