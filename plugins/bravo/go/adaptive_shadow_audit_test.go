@@ -50,6 +50,16 @@ func TestAdaptiveShadowAuditRecorderCapturesOnlyPrivacySafeActualAttempts(t *tes
 		AdaptiveShadowHeadroomAfter:           -0.5,
 		AdaptiveProviderDispatched:            true,
 		AdaptiveProviderAccepted:              true,
+		AdaptiveEdgeGate: &adaptiveEdgeGateAttemptState{
+			authIndex:              "auth-secret-must-not-enter-audit",
+			state:                  adaptiveEdgeGateStateGuarded,
+			decision:               adaptiveEdgeGateDecisionSkipBusy,
+			reason:                 "guarded_request_busy",
+			quotaConfirmed:         true,
+			sessionHeadroomPercent: 3,
+			weeklyHeadroomPercent:  1,
+			outcomeTransition:      "counterfactual_only",
+		},
 	}
 	recorder.success(attempt, started, http.StatusOK)
 	recorder.finish(true, http.StatusOK, executionFailure{})
@@ -66,7 +76,9 @@ func TestAdaptiveShadowAuditRecorderCapturesOnlyPrivacySafeActualAttempts(t *tes
 	if len(report.Recent) != 1 || len(report.Recent[0].Attempts) != 1 ||
 		report.Recent[0].Attempts[0].ProviderAcceptance != "confirmed" ||
 		report.Recent[0].Attempts[0].PredictedTokens != 8192 ||
-		report.Recent[0].Attempts[0].WeeklyReservationPercent != 0.4 {
+		report.Recent[0].Attempts[0].WeeklyReservationPercent != 0.4 ||
+		report.Recent[0].Attempts[0].EdgeGateDecision != adaptiveEdgeGateDecisionSkipBusy ||
+		report.EdgeGateAttempts != 1 || report.EdgeGateSuccessfulWouldSkip != 1 {
 		t.Fatalf("unexpected recent audit: %#v", report.Recent)
 	}
 	raw, errMarshal := json.Marshal(report.Recent)
@@ -85,6 +97,66 @@ func TestAdaptiveShadowAuditRecorderCapturesOnlyPrivacySafeActualAttempts(t *tes
 		if strings.Contains(string(raw), forbidden) {
 			t.Fatalf("shadow audit exposed forbidden value %q: %s", forbidden, raw)
 		}
+	}
+}
+
+func TestAdaptiveShadowAuditAggregatesEdgeGateCounterfactuals(t *testing.T) {
+	now := time.Date(2026, 8, 27, 18, 0, 0, 0, time.UTC)
+	store := newAdaptiveShadowAuditStore(filepath.Join(t.TempDir(), "state.json"), 4)
+	for index := 0; index < adaptiveShadowAuditReviewRequests; index++ {
+		at := now.Add(-adaptiveShadowAuditReviewCoverage).Add(
+			time.Duration(index) * adaptiveShadowAuditReviewCoverage / time.Duration(adaptiveShadowAuditReviewRequests-1),
+		)
+		record := adaptiveShadowAuditTestRecord(at, adaptiveShadowDecisionAdmit, true, "")
+		attempt := &record.Attempts[0]
+		attempt.EdgeGateState = adaptiveEdgeGateStateGreen
+		attempt.EdgeGateDecision = adaptiveEdgeGateDecisionDispatch
+		attempt.EdgeGateReason = "confirmed_headroom"
+		attempt.EdgeGateQuotaConfirmed = true
+		attempt.EdgeGateSessionHeadroom = 50
+		attempt.EdgeGateWeeklyHeadroom = 40
+		switch index {
+		case 1:
+			attempt.EdgeGateState = adaptiveEdgeGateStateGuarded
+			attempt.EdgeGateDecision = adaptiveEdgeGateDecisionSkipBusy
+			attempt.EdgeGateOutcomeTransition = "counterfactual_only"
+		case 2:
+			record.Success = false
+			record.Status = http.StatusTooManyRequests
+			attempt.Success = false
+			attempt.Status = http.StatusTooManyRequests
+			attempt.ErrorCode = "bravo_subscription_quota_exhausted"
+			attempt.EdgeGateState = adaptiveEdgeGateStateTripped
+			attempt.EdgeGateDecision = adaptiveEdgeGateDecisionSkipTripped
+			attempt.EdgeGateOutcomeTransition = "counterfactual_only"
+		case 3:
+			attempt.EdgeGateState = adaptiveEdgeGateStateHalfOpen
+			attempt.EdgeGateDecision = adaptiveEdgeGateDecisionProbe
+			attempt.EdgeGateOutcomeTransition = "reopened"
+		case 4:
+			record.Success = false
+			record.Status = http.StatusTooManyRequests
+			attempt.Success = false
+			attempt.Status = http.StatusTooManyRequests
+			attempt.ErrorCode = "bravo_subscription_quota_exhausted"
+			attempt.EdgeGateOutcomeTransition = "tripped_model"
+		}
+		store.appendMemory(sanitizeAdaptiveShadowAuditRecord(record))
+	}
+
+	report := store.report(defaultPluginConfig(), 24*time.Hour, 0, now)
+	if report.EdgeGateVerdict != "ready_for_review" ||
+		report.EdgeGateAttempts != adaptiveShadowAuditReviewRequests ||
+		report.EdgeGateCoverageSeconds < int64(adaptiveShadowAuditReviewCoverage/time.Second) ||
+		report.EdgeGateSuccessfulWouldSkip != 1 ||
+		report.EdgeGateQuotaFailuresWouldSkip != 1 ||
+		report.EdgeGateQuotaFailuresWhileDispatch != 1 ||
+		report.EdgeGateTripsObserved != 1 ||
+		report.EdgeGateReopensObserved != 1 ||
+		report.EdgeGateWouldSkipBusy != 1 ||
+		report.EdgeGateWouldSkipTripped != 1 ||
+		report.EdgeGateWouldProbe != 1 {
+		t.Fatalf("unexpected edge-gate audit: %#v", report)
 	}
 }
 

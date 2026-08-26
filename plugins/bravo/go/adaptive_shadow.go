@@ -109,6 +109,7 @@ type adaptiveShadowPublicView struct {
 	DroppedAccounts            uint64                             `json:"dropped_accounts"`
 	TokenCalibration           adaptiveTokenCalibrationPublicView `json:"token_calibration"`
 	ForecastBacktest           adaptiveForecastBacktestPublicView `json:"forecast_backtest"`
+	EdgeGate                   adaptiveEdgeGatePublicView         `json:"edge_gate"`
 	Note                       string                             `json:"note"`
 }
 
@@ -266,6 +267,13 @@ func annotateAdaptiveShadowPlan(
 		attempts[index].AdaptiveShadowPendingPercent = pending
 		attempts[index].AdaptiveShadowHeadroomBefore = before
 		attempts[index].AdaptiveShadowHeadroomAfter = after
+		attempts[index].AdaptiveEdgeGate = newAdaptiveEdgeGateAttemptState(
+			cfg,
+			attempts[index],
+			quota,
+			tariff,
+			now,
+		)
 	}
 	return attempts
 }
@@ -385,9 +393,10 @@ func adaptiveShadowEffectivePendingForWindow(authIndex, kind, quotaModel string,
 }
 
 func wrapAdaptiveShadowLease(attempt executionAttempt, release func(bool)) func(bool) {
-	if !attempt.AdaptiveShadow || attempt.AdaptiveReservationPercent <= 0 {
+	if !attempt.AdaptiveShadow {
 		return release
 	}
+	beginAdaptiveEdgeGateShadow(attempt, adaptiveShadowNow())
 	var once sync.Once
 	return func(commit bool) {
 		once.Do(func() {
@@ -697,6 +706,7 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 		MaximumLearnedScale:        1,
 		TokenCalibration:           tokenCalibration,
 		ForecastBacktest:           forecastBacktest,
+		EdgeGate:                   adaptiveEdgeGateSummary(cfg, authIndexes, now),
 		Note:                       "Теневой расчёт не блокирует запросы и не меняет маршруты; он не выполняет дополнительных обращений к подпискам.",
 	}
 	adaptiveShadowRuntime.Lock()
@@ -794,6 +804,7 @@ func resetAdaptiveShadowForTest() {
 	adaptiveShadowRuntime.DroppedAccounts = 0
 	adaptiveShadowRuntime.Unlock()
 	resetAdaptiveTokenCalibrationForTest()
+	resetAdaptiveEdgeGateForTest()
 }
 
 // adaptiveShadowDeclaredOutputTokens is a bounded-allocation top-level JSON

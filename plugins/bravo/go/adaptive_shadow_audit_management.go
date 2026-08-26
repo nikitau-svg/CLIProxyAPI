@@ -93,6 +93,18 @@ func renderAdaptiveShadowAuditText(report adaptiveShadowAuditReport, hours int) 
 		report.LegacyShapeEstimateAttempts)
 	fmt.Fprintf(&out, "Вердикт новой формулы: %s — %s\n",
 		report.TokenCalibrationVerdict, report.TokenCalibrationVerdictMessage)
+	fmt.Fprintf(&out, "Shadow-турникет: %s — %s\n",
+		report.EdgeGateVerdict, report.EdgeGateVerdictMessage)
+	fmt.Fprintf(&out, "Состояния турникета: green %d; guarded %d; tripped %d; half-open %d\n",
+		report.EdgeGateGreenAttempts, report.EdgeGateGuardedAttempts,
+		report.EdgeGateTrippedAttempts, report.EdgeGateHalfOpenAttempts)
+	fmt.Fprintf(&out, "Решения турникета: выполнить %d; probe %d; сразу сменить маршрут из-за busy %d; из-за breaker %d\n",
+		report.EdgeGateWouldDispatch, report.EdgeGateWouldProbe,
+		report.EdgeGateWouldSkipBusy, report.EdgeGateWouldSkipTripped)
+	fmt.Fprintf(&out, "Проверка турникета: успешных would_skip %d; quota-ошибок на would_skip %d; quota-ошибок при dispatch/probe %d; trip/reopen %d/%d\n",
+		report.EdgeGateSuccessfulWouldSkip, report.EdgeGateQuotaFailuresWouldSkip,
+		report.EdgeGateQuotaFailuresWhileDispatch, report.EdgeGateTripsObserved,
+		report.EdgeGateReopensObserved)
 	fmt.Fprintf(&out, "Дополнительные обращения к подпискам/провайдерам: %d; применённых изменений маршрута: %d\n",
 		report.AdditionalProviderRequests, report.RoutingChangesApplied)
 	fmt.Fprintf(&out, "Телеметрия: очередь %d/%d; потеряно %d; ошибок записи %d; диск %d/%d байт\n",

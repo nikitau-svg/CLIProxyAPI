@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.9.0-preview.7"
+	pluginVersion    = "0.9.0-preview.8"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -215,6 +215,10 @@ type executionAttempt struct {
 	AdaptiveShadowHeadroomAfter           float64
 	AdaptiveProviderDispatched            bool
 	AdaptiveProviderAccepted              bool
+	// AdaptiveEdgeGate is runtime-only shadow state. Copies of an execution
+	// attempt intentionally share this pointer so streaming and non-streaming
+	// completion paths settle the same simulated lease exactly once.
+	AdaptiveEdgeGate *adaptiveEdgeGateAttemptState
 }
 
 type attemptRecord struct {

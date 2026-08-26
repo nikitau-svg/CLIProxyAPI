@@ -153,6 +153,32 @@ authority, and generates no additional provider requests.
 
 ## Adaptive allocator 0.9 preview
 
+Preview.8 adds an independent **edge-gate shadow**. It deliberately stops
+using a predicted per-request quota percentage as a routing premise. The old
+token calibration and forecast backtest stay available for analytics and
+capacity planning, while the new state machine uses only cached headroom and
+actual provider outcomes:
+
+```text
+Green    -> normal concurrency
+Guarded  -> near/stale/unknown quota: one simulated in-flight request
+Tripped  -> only after an actual quota/rate-limit failure
+Half-open -> after expiry: exactly one simulated probe
+```
+
+`would_skip_busy` and `would_skip_tripped` mean “an enforcing version would
+immediately try the next route”. They never mean wait: the shadow gate has no
+queue. Preview.8 still executes the original route byte-for-byte, so it can
+compare each counterfactual decision with the actual result. Runtime state is
+bounded; saturation is explicit and fail-open. There is no migration and no
+new provider or quota call.
+
+The existing adaptive-audit endpoint now reports edge-gate states, decisions,
+trip/reopen transitions, successful counterfactual skips and quota failures on
+both skipped and dispatched attempts. `edge_gate_verdict=ready_for_review`
+requires at least 100 edge-gate attempts spanning six hours and never enables
+routing by itself.
+
 The first 0.9 phase deliberately observes without enforcing. It estimates the
 possible quota cost of the request that Bravo actually attempts, then compares
 that estimate only with quota snapshots produced by the existing background
@@ -205,7 +231,8 @@ Profiles are bounded, decay with a 24-hour half-life, survive restart, contain
 no prompts or responses, and still have no routing authority.
 The invariants and release gates are in
 [`docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md`](docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md)
-and [`ADAPTIVE_TOKEN_CALIBRATION_TEST_PLAN.md`](ADAPTIVE_TOKEN_CALIBRATION_TEST_PLAN.md).
+[`ADAPTIVE_TOKEN_CALIBRATION_TEST_PLAN.md`](ADAPTIVE_TOKEN_CALIBRATION_TEST_PLAN.md),
+and [`ADAPTIVE_EDGE_GATE_TEST_PLAN.md`](ADAPTIVE_EDGE_GATE_TEST_PLAN.md).
 
 `adaptive_allocator_mode` accepts only `off` or `observe` in this preview.
 `assist` and `enforce` are rejected at configuration time, so a partial rollout

@@ -1,13 +1,16 @@
 # Bravo Adaptive Quota 0.9 Preview Contract
 
 Status: preview, phase 1 (`shadow_only`), token calibration v2 with forecast
-backtest v3. Base: published Bravo 0.8.11.
+backtest v3 and edge-gate state machine v4. Base: published Bravo 0.8.11.
 
 ## Purpose
 
-The preview measures how much subscription headroom a real request may consume
-without allowing that estimate to control production routing. It exists to
-collect evidence for a later allocator, not to activate one implicitly.
+The preview measures subscription use and tests a simpler edge-control
+mechanism without allowing either to control production routing. Token math is
+retained for analytics and capacity planning. The edge gate does not predict
+the cost of a request; it exists to test whether cached headroom, single-flight
+at the edge and provider-confirmed breaker transitions are sufficient for a
+later allocator.
 
 ## Non-negotiable phase-1 invariants
 
@@ -43,6 +46,43 @@ collect evidence for a later allocator, not to activate one implicitly.
     attached to a real attempt and the next confirmed quota snapshot. It never
     trains on an interval before scoring that interval and never replays a
     request against a provider.
+11. The edge gate is counterfactual only. It cannot wait, queue, withhold or
+    reorder a real attempt. A simulated busy/tripped decision means immediate
+    fallback in a future enforcing version, never delayed execution.
+12. Only an actual quota/rate-limit provider outcome may trip the edge-gate
+    breaker. Cached quota selects Green or Guarded but cannot fabricate a trip.
+    After expiry, exactly one simulated attempt becomes Half-open probe.
+13. Edge-gate runtime is bounded to 4096 in-flight account leases and 4096
+    breakers. Saturation is visible and fail-open. A stale simulated lease has
+    a hard two-hour recovery bound.
+
+## Edge gate v4
+
+The state machine is scoped to one subscription and, for reviewed model-scoped
+provider failures, one physical model:
+
+```text
+Green     confirmed cached headroom outside the guard band
+Guarded   session headroom <= 8pp, weekly headroom <= 2pp,
+          or the cached quota is stale/unknown
+Tripped   an actual quota/rate-limit result supplied a cooldown/reset window
+Half-open the window expired and one non-queued probe owns the turnstile
+```
+
+For secondary subscriptions, headroom is measured after the configured tariff
+floor; primary subscriptions use a zero floor. No predicted token cost or
+cooled pending percentage enters this state decision. Green attempts remain
+fully concurrent. Guarded and Half-open use one nonblocking account lease. A
+concurrent attempt records `would_skip_busy` immediately. An unexpired breaker
+records `would_skip_tripped`. In phase 1 all of those attempts still execute on
+the original production route so the counterfactual can be audited.
+
+The simulated lease is acquired only after the real allocator grants an
+attempt and is settled only after the provider outcome has been classified.
+This closes the race between releasing an in-flight slot and observing a 429.
+Token-count probes never acquire the lease. Account-wide credential failures
+trip the account key; explicit provider model scope trips only that physical
+model. A successful or non-quota Half-open result reopens the breaker.
 
 ## Estimate
 
@@ -194,6 +234,15 @@ no queue/disk loss, no unknown shadow decision, no successful `would_withhold`
 attempt, and no quota failure on an attempt marked `would_admit`. This verdict
 does not enable routing authority.
 
+Preview.8 adds an independent `edge_gate_verdict` and per-attempt safe fields:
+state, counterfactual decision, reason, session/weekly headroom, remaining trip
+time and outcome transition. Aggregate counters distinguish successful
+attempts an enforcing gate would have skipped, quota failures on those skipped
+attempts, quota failures while dispatching/probing, and trip/reopen events.
+Old audit records remain readable but do not count toward edge-gate coverage.
+The edge verdict needs at least 100 new attempts over six hours and still grants
+no routing authority.
+
 ## Promotion gate
 
 No phase-2 routing authority may be added to this preview branch. Promotion
@@ -213,3 +262,8 @@ requires a separate reviewed change with production traces proving:
   subscription-hours for every quota window that may receive routing authority,
   with manual review of p95 and maximum underprediction;
 - an explicit fail-open availability path if future adaptive state is unknown.
+- burst evidence that Guarded never queues and immediately selects a later
+  route in an enforcing prototype;
+- exactly-one-probe evidence across concurrent Half-open attempts;
+- a separate manual review of successful `would_skip` cost versus quota
+  failures an enforcing gate would have avoided.

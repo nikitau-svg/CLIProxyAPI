@@ -42,6 +42,7 @@ func (recorder *routeTraceRecorder) captureAdaptiveAuditAttempt(
 		recorder.adaptiveAuditOmittedAttempts++
 		return
 	}
+	edgeGate := attempt.AdaptiveEdgeGate.snapshot()
 	recorder.adaptiveAuditAttempts = append(recorder.adaptiveAuditAttempts, adaptiveShadowAuditAttempt{
 		Provider:                      normalizeProvider(attempt.Candidate.Provider),
 		Model:                         strings.TrimSpace(attempt.Candidate.Model),
@@ -63,6 +64,14 @@ func (recorder *routeTraceRecorder) captureAdaptiveAuditAttempt(
 		ProviderAcceptance:            adaptiveShadowProviderAcceptance(attempt),
 		LatencyMilliseconds:           time.Since(started).Milliseconds(),
 		ErrorCode:                     errorCode,
+		EdgeGateState:                 edgeGate.State,
+		EdgeGateDecision:              edgeGate.Decision,
+		EdgeGateReason:                edgeGate.Reason,
+		EdgeGateQuotaConfirmed:        edgeGate.QuotaConfirmed,
+		EdgeGateSessionHeadroom:       edgeGate.SessionHeadroomPercent,
+		EdgeGateWeeklyHeadroom:        edgeGate.WeeklyHeadroomPercent,
+		EdgeGateTripRemainingSeconds:  edgeGate.TripRemainingSeconds,
+		EdgeGateOutcomeTransition:     edgeGate.OutcomeTransition,
 	})
 }
 

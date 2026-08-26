@@ -1008,6 +1008,7 @@ func retryAfterTime(value string, now time.Time) time.Time {
 }
 
 func recordExecutionAttempt(attempt executionAttempt, started time.Time, status int, success bool, failure executionFailure) {
+	observeAdaptiveEdgeGateOutcome(attempt, success, failure, adaptiveShadowNow())
 	if success {
 		failure = executionFailure{}
 	} else {

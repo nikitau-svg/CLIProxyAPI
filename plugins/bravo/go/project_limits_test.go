@@ -54,6 +54,16 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndHourlyCache(t *testing.T) {
 	recordAnalyticsUsage(bravoUsageState, now.Add(-24*time.Hour), "prj_limits", "claude-private", "claude", "claude-fable-5", "bravo/fable", 123)
 	recordAdaptiveShadowCommit("claude-private", 2, now)
 	recordAdaptiveShadowCommit("outside-private", 9, now)
+	adaptiveEdgeGateRuntime.Lock()
+	adaptiveEdgeGateRuntime.InFlight["claude-private"] = adaptiveEdgeGateLease{StartedAt: now}
+	adaptiveEdgeGateRuntime.InFlight["outside-private"] = adaptiveEdgeGateLease{StartedAt: now}
+	adaptiveEdgeGateRuntime.Breakers[adaptiveEdgeGateBreakerKey("claude", "claude-private", "claude-fable-5")] = adaptiveEdgeGateBreaker{
+		AuthIndex: "claude-private", Provider: "claude", Model: "claude-fable-5", Until: now.Add(time.Minute),
+	}
+	adaptiveEdgeGateRuntime.Breakers[adaptiveEdgeGateBreakerKey("claude", "outside-private", "claude-fable-5")] = adaptiveEdgeGateBreaker{
+		AuthIndex: "outside-private", Provider: "claude", Model: "claude-fable-5", Until: now.Add(time.Minute),
+	}
+	adaptiveEdgeGateRuntime.Unlock()
 
 	hostCalls := 0
 	installBravoHostCall(t, func(method string, payload any) (json.RawMessage, error) {
@@ -94,6 +104,14 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndHourlyCache(t *testing.T) {
 	}
 	if response.AdaptiveAllocator.TrackedAccounts != 1 || response.AdaptiveAllocator.RawPendingPercent != 2 {
 		t.Fatalf("adaptive project scope = %#v, want only allowed account aggregate", response.AdaptiveAllocator)
+	}
+	if response.AdaptiveAllocator.EdgeGate.Mode != "observe" ||
+		response.AdaptiveAllocator.EdgeGate.RoutingEnforced ||
+		response.AdaptiveAllocator.EdgeGate.QueuesRequests ||
+		response.AdaptiveAllocator.EdgeGate.AdditionalProviderRequests ||
+		response.AdaptiveAllocator.EdgeGate.InFlightGuards != 1 ||
+		response.AdaptiveAllocator.EdgeGate.TrackedBreakers != 1 {
+		t.Fatalf("edge gate project scope = %#v", response.AdaptiveAllocator.EdgeGate)
 	}
 	claude := findProjectLimitProvider(t, response.Providers, "claude")
 	if claude.Status == "available" || claude.AccountsTotal != 1 {

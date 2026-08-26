@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,6 +49,14 @@ type adaptiveShadowAuditAttempt struct {
 	ProviderAcceptance            string  `json:"provider_acceptance"`
 	LatencyMilliseconds           int64   `json:"latency_ms"`
 	ErrorCode                     string  `json:"error_code,omitempty"`
+	EdgeGateState                 string  `json:"edge_gate_state,omitempty"`
+	EdgeGateDecision              string  `json:"edge_gate_decision,omitempty"`
+	EdgeGateReason                string  `json:"edge_gate_reason,omitempty"`
+	EdgeGateQuotaConfirmed        bool    `json:"edge_gate_quota_confirmed,omitempty"`
+	EdgeGateSessionHeadroom       float64 `json:"edge_gate_session_headroom_percent,omitempty"`
+	EdgeGateWeeklyHeadroom        float64 `json:"edge_gate_weekly_headroom_percent,omitempty"`
+	EdgeGateTripRemainingSeconds  int64   `json:"edge_gate_trip_remaining_seconds,omitempty"`
+	EdgeGateOutcomeTransition     string  `json:"edge_gate_outcome_transition,omitempty"`
 }
 
 type adaptiveShadowAuditRecord struct {
@@ -98,6 +107,23 @@ type adaptiveShadowAuditReport struct {
 	TokenCalibrationVerdict             string                      `json:"token_calibration_verdict"`
 	TokenCalibrationVerdictMessage      string                      `json:"token_calibration_verdict_message"`
 	LegacyShapeEstimateAttempts         int                         `json:"legacy_shape_estimate_attempts"`
+	EdgeGateAttempts                    int                         `json:"edge_gate_attempts"`
+	EdgeGateGreenAttempts               int                         `json:"edge_gate_green_attempts"`
+	EdgeGateGuardedAttempts             int                         `json:"edge_gate_guarded_attempts"`
+	EdgeGateTrippedAttempts             int                         `json:"edge_gate_tripped_attempts"`
+	EdgeGateHalfOpenAttempts            int                         `json:"edge_gate_half_open_attempts"`
+	EdgeGateWouldDispatch               int                         `json:"edge_gate_would_dispatch"`
+	EdgeGateWouldProbe                  int                         `json:"edge_gate_would_probe"`
+	EdgeGateWouldSkipBusy               int                         `json:"edge_gate_would_skip_busy"`
+	EdgeGateWouldSkipTripped            int                         `json:"edge_gate_would_skip_tripped"`
+	EdgeGateSuccessfulWouldSkip         int                         `json:"edge_gate_successful_would_skip"`
+	EdgeGateQuotaFailuresWouldSkip      int                         `json:"edge_gate_quota_failures_would_skip"`
+	EdgeGateQuotaFailuresWhileDispatch  int                         `json:"edge_gate_quota_failures_while_dispatching"`
+	EdgeGateTripsObserved               int                         `json:"edge_gate_trips_observed"`
+	EdgeGateReopensObserved             int                         `json:"edge_gate_reopens_observed"`
+	EdgeGateCoverageSeconds             int64                       `json:"edge_gate_coverage_seconds"`
+	EdgeGateVerdict                     string                      `json:"edge_gate_verdict"`
+	EdgeGateVerdictMessage              string                      `json:"edge_gate_verdict_message"`
 	RoutingChangesApplied               int                         `json:"routing_changes_applied"`
 	AdditionalProviderRequests          int                         `json:"additional_provider_requests"`
 	QueueDepth                          int                         `json:"queue_depth"`
@@ -473,6 +499,8 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 	var firstEventAt time.Time
 	var firstTokenCalibratedAt time.Time
 	var lastTokenCalibratedAt time.Time
+	var firstEdgeGateAt time.Time
+	var lastEdgeGateAt time.Time
 	for _, record := range records {
 		if record.At.Before(report.From) || record.At.After(now.Add(time.Minute)) {
 			continue
@@ -535,6 +563,53 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 					report.TokenCalibratedQuotaFailuresOnAdmit++
 				}
 			}
+			if attempt.EdgeGateState != "" {
+				report.EdgeGateAttempts++
+				if firstEdgeGateAt.IsZero() || record.At.Before(firstEdgeGateAt) {
+					firstEdgeGateAt = record.At
+				}
+				if record.At.After(lastEdgeGateAt) {
+					lastEdgeGateAt = record.At
+				}
+				switch attempt.EdgeGateState {
+				case adaptiveEdgeGateStateGreen:
+					report.EdgeGateGreenAttempts++
+				case adaptiveEdgeGateStateGuarded:
+					report.EdgeGateGuardedAttempts++
+				case adaptiveEdgeGateStateTripped:
+					report.EdgeGateTrippedAttempts++
+				case adaptiveEdgeGateStateHalfOpen:
+					report.EdgeGateHalfOpenAttempts++
+				}
+				skipped := false
+				switch attempt.EdgeGateDecision {
+				case adaptiveEdgeGateDecisionDispatch:
+					report.EdgeGateWouldDispatch++
+				case adaptiveEdgeGateDecisionProbe:
+					report.EdgeGateWouldProbe++
+				case adaptiveEdgeGateDecisionSkipBusy:
+					report.EdgeGateWouldSkipBusy++
+					skipped = true
+				case adaptiveEdgeGateDecisionSkipTripped:
+					report.EdgeGateWouldSkipTripped++
+					skipped = true
+				}
+				quotaFailure := adaptiveEdgeGateAuditQuotaFailure(attempt)
+				if skipped && attempt.Success {
+					report.EdgeGateSuccessfulWouldSkip++
+				}
+				if skipped && quotaFailure {
+					report.EdgeGateQuotaFailuresWouldSkip++
+				} else if !skipped && quotaFailure {
+					report.EdgeGateQuotaFailuresWhileDispatch++
+				}
+				if strings.HasPrefix(attempt.EdgeGateOutcomeTransition, "tripped_") {
+					report.EdgeGateTripsObserved++
+				}
+				if attempt.EdgeGateOutcomeTransition == "reopened" {
+					report.EdgeGateReopensObserved++
+				}
+			}
 		}
 		if recentLimit > 0 {
 			report.Recent = append(report.Recent, record)
@@ -549,6 +624,9 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 	}
 	if !firstTokenCalibratedAt.IsZero() && lastTokenCalibratedAt.After(firstTokenCalibratedAt) {
 		report.TokenCalibratedCoverageSeconds = int64(lastTokenCalibratedAt.Sub(firstTokenCalibratedAt) / time.Second)
+	}
+	if !firstEdgeGateAt.IsZero() && lastEdgeGateAt.After(firstEdgeGateAt) {
+		report.EdgeGateCoverageSeconds = int64(lastEdgeGateAt.Sub(firstEdgeGateAt) / time.Second)
 	}
 	report.TokenCalibrationVerdict = "collecting"
 	report.TokenCalibrationVerdictMessage = "Полностью токен-калиброванных наблюдений пока недостаточно; маршрутизация остаётся прежней."
@@ -595,6 +673,27 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 			int(adaptiveShadowAuditReviewCoverage/time.Hour),
 		)
 	}
+	report.EdgeGateVerdict = "collecting"
+	report.EdgeGateVerdictMessage = "Новый турникет пока только наблюдает; маршрутизация остаётся прежней."
+	if report.Status == "warning" {
+		report.EdgeGateVerdict = "telemetry_degraded"
+		report.EdgeGateVerdictMessage = "Часть наблюдений потеряна; для оценки турникета нужен новый чистый период сбора."
+	} else if report.EdgeGateAttempts >= adaptiveShadowAuditReviewRequests &&
+		report.EdgeGateCoverageSeconds >= int64(adaptiveShadowAuditReviewCoverage/time.Second) {
+		report.EdgeGateVerdict = "ready_for_review"
+		report.EdgeGateVerdictMessage = fmt.Sprintf(
+			"Турникет набрал достаточную shadow-выборку: успешных контрфактических пропусков %d, quota-ошибок на пропущенных попытках %d; требуется ручная проверка перед отдельной канарейкой.",
+			report.EdgeGateSuccessfulWouldSkip,
+			report.EdgeGateQuotaFailuresWouldSkip,
+		)
+	} else if report.EdgeGateAttempts > 0 {
+		report.EdgeGateVerdictMessage = fmt.Sprintf(
+			"Сбор турникета продолжается: нужно не менее %d попыток за %d часов; сейчас %d попыток.",
+			adaptiveShadowAuditReviewRequests,
+			int(adaptiveShadowAuditReviewCoverage/time.Hour),
+			report.EdgeGateAttempts,
+		)
+	}
 	return report
 }
 
@@ -611,6 +710,8 @@ func currentAdaptiveShadowAuditReport(cfg pluginConfig, period time.Duration, re
 			VerdictMessage:                 "Shadow-журнал ещё не инициализирован.",
 			TokenCalibrationVerdict:        "collecting",
 			TokenCalibrationVerdictMessage: "Токен-калибровка ещё не инициализирована.",
+			EdgeGateVerdict:                "collecting",
+			EdgeGateVerdictMessage:         "Shadow-турникет ещё не инициализирован.",
 			Mode:                           cfg.AdaptiveAllocatorMode,
 			Effect:                         adaptiveShadowEffect(cfg),
 			From:                           now.UTC().Add(-period),
@@ -651,6 +752,10 @@ func sanitizeAdaptiveShadowAuditRecord(record adaptiveShadowAuditRecord) adaptiv
 		attempt.Outcome = adaptiveShadowAuditToken(attempt.Outcome, 32)
 		attempt.ProviderAcceptance = adaptiveShadowAuditToken(attempt.ProviderAcceptance, 16)
 		attempt.ErrorCode = adaptiveShadowAuditToken(attempt.ErrorCode, 96)
+		attempt.EdgeGateState = adaptiveShadowAuditToken(attempt.EdgeGateState, 24)
+		attempt.EdgeGateDecision = adaptiveShadowAuditToken(attempt.EdgeGateDecision, 32)
+		attempt.EdgeGateReason = adaptiveShadowAuditToken(attempt.EdgeGateReason, 64)
+		attempt.EdgeGateOutcomeTransition = adaptiveShadowAuditToken(attempt.EdgeGateOutcomeTransition, 48)
 		attempt.ReservationPercent = adaptiveShadowAuditNumber(attempt.ReservationPercent, 0, 100)
 		attempt.SessionReservationPercent = adaptiveShadowAuditNumber(attempt.SessionReservationPercent, 0, 100)
 		attempt.WeeklyReservationPercent = adaptiveShadowAuditNumber(attempt.WeeklyReservationPercent, 0, 100)
@@ -659,6 +764,11 @@ func sanitizeAdaptiveShadowAuditRecord(record adaptiveShadowAuditRecord) adaptiv
 		attempt.PendingPercent = adaptiveShadowAuditNumber(attempt.PendingPercent, 0, 1_000_000)
 		attempt.SafeHeadroomBefore = adaptiveShadowAuditNumber(attempt.SafeHeadroomBefore, -1_000_000, 1_000_000)
 		attempt.SafeHeadroomAfter = adaptiveShadowAuditNumber(attempt.SafeHeadroomAfter, -1_000_000, 1_000_000)
+		attempt.EdgeGateSessionHeadroom = adaptiveShadowAuditNumber(attempt.EdgeGateSessionHeadroom, -100, 100)
+		attempt.EdgeGateWeeklyHeadroom = adaptiveShadowAuditNumber(attempt.EdgeGateWeeklyHeadroom, -100, 100)
+		if attempt.EdgeGateTripRemainingSeconds < 0 {
+			attempt.EdgeGateTripRemainingSeconds = 0
+		}
 		if attempt.LatencyMilliseconds < 0 {
 			attempt.LatencyMilliseconds = 0
 		}
@@ -704,6 +814,10 @@ func adaptiveShadowAuditQuotaFailure(code string) bool {
 	code = strings.ToLower(strings.TrimSpace(code))
 	return strings.Contains(code, "quota") || strings.Contains(code, "rate_limit") ||
 		strings.Contains(code, "credits_exhausted") || strings.Contains(code, "usage_limit")
+}
+
+func adaptiveEdgeGateAuditQuotaFailure(attempt adaptiveShadowAuditAttempt) bool {
+	return attempt.Status == http.StatusTooManyRequests || adaptiveShadowAuditQuotaFailure(attempt.ErrorCode)
 }
 
 func (store *adaptiveShadowAuditStore) noteWriteFailure(err error) {
