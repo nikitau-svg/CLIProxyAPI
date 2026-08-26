@@ -338,6 +338,13 @@ func TestStripRequestEffortLeavesOnlySuffixAuthority(t *testing.T) {
 			absent:   []string{`"thinking"`, `"output_config"`},
 			present:  []string{`"messages":[]`},
 		},
+		{
+			name:     "claude structured output",
+			protocol: protocolClaude,
+			body:     `{"messages":[],"thinking":{"type":"adaptive"},"output_config":{"effort":"low","format":{"type":"json_schema","schema":{"type":"object"}}}}`,
+			absent:   []string{`"thinking"`, `"effort"`},
+			present:  []string{`"output_config"`, `"format"`, `"json_schema"`, `"schema"`},
+		},
 	}
 	for _, testCase := range tests {
 		testCase := testCase

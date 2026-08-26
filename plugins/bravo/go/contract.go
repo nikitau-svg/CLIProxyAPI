@@ -59,13 +59,14 @@ var liveCapabilityMatrix = map[providerProtocol]capabilitySet{
 		capabilityStream:     {},
 	},
 	{Provider: "claude", Protocol: protocolClaude}: {
-		capabilityText:       {},
-		capabilityTools:      {},
-		capabilityToolResult: {},
-		capabilityReasoning:  {},
-		capabilityVision:     {},
-		capabilityWebSearch:  {},
-		capabilityStream:     {},
+		capabilityText:             {},
+		capabilityTools:            {},
+		capabilityToolResult:       {},
+		capabilityReasoning:        {},
+		capabilityVision:           {},
+		capabilityWebSearch:        {},
+		capabilityStructuredOutput: {},
+		capabilityStream:           {},
 	},
 	{Provider: "codex", Protocol: protocolOpenAI}: {
 		capabilityText:       {},
@@ -83,13 +84,14 @@ var liveCapabilityMatrix = map[providerProtocol]capabilitySet{
 		capabilityStream:     {},
 	},
 	{Provider: "codex", Protocol: protocolClaude}: {
-		capabilityText:       {},
-		capabilityTools:      {},
-		capabilityToolResult: {},
-		capabilityReasoning:  {},
-		capabilityVision:     {},
-		capabilityWebSearch:  {},
-		capabilityStream:     {},
+		capabilityText:             {},
+		capabilityTools:            {},
+		capabilityToolResult:       {},
+		capabilityReasoning:        {},
+		capabilityVision:           {},
+		capabilityWebSearch:        {},
+		capabilityStructuredOutput: {},
+		capabilityStream:           {},
 	},
 	{Provider: "codex", Protocol: protocolOpenAIImage}: {
 		capabilityImageGeneration: {},
@@ -98,10 +100,14 @@ var liveCapabilityMatrix = map[providerProtocol]capabilitySet{
 
 // Vision through OpenAI Chat and Anthropic Messages is live-verified for Claude
 // and Codex. The Anthropic path additionally covers nested tool-result images,
-// adaptive effort, and streaming. OpenAI Responses vision remains absent until
-// that entry/exit contract is exercised end to end. OpenAI image generation and
-// edit are also live-verified; image-generation streaming remains absent until
-// its upstream response framing is verified as valid SSE.
+// adaptive effort, strict JSON-schema output, and streaming. Native
+// output_config.format on claude-haiku-4-5-20251001 and the translated
+// Responses text.format contract on gpt-5.6-luna both returned schema-valid
+// HTTP 200 responses in the production-compatible live probe. OpenAI Responses
+// vision remains absent until that entry/exit contract is exercised end to end.
+// OpenAI image generation and edit are also live-verified; image-generation
+// streaming remains absent until its upstream response framing is verified as
+// valid SSE.
 //
 // capabilityReasoning for {codex, claude} is a *degraded* contract, and it is
 // declared because the alternative was worse. It is the contract for replaying a
@@ -232,6 +238,9 @@ func detectRequestContract(protocol string, body []byte, streaming bool) (reques
 	case protocolOpenAIResponse:
 		inspectOpenAIResponse(root, contract.Capabilities)
 	case protocolClaude:
+		if errStructured := validateClaudeStructuredOutput(root); errStructured != nil {
+			return requestCapabilityContract{}, errStructured
+		}
 		inspectClaude(root, contract.Capabilities)
 	}
 
@@ -528,6 +537,41 @@ func inspectClaude(root map[string]any, capabilities capabilitySet) {
 		capabilities[capabilityStructuredOutput] = struct{}{}
 	}
 	inspectConversationValue(root["messages"], protocolClaude, capabilities)
+}
+
+func validateClaudeStructuredOutput(root map[string]any) error {
+	if outputConfig, ok := root["output_config"].(map[string]any); ok {
+		if format, exists := outputConfig["format"]; exists && structuredFormat(format) {
+			if errFormat := validateClaudeJSONSchemaFormat(format, "output_config.format"); errFormat != nil {
+				return errFormat
+			}
+		}
+	}
+	if format, exists := root["output_format"]; exists && structuredFormat(format) {
+		if errFormat := validateClaudeJSONSchemaFormat(format, "output_format"); errFormat != nil {
+			return errFormat
+		}
+	}
+	return nil
+}
+
+func validateClaudeJSONSchemaFormat(value any, path string) error {
+	format, ok := value.(map[string]any)
+	if !ok {
+		return invalidContractPayload(protocolClaude, path+" must be an object")
+	}
+	if lowerString(format["type"]) != "json_schema" {
+		return &capabilityContractError{
+			Code:       "bravo_contract_unverified",
+			Protocol:   protocolClaude,
+			Capability: capabilityStructuredOutput,
+			Message:    path + " supports only the live-verified json_schema type",
+		}
+	}
+	if _, okSchema := format["schema"].(map[string]any); !okSchema {
+		return invalidContractPayload(protocolClaude, path+".schema must be a JSON object")
+	}
+	return nil
 }
 
 func inspectConversationValue(value any, protocol string, capabilities capabilitySet) {

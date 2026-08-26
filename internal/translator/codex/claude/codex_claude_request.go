@@ -364,6 +364,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	}
 	template, _ = sjson.SetBytes(template, "reasoning.effort", reasoningEffort)
 	template, _ = sjson.SetBytes(template, "reasoning.summary", "auto")
+	template = applyClaudeStructuredOutputFormat(template, rootResult)
 	serviceTier := normalizeCodexServiceTier(rootResult.Get("service_tier"))
 	if speed := rootResult.Get("speed"); speed.Type == gjson.String && speed.String() == "fast" {
 		serviceTier = "priority"
@@ -380,6 +381,33 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	template = translatorcommon.SetRawArrayItems(template, "input", inputItems)
 
 	return template
+}
+
+// applyClaudeStructuredOutputFormat preserves Anthropic's strict
+// output_config.format contract when a Claude-protocol request falls back to
+// Codex. Anthropic does not require a schema name, while the Responses API
+// does, so use one stable proxy-owned name without changing the schema itself.
+func applyClaudeStructuredOutputFormat(out []byte, root gjson.Result) []byte {
+	format := root.Get("output_config.format")
+	if !format.Exists() {
+		format = root.Get("output_format")
+	}
+	if !format.Exists() || !format.IsObject() || strings.ToLower(strings.TrimSpace(format.Get("type").String())) != "json_schema" {
+		return out
+	}
+	schema := format.Get("schema")
+	if !schema.Exists() || !schema.IsObject() {
+		return out
+	}
+
+	out, _ = sjson.SetBytes(out, "text.format.type", "json_schema")
+	out, _ = sjson.SetBytes(out, "text.format.name", "anthropic_structured_output")
+	out, _ = sjson.SetBytes(out, "text.format.strict", true)
+	out, _ = sjson.SetRawBytes(out, "text.format.schema", []byte(schema.Raw))
+	if description := strings.TrimSpace(format.Get("description").String()); description != "" {
+		out, _ = sjson.SetBytes(out, "text.format.description", description)
+	}
+	return out
 }
 
 func codexClaudeTargetAcceptsGrokSignature(modelName string) bool {

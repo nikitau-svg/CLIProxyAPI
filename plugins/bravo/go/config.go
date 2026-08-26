@@ -39,12 +39,24 @@ func defaultPluginConfig() pluginConfig {
 	// unroutable the moment every Claude credential ran out of weekly quota, which
 	// is a worse outcome than answering with the reasoning as context.
 	textCaps := append(append([]string(nil), caps...), capabilityReasoning)
+	profiles := compatibilityProfiles()
+	withReviewedStructuredOutput := func(provider, model string, capabilities []string) []string {
+		out := append([]string(nil), capabilities...)
+		profile, ok := profiles[routeCandidateKey(provider, model)]
+		if !ok {
+			return out
+		}
+		if _, verified := newCapabilitySet(profile.Capabilities...)[capabilityStructuredOutput]; verified {
+			out = append(out, capabilityStructuredOutput)
+		}
+		return out
+	}
 	imageCaps := []string{capabilityImageGeneration}
 	claude := func(model, effort string, priority int) candidate {
-		return candidate{Provider: "claude", Model: model, Effort: effort, Priority: priority, Capabilities: append([]string(nil), textCaps...)}
+		return candidate{Provider: "claude", Model: model, Effort: effort, Priority: priority, Capabilities: withReviewedStructuredOutput("claude", model, textCaps)}
 	}
 	codex := func(model, effort string, priority int) candidate {
-		return candidate{Provider: "codex", Model: model, Effort: effort, Priority: priority, Capabilities: append([]string(nil), textCaps...)}
+		return candidate{Provider: "codex", Model: model, Effort: effort, Priority: priority, Capabilities: withReviewedStructuredOutput("codex", model, textCaps)}
 	}
 	codexImage := func(model string, priority int) candidate {
 		return candidate{Provider: "codex", Model: model, Priority: priority, Capabilities: append([]string(nil), imageCaps...)}

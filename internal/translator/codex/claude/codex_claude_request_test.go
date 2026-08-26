@@ -183,6 +183,52 @@ func TestConvertClaudeRequestToCodex_ParallelToolCalls(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToCodex_MapsAnthropicStructuredOutput(t *testing.T) {
+	tests := []struct {
+		name       string
+		formatPath string
+	}{
+		{name: "output config format", formatPath: "output_config"},
+		{name: "legacy output format", formatPath: "output_format"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			format := `{"type":"json_schema","description":"Reasoning extraction","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}`
+			inputJSON := `{"model":"bravo/haiku","messages":[{"role":"user","content":"extract"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}`
+			var errSet error
+			if testCase.formatPath == "output_config" {
+				inputJSON, errSet = sjson.SetRaw(inputJSON, "output_config.format", format)
+			} else {
+				inputJSON, errSet = sjson.SetRaw(inputJSON, "output_format", format)
+			}
+			if errSet != nil {
+				t.Fatalf("set input format: %v", errSet)
+			}
+
+			result := ConvertClaudeRequestToCodex("gpt-5.6-luna", []byte(inputJSON), true)
+			root := gjson.ParseBytes(result)
+			if got := root.Get("text.format.type").String(); got != "json_schema" {
+				t.Fatalf("text.format.type = %q, want json_schema: %s", got, result)
+			}
+			if got := root.Get("text.format.name").String(); got != "anthropic_structured_output" {
+				t.Fatalf("text.format.name = %q: %s", got, result)
+			}
+			if !root.Get("text.format.strict").Bool() {
+				t.Fatalf("text.format.strict = false: %s", result)
+			}
+			if got := root.Get("text.format.description").String(); got != "Reasoning extraction" {
+				t.Fatalf("text.format.description = %q: %s", got, result)
+			}
+			if got := root.Get("text.format.schema.properties.answer.type").String(); got != "string" {
+				t.Fatalf("schema answer type = %q: %s", got, result)
+			}
+			if got := root.Get("reasoning.effort").String(); got != "low" {
+				t.Fatalf("reasoning.effort = %q, want low: %s", got, result)
+			}
+		})
+	}
+}
+
 func TestConvertClaudeRequestToCodex_ServiceTier(t *testing.T) {
 	tests := []struct {
 		name            string

@@ -607,7 +607,6 @@ func TestPreflightCandidateContractRejectsUnverifiedAdvancedCapabilities(t *test
 	}{
 		{name: "reasoning replay", protocol: protocolOpenAI, body: `{"messages":[{"role":"assistant","reasoning_content":"prior trace"}]}`, capability: capabilityReasoning},
 		{name: "vision", protocol: protocolOpenAIResponse, body: `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}]}`, capability: capabilityVision},
-		{name: "structured", protocol: protocolClaude, body: `{"messages":[{"role":"user","content":"hello"}],"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}}`, capability: capabilityStructuredOutput},
 		{name: "background", protocol: protocolOpenAIResponse, body: `{"input":"hello","background":true}`, capability: capabilityBackground},
 	}
 	allCapabilities := append([]string(nil), capabilityOrder...)
@@ -620,6 +619,60 @@ func TestPreflightCandidateContractRejectsUnverifiedAdvancedCapabilities(t *test
 			assertContractError(t, errPreflight, "bravo_contract_unverified", testCase.capability)
 		})
 	}
+}
+
+func TestPreflightLogicalHaikuAllowsReasoningExtractionStructuredOutput(t *testing.T) {
+	t.Parallel()
+
+	model := defaultPluginConfig().Models["haiku"]
+	body := []byte(`{
+		"model":"bravo/haiku",
+		"stream":true,
+		"messages":[{"role":"user","content":"extract"}],
+		"output_config":{
+			"format":{
+				"type":"json_schema",
+				"schema":{
+					"type":"object",
+					"properties":{"answer":{"type":"string"}},
+					"required":["answer"],
+					"additionalProperties":false
+				}
+			}
+		}
+	}`)
+	if errPreflight := preflightLogicalModelContract(model, protocolClaude, body, true); errPreflight != nil {
+		t.Fatalf("reasoning-extraction logical preflight: %v", errPreflight)
+	}
+	contract, errDetect := detectRequestContract(protocolClaude, body, true)
+	if errDetect != nil {
+		t.Fatalf("detect reasoning-extraction contract: %v", errDetect)
+	}
+	for _, item := range model.Candidates {
+		if _, errResolve := resolveCandidateContract(item, contract); errResolve != nil {
+			t.Errorf("%s/%s cannot preserve structured output: %v", item.Provider, item.Model, errResolve)
+		}
+	}
+}
+
+func TestDetectClaudeStructuredOutputRejectsUnverifiedFormatType(t *testing.T) {
+	t.Parallel()
+
+	_, errDetect := detectRequestContract(protocolClaude, []byte(`{
+		"messages":[{"role":"user","content":"extract"}],
+		"output_config":{"format":{"type":"future_schema","schema":{"type":"object"}}}
+	}`), false)
+	assertContractError(t, errDetect, "bravo_contract_unverified", capabilityStructuredOutput)
+}
+
+func TestDetectClaudeStructuredOutputRequiresSchemaObject(t *testing.T) {
+	t.Parallel()
+
+	_, errDetect := detectRequestContract(protocolClaude, []byte(`{
+		"messages":[{"role":"user","content":"extract"}],
+		"output_config":{"format":{"type":"json_schema","schema":"not-an-object"}}
+	}`), false)
+	assertContractError(t, errDetect, "bravo_request_invalid", "")
 }
 
 func TestPreflightCandidateContractRejectsClaudeReasoningWithForcedToolChoice(t *testing.T) {

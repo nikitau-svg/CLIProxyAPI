@@ -66,8 +66,11 @@ receives its native JSON-mode equivalent; Claude executes the request without
 rejecting the format hint and receives an explicit instruction to emit one bare
 JSON object. If a non-streaming provider still wraps one valid object in an
 outer `json` Markdown fence, Bravo removes that fence before returning the
-OpenAI Chat response. Strict `json_schema` remains fail-closed until its
-cross-provider output contract is verified.
+OpenAI Chat response. Strict OpenAI Chat `json_schema` remains fail-closed until
+that entry protocol is verified cross-provider. Anthropic Messages
+`output_config.format` is separately live-verified for the `bravo/haiku`
+Claude Haiku / Codex Luna route: Claude receives the native schema and Codex
+receives the equivalent Responses `text.format` contract.
 OpenAI Chat sampling controls are also treated as advisory when routed to
 Claude Code: `temperature` and `top_p` are omitted from the translated Claude
 request because the provider rejects `top_p < 1` and mixed sampling controls.
@@ -433,6 +436,8 @@ Text logical models currently support:
 - PNG/JPEG vision through OpenAI Chat on both Claude and Codex candidates;
 - PNG/JPEG vision through Anthropic Messages, including nested `tool_result`
   history, on both Claude and Codex candidates;
+- strict Anthropic `output_config.format` JSON Schema on the live-verified
+  Claude Haiku / Codex Luna route;
 - Anthropic token counting;
 - OpenAI Chat, OpenAI Responses, and Anthropic Messages entry/exit protocols.
 
@@ -442,7 +447,8 @@ The plugin rejects unverified semantics instead of silently dropping them.
 This currently includes image streaming, web-search domain filters, arbitrary
 provider-built-in tools, manual reasoning budgets/summaries, cross-provider
 signed-thinking replay, OpenAI Responses vision, file/document inputs,
-structured output, and background execution. Named effort is supported and
+structured output outside the reviewed Anthropic Haiku/Luna contract, and
+background execution. Named effort is supported and
 resolved against each physical model before execution; signed Claude thinking
 replay is supported only on the native Anthropic-Messages-to-Claude route.
 

@@ -27,6 +27,8 @@ func compatibilityProfiles() map[string]compatibilityProfile {
 		capabilityStream,
 	}
 	claudeCaps := append(append([]string(nil), textCaps...), capabilityReasoning)
+	claudeStructuredCaps := append(append([]string(nil), claudeCaps...), capabilityStructuredOutput)
+	codexStructuredCaps := append(append([]string(nil), textCaps...), capabilityStructuredOutput)
 	imageCaps := []string{capabilityImageGeneration}
 	profiles := []compatibilityProfile{
 		{Provider: "claude", Model: "claude-fable-5", DefaultEffort: "max", Capabilities: claudeCaps, RecommendedRoutes: []string{"frontier"}, HasThinkingPolicy: true, ThinkingDefaultOn: true},
@@ -38,7 +40,7 @@ func compatibilityProfiles() map[string]compatibilityProfile {
 		{Provider: "claude", Model: "claude-sonnet-4-6", DefaultEffort: "medium", Capabilities: claudeCaps},
 		{Provider: "claude", Model: "claude-opus-4-5-20251101", DefaultEffort: "high", Capabilities: claudeCaps},
 		{Provider: "claude", Model: "claude-sonnet-4-5-20250929", DefaultEffort: "medium", Capabilities: claudeCaps},
-		{Provider: "claude", Model: "claude-haiku-4-5-20251001", DefaultEffort: "low", Capabilities: claudeCaps, RecommendedRoutes: []string{"haiku"}},
+		{Provider: "claude", Model: "claude-haiku-4-5-20251001", DefaultEffort: "low", Capabilities: claudeStructuredCaps, RecommendedRoutes: []string{"haiku"}},
 		{Provider: "claude", Model: "claude-opus-4-1-20250805", DefaultEffort: "high", Capabilities: claudeCaps},
 		{Provider: "claude", Model: "claude-opus-4-20250514", DefaultEffort: "high", Capabilities: claudeCaps},
 		{Provider: "claude", Model: "claude-sonnet-4-20250514", DefaultEffort: "medium", Capabilities: claudeCaps},
@@ -46,7 +48,7 @@ func compatibilityProfiles() map[string]compatibilityProfile {
 		{Provider: "claude", Model: "claude-3-5-haiku-20241022", Capabilities: claudeCaps},
 		{Provider: "codex", Model: "gpt-5.6-sol", DefaultEffort: "max", Capabilities: textCaps, RecommendedRoutes: []string{"sol"}},
 		{Provider: "codex", Model: "gpt-5.6-terra", DefaultEffort: "medium", Capabilities: textCaps, RecommendedRoutes: []string{"terra"}},
-		{Provider: "codex", Model: "gpt-5.6-luna", DefaultEffort: "low", Capabilities: textCaps, RecommendedRoutes: []string{"luna"}},
+		{Provider: "codex", Model: "gpt-5.6-luna", DefaultEffort: "low", Capabilities: codexStructuredCaps, RecommendedRoutes: []string{"luna"}},
 		{Provider: "codex", Model: "gpt-5.5", DefaultEffort: "high", Capabilities: textCaps},
 		{Provider: "codex", Model: "gpt-5.4", DefaultEffort: "medium", Capabilities: textCaps},
 		{Provider: "codex", Model: "gpt-5.4-mini", DefaultEffort: "low", Capabilities: textCaps},
