@@ -245,6 +245,9 @@ func clonePersistedUsageState(source persistedUsageState) persistedUsageState {
 			continue
 		}
 		copyValue := *value
+		copyValue.Usage.Total.ForecastUnderpredictionBuckets = append(
+			[]float64(nil), value.Usage.Total.ForecastUnderpredictionBuckets...,
+		)
 		copyValue.Usage.Hourly = cloneQuotaObservationCounters(value.Usage.Hourly)
 		copyValue.Usage.Daily = cloneQuotaObservationCounters(value.Usage.Daily)
 		cloned.QuotaObservations[key] = &copyValue
@@ -316,6 +319,7 @@ func cloneQuotaRefreshState(source quotaRefreshState) quotaRefreshState {
 func cloneQuotaObservationCounters(source map[string]quotaObservationCounters) map[string]quotaObservationCounters {
 	cloned := make(map[string]quotaObservationCounters, len(source))
 	for key, value := range source {
+		value.ForecastUnderpredictionBuckets = append([]float64(nil), value.ForecastUnderpredictionBuckets...)
 		cloned[key] = value
 	}
 	return cloned
@@ -387,6 +391,7 @@ func loadUsageStateFile(path string) (persistedUsageState, error) {
 	default:
 		return newPersistedUsageState(), fmt.Errorf("unsupported state schema version %d", state.SchemaVersion)
 	}
+	normalizeAdaptiveForecastState(&state)
 	return state, nil
 }
 

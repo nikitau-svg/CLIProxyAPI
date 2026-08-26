@@ -19,14 +19,28 @@ const (
 // Percentages from session, weekly and model-weekly windows are deliberately
 // never added together: each window is an independent capacity constraint.
 type quotaObservationCounters struct {
-	Samples                          int64   `json:"samples"`
-	SkippedResetOrIncreaseSamples    int64   `json:"skipped_reset_or_increase_samples,omitempty"`
-	CoverageSeconds                  int64   `json:"coverage_seconds"`
-	ObservedDropPercent              float64 `json:"observed_drop_percent"`
-	EstimatedLocalPercent            float64 `json:"estimated_local_percent"`
-	AttributedProjectPercent         float64 `json:"attributed_project_percent"`
-	AttributedLocalUnassignedPercent float64 `json:"attributed_local_unassigned_percent"`
-	ExternalOrEstimatorGapPercent    float64 `json:"external_or_estimator_gap_percent"`
+	Samples                          int64     `json:"samples"`
+	SkippedResetOrIncreaseSamples    int64     `json:"skipped_reset_or_increase_samples,omitempty"`
+	CoverageSeconds                  int64     `json:"coverage_seconds"`
+	ObservedDropPercent              float64   `json:"observed_drop_percent"`
+	EstimatedLocalPercent            float64   `json:"estimated_local_percent"`
+	AttributedProjectPercent         float64   `json:"attributed_project_percent"`
+	AttributedLocalUnassignedPercent float64   `json:"attributed_local_unassigned_percent"`
+	ExternalOrEstimatorGapPercent    float64   `json:"external_or_estimator_gap_percent"`
+	ForecastSamples                  int64     `json:"forecast_samples,omitempty"`
+	ForecastSkippedUncalibrated      int64     `json:"forecast_skipped_uncalibrated,omitempty"`
+	ForecastSkippedNoLocal           int64     `json:"forecast_skipped_no_local,omitempty"`
+	ForecastCoverageSeconds          int64     `json:"forecast_coverage_seconds,omitempty"`
+	ForecastPredictedPercent         float64   `json:"forecast_predicted_percent,omitempty"`
+	ForecastActualPercent            float64   `json:"forecast_actual_percent,omitempty"`
+	ForecastSignedErrorPercent       float64   `json:"forecast_signed_error_percent,omitempty"`
+	ForecastAbsoluteErrorPercent     float64   `json:"forecast_absolute_error_percent,omitempty"`
+	ForecastUnderpredictionPercent   float64   `json:"forecast_underprediction_percent,omitempty"`
+	ForecastOverpredictionPercent    float64   `json:"forecast_overprediction_percent,omitempty"`
+	ForecastUnderpredictionSamples   int64     `json:"forecast_underprediction_samples,omitempty"`
+	ForecastOverpredictionSamples    int64     `json:"forecast_overprediction_samples,omitempty"`
+	ForecastUnderpredictionBuckets   []float64 `json:"forecast_underprediction_buckets,omitempty"`
+	ForecastMaximumUnderprediction   float64   `json:"forecast_maximum_underprediction_percent,omitempty"`
 }
 
 type quotaObservationAggregate struct {
@@ -306,22 +320,26 @@ func buildQuotaConsumptionWindow(
 	unassignedEstimated := 0.0
 	totalWeight := 0.0
 	unassignedWeight := 0.0
+	matchingCommits := 0
+	allTokenCalibrated := true
 	for _, commit := range commits {
-		if kind == pluginapi.HostAuthQuotaWindowKindModelWeekly && !quotaModelMatches(commit.Model, quotaModel) {
+		percent, applies, tokenCalibrated := adaptiveShadowCommitPercentForWindow(commit, kind, quotaModel)
+		if !applies {
 			continue
 		}
-		if commit.Percent <= 0 || math.IsNaN(commit.Percent) || math.IsInf(commit.Percent, 0) {
-			continue
+		matchingCommits++
+		if !tokenCalibrated {
+			allTokenCalibrated = false
 		}
-		totalEstimated += commit.Percent
+		totalEstimated += percent
 		weight := commit.TokenUnits
 		if weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
-			weight = commit.Percent
+			weight = percent
 		}
 		totalWeight += weight
 		projectID := strings.TrimSpace(commit.ProjectID)
 		if projectID == "" || !validProjectID(projectID) {
-			unassignedEstimated += commit.Percent
+			unassignedEstimated += percent
 			unassignedWeight += weight
 			continue
 		}
@@ -343,10 +361,14 @@ func buildQuotaConsumptionWindow(
 			groups[key] = group
 		}
 		group.count++
-		group.percent += commit.Percent
+		group.percent += percent
 		group.weight += weight
 	}
 	observation.Counters.EstimatedLocalPercent = totalEstimated
+	recordAdaptiveForecastObservation(
+		&observation.Counters, totalEstimated, drop, coverage,
+		matchingCommits, allTokenCalibrated,
+	)
 	scale := 1.0
 	if totalEstimated > 0 && drop < totalEstimated {
 		scale = math.Max(drop/totalEstimated, 0)
@@ -430,6 +452,26 @@ func mergeQuotaObservationCounters(left, right quotaObservationCounters) quotaOb
 	left.AttributedProjectPercent += right.AttributedProjectPercent
 	left.AttributedLocalUnassignedPercent += right.AttributedLocalUnassignedPercent
 	left.ExternalOrEstimatorGapPercent += right.ExternalOrEstimatorGapPercent
+	left.ForecastSamples += right.ForecastSamples
+	left.ForecastSkippedUncalibrated += right.ForecastSkippedUncalibrated
+	left.ForecastSkippedNoLocal += right.ForecastSkippedNoLocal
+	left.ForecastCoverageSeconds += right.ForecastCoverageSeconds
+	left.ForecastPredictedPercent += right.ForecastPredictedPercent
+	left.ForecastActualPercent += right.ForecastActualPercent
+	left.ForecastSignedErrorPercent += right.ForecastSignedErrorPercent
+	left.ForecastAbsoluteErrorPercent += right.ForecastAbsoluteErrorPercent
+	left.ForecastUnderpredictionPercent += right.ForecastUnderpredictionPercent
+	left.ForecastOverpredictionPercent += right.ForecastOverpredictionPercent
+	left.ForecastUnderpredictionSamples += right.ForecastUnderpredictionSamples
+	left.ForecastOverpredictionSamples += right.ForecastOverpredictionSamples
+	left.ForecastUnderpredictionBuckets = mergeAdaptiveForecastBuckets(
+		left.ForecastUnderpredictionBuckets,
+		right.ForecastUnderpredictionBuckets,
+	)
+	left.ForecastMaximumUnderprediction = math.Max(
+		left.ForecastMaximumUnderprediction,
+		right.ForecastMaximumUnderprediction,
+	)
 	return left
 }
 
@@ -484,15 +526,16 @@ type quotaConsumptionWindowView struct {
 }
 
 type quotaConsumptionPoolView struct {
-	Samples                          int64   `json:"samples"`
-	SkippedResetOrIncreaseSamples    int64   `json:"skipped_reset_or_increase_samples"`
-	SubscriptionHours                float64 `json:"subscription_hours"`
-	ObservedDropPercent              float64 `json:"observed_drop_percent"`
-	AttributedProjectPercent         float64 `json:"attributed_project_percent"`
-	AttributedLocalUnassignedPercent float64 `json:"attributed_local_unassigned_percent"`
-	ExternalOrEstimatorGapPercent    float64 `json:"external_or_estimator_gap_percent"`
-	AverageObservedPPPerSubHour      float64 `json:"average_observed_pp_per_subscription_hour"`
-	AverageExternalPPPerSubHour      float64 `json:"average_external_pp_per_subscription_hour"`
+	Samples                          int64                               `json:"samples"`
+	SkippedResetOrIncreaseSamples    int64                               `json:"skipped_reset_or_increase_samples"`
+	SubscriptionHours                float64                             `json:"subscription_hours"`
+	ObservedDropPercent              float64                             `json:"observed_drop_percent"`
+	AttributedProjectPercent         float64                             `json:"attributed_project_percent"`
+	AttributedLocalUnassignedPercent float64                             `json:"attributed_local_unassigned_percent"`
+	ExternalOrEstimatorGapPercent    float64                             `json:"external_or_estimator_gap_percent"`
+	AverageObservedPPPerSubHour      float64                             `json:"average_observed_pp_per_subscription_hour"`
+	AverageExternalPPPerSubHour      float64                             `json:"average_external_pp_per_subscription_hour"`
+	ForecastBacktest                 *adaptiveForecastBacktestWindowView `json:"forecast_backtest,omitempty"`
 }
 
 type quotaConsumptionProjectView struct {
@@ -705,6 +748,14 @@ func collectQuotaConsumptionLocked(
 			if subscriptionHours > 0 {
 				pool.AverageObservedPPPerSubHour = pool.ObservedDropPercent / subscriptionHours
 				pool.AverageExternalPPPerSubHour = pool.ExternalOrEstimatorGapPercent / subscriptionHours
+			}
+			if window.Observations.ForecastSamples > 0 ||
+				window.Observations.ForecastSkippedUncalibrated > 0 ||
+				window.Observations.ForecastSkippedNoLocal > 0 {
+				forecast := adaptiveForecastWindowFromCounters(adaptiveForecastBacktestWindowView{
+					Provider: window.Provider, WindowKind: window.Kind, QuotaModel: window.QuotaModel,
+				}, window.Observations)
+				pool.ForecastBacktest = &forecast
 			}
 			item.Pool = pool
 		}

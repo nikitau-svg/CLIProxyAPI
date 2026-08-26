@@ -1,6 +1,7 @@
 # Bravo Adaptive Quota 0.9 Preview Contract
 
-Status: preview, phase 1 (`shadow_only`), token calibration v2. Base: published Bravo 0.8.11.
+Status: preview, phase 1 (`shadow_only`), token calibration v2 with forecast
+backtest v3. Base: published Bravo 0.8.11.
 
 ## Purpose
 
@@ -38,6 +39,10 @@ collect evidence for a later allocator, not to activate one implicitly.
    audit record but cannot delay or fail inference and cannot alter a route.
 9. Audit records never contain project/credential identity, API or OAuth
    secrets, headers, prompt/request/response bodies, or raw provider messages.
+10. Forecast backtesting is computed from the pre-request reservation already
+    attached to a real attempt and the next confirmed quota snapshot. It never
+    trains on an interval before scoring that interval and never replays a
+    request against a provider.
 
 ## Estimate
 
@@ -102,6 +107,37 @@ An unreconciled usage event delivered after its nominal interval is excluded
 and increments a visible dropped-telemetry counter. It is never moved into a
 newer interval where it could lower the learned rate without provider proof.
 
+## Forecast backtest
+
+Every valid confirmed interval keeps the session, global-weekly, and
+model-weekly reservation vectors independent. The score for one window is:
+
+```text
+signed_error_pp = confirmed_drop_pp - pre_request_reservations_pp
+underprediction_pp = max(signed_error_pp, 0)
+overprediction_pp = max(-signed_error_pp, 0)
+```
+
+Only intervals whose applicable local commitments all used a token-calibrated
+reservation for that exact window enter the paired cohort. Calibration is
+checked independently: a calibrated session estimate cannot make an
+uncalibrated global-weekly estimate look ready. Intervals containing a reset or
+unexplained quota increase are excluded by the existing watermark. Intervals
+with no local request and intervals containing cold/partial estimates are
+counted separately and cannot improve the score.
+
+The 7-day public backtest exposes paired/skipped interval counts, coverage,
+predicted and observed drop, mean bias, mean absolute error, total
+underprediction/overprediction, conservative-coverage rate, p95
+underprediction, and maximum underprediction. The p95 distribution uses a
+fixed percentage-point histogram stored inside the already bounded quota
+observation buckets; it cannot grow with request volume. Old state is accepted
+without migration and begins the new paired cohort at zero.
+
+A positive residual is an upper bound on estimator slippage, not proof of a
+local estimator miss: another client may consume the same subscription between
+the two provider snapshots. That caveat must remain visible in public output.
+
 Session, weekly and model-weekly percentage points are separate constraints and
 must never be summed into a single consumption percentage. Capacity estimates
 may express attributed use as subscription-window equivalents, average/peak
@@ -125,6 +161,11 @@ event counts, and a separate row for every provider/window/model-window. A row
 reports effective profile intervals, profile coverage, token units, confirmed
 drop, and percentage points per million tokens. It never adds session, weekly,
 and model-weekly drops into a false grand total.
+
+The same aggregate view exposes `forecast_backtest`; management quota analytics
+also include the matching backtest row inside each shared-pool window. Project
+views may receive only aggregates scoped to their allowed subscription pool.
+Neither response contains credential identity.
 
 The management analytics response and the project limits response additionally
 contain 30-day quota-consumption analytics. Management may show shared-pool
@@ -168,4 +209,7 @@ requires a separate reviewed change with production traces proving:
 - acceptable latency on maximum supported request bodies;
 - a clean bounded audit with at least 100 requests over six hours and a manual
   review of fallback and disagreement samples;
+- at least twelve paired, fully token-calibrated intervals over six
+  subscription-hours for every quota window that may receive routing authority,
+  with manual review of p95 and maximum underprediction;
 - an explicit fail-open availability path if future adaptive state is unknown.

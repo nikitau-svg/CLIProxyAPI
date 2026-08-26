@@ -39,6 +39,9 @@ type adaptiveShadowEstimate struct {
 	WeeklyReservationPercent      float64
 	ModelWeeklyReservationPercent float64
 	ModelWeeklyName               string
+	SessionTokenCalibrated        bool
+	WeeklyTokenCalibrated         bool
+	ModelWeeklyTokenCalibrated    bool
 	PredictedTokens               float64
 	LearnedScale                  float64
 	Confidence                    string
@@ -47,6 +50,7 @@ type adaptiveShadowEstimate struct {
 type adaptiveShadowCommit struct {
 	At                 time.Time
 	Percent            float64
+	WindowKind         string
 	ProjectID          string
 	Provider           string
 	Model              string
@@ -59,6 +63,10 @@ type adaptiveShadowCommit struct {
 	WeeklyPercent      float64
 	ModelWeeklyPercent float64
 	ModelWeeklyName    string
+	SessionCalibrated  bool
+	WeeklyCalibrated   bool
+	ModelCalibrated    bool
+	EstimateConfidence string
 }
 
 type adaptiveShadowAccount struct {
@@ -100,6 +108,7 @@ type adaptiveShadowPublicView struct {
 	Saturated                  bool                               `json:"saturated"`
 	DroppedAccounts            uint64                             `json:"dropped_accounts"`
 	TokenCalibration           adaptiveTokenCalibrationPublicView `json:"token_calibration"`
+	ForecastBacktest           adaptiveForecastBacktestPublicView `json:"forecast_backtest"`
 	Note                       string                             `json:"note"`
 }
 
@@ -179,13 +188,16 @@ func adaptiveShadowEstimateFor(
 	)
 	if token.Session.Available {
 		estimate.SessionReservationPercent = token.Session.Percent
+		estimate.SessionTokenCalibrated = true
 	}
 	if token.Weekly.Available {
 		estimate.WeeklyReservationPercent = token.Weekly.Percent
+		estimate.WeeklyTokenCalibrated = true
 	}
 	if token.ModelWeekly.Available {
 		estimate.ModelWeeklyReservationPercent = token.ModelWeekly.Percent
 		estimate.ModelWeeklyName = token.ModelWeeklyName
+		estimate.ModelWeeklyTokenCalibrated = true
 	}
 	if token.Session.Available || token.Weekly.Available || token.ModelWeekly.Available {
 		estimate.ReservationPercent = math.Max(
@@ -229,6 +241,9 @@ func annotateAdaptiveShadowPlan(
 		attempts[index].AdaptiveWeeklyReservationPercent = estimate.WeeklyReservationPercent
 		attempts[index].AdaptiveModelWeeklyReservationPercent = estimate.ModelWeeklyReservationPercent
 		attempts[index].AdaptiveModelWeeklyName = estimate.ModelWeeklyName
+		attempts[index].AdaptiveSessionTokenCalibrated = estimate.SessionTokenCalibrated
+		attempts[index].AdaptiveWeeklyTokenCalibrated = estimate.WeeklyTokenCalibrated
+		attempts[index].AdaptiveModelWeeklyTokenCalibrated = estimate.ModelWeeklyTokenCalibrated
 		attempts[index].AdaptivePredictedTokens = estimate.PredictedTokens
 		attempts[index].AdaptiveEstimateConfidence = estimate.Confidence
 		// These fields are metadata only for unmanaged legacy attempts. Setting
@@ -409,6 +424,10 @@ func recordAdaptiveShadowAttemptCommit(attempt executionAttempt, at time.Time) {
 		WeeklyPercent:      attempt.AdaptiveWeeklyReservationPercent,
 		ModelWeeklyPercent: attempt.AdaptiveModelWeeklyReservationPercent,
 		ModelWeeklyName:    attempt.AdaptiveModelWeeklyName,
+		SessionCalibrated:  attempt.AdaptiveSessionTokenCalibrated,
+		WeeklyCalibrated:   attempt.AdaptiveWeeklyTokenCalibrated,
+		ModelCalibrated:    attempt.AdaptiveModelWeeklyTokenCalibrated,
+		EstimateConfidence: attempt.AdaptiveEstimateConfidence,
 	}
 	recordAdaptiveShadowCommitValue(authIndex, item)
 }
@@ -510,7 +529,6 @@ func reconcileAdaptiveShadow(
 	covered := make([]adaptiveShadowCommit, 0)
 	predicted := 0.0
 	if account != nil {
-		pruneAdaptiveShadowAccount(account, cfg, observedAt)
 		remaining := account.Commits[:0]
 		for _, item := range account.Commits {
 			if !item.At.After(observedAt) {
@@ -526,13 +544,52 @@ func reconcileAdaptiveShadow(
 		if !account.OverflowAt.IsZero() && !account.OverflowAt.After(observedAt) {
 			if account.OverflowAt.After(previousAt) {
 				predicted += account.OverflowPercent
-				covered = append(covered, adaptiveShadowCommit{
-					At: account.OverflowAt, Percent: account.OverflowPercent, Multiplier: 1,
-				})
+				// Coalescing deliberately drops per-request calibration proof. The
+				// synthetic commits still preserve attribution, but the interval is
+				// excluded from the paired forecast cohort instead of claiming a
+				// precision that can no longer be demonstrated.
+				if account.OverflowSessionPercent > 0 {
+					covered = append(covered, adaptiveShadowCommit{
+						At: account.OverflowAt, Percent: account.OverflowSessionPercent,
+						WindowKind:     pluginapi.HostAuthQuotaWindowKindSession,
+						SessionPercent: account.OverflowSessionPercent, Multiplier: 1,
+					})
+				}
+				if account.OverflowWeeklyPercent > 0 {
+					covered = append(covered, adaptiveShadowCommit{
+						At: account.OverflowAt, Percent: account.OverflowWeeklyPercent,
+						WindowKind:    pluginapi.HostAuthQuotaWindowKindWeekly,
+						WeeklyPercent: account.OverflowWeeklyPercent, Multiplier: 1,
+					})
+				}
+				for model, percent := range account.OverflowModelWeeklyPercent {
+					if percent <= 0 {
+						continue
+					}
+					covered = append(covered, adaptiveShadowCommit{
+						At: account.OverflowAt, Percent: percent,
+						WindowKind: pluginapi.HostAuthQuotaWindowKindModelWeekly,
+						Model:      model, ModelWeeklyName: model, ModelWeeklyPercent: percent,
+						Multiplier: 1,
+					})
+				}
+				if account.OverflowUnknownModelWeeklyPercent > 0 {
+					covered = append(covered, adaptiveShadowCommit{
+						At: account.OverflowAt, Percent: account.OverflowUnknownModelWeeklyPercent,
+						WindowKind:         pluginapi.HostAuthQuotaWindowKindModelWeekly,
+						ModelWeeklyPercent: account.OverflowUnknownModelWeeklyPercent,
+						Multiplier:         1,
+					})
+				}
 			}
 			account.OverflowAt = time.Time{}
 			account.OverflowPercent = 0
+			account.OverflowSessionPercent = 0
+			account.OverflowWeeklyPercent = 0
+			account.OverflowModelWeeklyPercent = nil
+			account.OverflowUnknownModelWeeklyPercent = 0
 		}
+		pruneAdaptiveShadowAccount(account, cfg, observedAt)
 		actual := math.Max(
 			math.Max(previous.Session.RemainingPercent-refreshed.Session.RemainingPercent, 0),
 			math.Max(previous.Weekly.RemainingPercent-refreshed.Weekly.RemainingPercent, 0),
@@ -621,6 +678,7 @@ func pruneAdaptiveShadowAccount(account *adaptiveShadowAccount, cfg pluginConfig
 
 func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time) adaptiveShadowPublicView {
 	tokenCalibration := adaptiveTokenCalibrationSummary(authIndexes, now)
+	forecastBacktest := adaptiveForecastBacktestSummary(authIndexes, now)
 	allowed := make(map[string]struct{}, len(authIndexes))
 	for _, authIndex := range authIndexes {
 		if authIndex = strings.TrimSpace(authIndex); authIndex != "" {
@@ -638,6 +696,7 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 		CoolingMaxAgeSeconds:       cfg.AdaptiveCoolingMaxAgeSeconds,
 		MaximumLearnedScale:        1,
 		TokenCalibration:           tokenCalibration,
+		ForecastBacktest:           forecastBacktest,
 		Note:                       "Теневой расчёт не блокирует запросы и не меняет маршруты; он не выполняет дополнительных обращений к подпискам.",
 	}
 	adaptiveShadowRuntime.Lock()

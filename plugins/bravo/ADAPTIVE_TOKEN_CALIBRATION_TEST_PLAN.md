@@ -1,4 +1,4 @@
-# Adaptive token calibration v2 test plan
+# Adaptive token calibration v2 and forecast backtest v3 test plan
 
 Status: Bravo 0.9 shadow preview. The module has no routing authority.
 
@@ -23,6 +23,11 @@ Status: Bravo 0.9 shadow preview. The module has no routing authority.
    identity, prompts, responses, keys, headers, or raw provider errors.
 8. Reconciled profiles survive restart, decay with a 24-hour half-life, and are
    ignored after insufficient decayed evidence or 31 inactive days.
+9. Backtest scoring uses the reservation captured before the request. It keeps
+   session, weekly and model-weekly predictions independent, excludes reset and
+   mixed cold/partial intervals, and never changes routing.
+10. Forecast histograms are fixed-size, persist inside the bounded quota
+    observation state, and expose no credential or project identity.
 
 ## Deterministic tests
 
@@ -48,6 +53,16 @@ Status: Bravo 0.9 shadow preview. The module has no routing authority.
 - Audit reports token-calibrated decisions separately from cold/legacy ones.
   A decision enters that cohort only when both effective quota dimensions are
   calibrated; partial profiles remain explicitly outside it.
+- Window-specific fixtures compare the pre-request prediction with the next
+  confirmed drop and verify signed bias, absolute error, under/overprediction,
+  conservative coverage, p95, and maximum underprediction.
+- Calibration eligibility is checked per exact window: a ready session profile
+  cannot admit an uncalibrated weekly reservation into the paired cohort.
+- Reset, external-only, and mixed legacy intervals increment explicit skipped
+  counters and never enter the paired backtest cohort.
+- Twelve paired intervals over six subscription-hours survive restart and make
+  the corresponding window available for manual review without granting route
+  authority.
 
 ## Required gates
 
@@ -70,6 +85,8 @@ so historical cold/legacy disagreements cannot contaminate this cohort:
 - successful `would_withhold` rate;
 - quota failures on `would_admit`;
 - reservation/confirmed-drop ratio per independent window;
+- mean bias, mean absolute error, p95 and maximum underprediction from the
+  paired pre-request forecast cohort;
 - dropped/saturated telemetry, persistence errors, queue depth, and disk bound;
 - provider request count and quota polling cadence against the prior preview.
 

@@ -124,6 +124,10 @@ func TestAdaptiveTokenCalibrationLearnsIndependentWindowRates(t *testing.T) {
 		estimate.ModelWeeklyReservationPercent <= 0 {
 		t.Fatalf("non-positive calibrated estimate: %#v", estimate)
 	}
+	if !estimate.SessionTokenCalibrated || !estimate.WeeklyTokenCalibrated ||
+		!estimate.ModelWeeklyTokenCalibrated {
+		t.Fatalf("window-specific calibration proof missing: %#v", estimate)
+	}
 
 	view := adaptiveTokenCalibrationSummary([]string{authIndex}, testAt)
 	if view.Status != "available" || view.ReadyWindowProfiles != 3 || view.TrackedUsageProfiles != 1 || len(view.Windows) != 3 {
@@ -478,13 +482,17 @@ func TestAdaptiveTokenCalibrationAuditConfidenceRequiresBothEffectiveWindows(t *
 		strings.HasPrefix(partial.Confidence, "token_calibrated_") {
 		t.Fatalf("one learned dimension entered complete audit cohort: %#v", partial)
 	}
+	if !partial.SessionTokenCalibrated || partial.WeeklyTokenCalibrated || partial.ModelWeeklyTokenCalibrated {
+		t.Fatalf("partial estimate lost window-specific calibration state: %#v", partial)
+	}
 	bravoUsageState.mu.Lock()
 	bravoUsageState.state.AdaptiveTokenWindowProfiles[adaptiveTokenWindowProfileKey(
 		authIndex, "claude", model, "", tariff.ID, pluginapi.HostAuthQuotaWindowKindWeekly, "",
 	)] = window(pluginapi.HostAuthQuotaWindowKindWeekly)
 	bravoUsageState.mu.Unlock()
 	complete := estimate()
-	if complete.Confidence != "token_calibrated_complete" {
+	if complete.Confidence != "token_calibrated_complete" || !complete.SessionTokenCalibrated ||
+		!complete.WeeklyTokenCalibrated {
 		t.Fatalf("both effective dimensions did not enter complete audit cohort: %#v", complete)
 	}
 }
