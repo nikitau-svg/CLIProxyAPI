@@ -275,11 +275,34 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	if keepAliveInterval <= 0 {
+		keepAliveInterval = handlers.BravoStreamHeartbeatInterval(upstreamHeaders)
+	}
+	if upstreamHeaders != nil {
+		upstreamHeaders.Del(handlers.BravoStreamHeartbeatHeader)
+	}
+	var bootstrapKeepAlive *time.Ticker
+	var bootstrapKeepAliveC <-chan time.Time
+	if keepAliveInterval > 0 {
+		bootstrapKeepAlive = time.NewTicker(keepAliveInterval)
+		defer bootstrapKeepAlive.Stop()
+		bootstrapKeepAliveC = bootstrapKeepAlive.C
+	}
+	streamCommitted := false
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+	}
+	commitStream := func() {
+		if streamCommitted {
+			return
+		}
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		streamCommitted = true
 	}
 
 	// Peek at the first chunk to determine success or failure before setting headers
@@ -288,6 +311,10 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case <-bootstrapKeepAliveC:
+			commitStream()
+			_, _ = c.Writer.Write([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
+			flusher.Flush()
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
@@ -295,7 +322,12 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				continue
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			if streamCommitted {
+				h.writeClaudeStreamError(c, errMsg)
+				flusher.Flush()
+			} else {
+				h.WriteErrorResponse(c, errMsg)
+			}
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -305,7 +337,12 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case chunk, ok := <-dataChan:
 			if !ok {
 				if errMsg, okPendingErr := pendingClaudeStreamError(errChan); okPendingErr {
-					h.WriteErrorResponse(c, errMsg)
+					if streamCommitted {
+						h.writeClaudeStreamError(c, errMsg)
+						flusher.Flush()
+					} else {
+						h.WriteErrorResponse(c, errMsg)
+					}
 					if errMsg != nil {
 						cliCancel(errMsg.Error)
 					} else {
@@ -314,16 +351,14 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 					return
 				}
 				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				commitStream()
 				flusher.Flush()
 				cliCancel(nil)
 				return
 			}
 
 			// Success! Set headers now.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			commitStream()
 
 			// Write the first chunk
 			if len(chunk) > 0 {
@@ -362,19 +397,24 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			_, _ = c.Writer.Write(chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
-			if errMsg == nil {
-				return
-			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
-			c.Status(status)
-
-			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
-			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+			h.writeClaudeStreamError(c, errMsg)
 		},
 	})
+}
+
+func (h *ClaudeCodeAPIHandler) writeClaudeStreamError(c *gin.Context, errMsg *interfaces.ErrorMessage) {
+	if c == nil || errMsg == nil {
+		return
+	}
+	if !c.Writer.Written() {
+		status := http.StatusInternalServerError
+		if errMsg.StatusCode > 0 {
+			status = errMsg.StatusCode
+		}
+		c.Status(status)
+	}
+	errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+	_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 }
 
 type claudeErrorDetail struct {

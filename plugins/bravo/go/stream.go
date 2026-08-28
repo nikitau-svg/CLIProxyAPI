@@ -14,6 +14,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+const bravoStreamHeartbeatHeader = "X-Bravo-Stream-Heartbeat-Seconds"
+
 type rpcStreamEmitRequest struct {
 	StreamID       string `json:"stream_id"`
 	HostCallbackID string `json:"host_callback_id,omitempty"`
@@ -65,13 +67,25 @@ func executeStream(raw []byte) ([]byte, error) {
 		routeRecorder.preflightFailure("logical_contract", failure, errPreflight)
 		return failureEnvelopeWithRouteTrace(routeRecorder, failure), nil
 	}
-	go runBravoStreamWithTrace(req, streamID, routeRecorder)
+	lease, duplicateFailure := acquireBravoActiveStream(req, cfg, logicalModelID, protocol, body)
+	if duplicateFailure != nil {
+		routeRecorder.preflightFailure("duplicate_stream_guard", *duplicateFailure, nil)
+		return failureEnvelopeWithRouteTrace(routeRecorder, *duplicateFailure), nil
+	}
+	go func() {
+		defer lease.release()
+		runBravoStreamWithTrace(req, streamID, routeRecorder)
+	}()
+	responseHeaders := http.Header{
+		"Content-Type":     []string{"text/event-stream"},
+		"Cache-Control":    []string{"no-cache"},
+		bravoTraceIDHeader: []string{routeRecorder.trace.TraceID},
+	}
+	if protocol == protocolClaude {
+		responseHeaders.Set(bravoStreamHeartbeatHeader, "15")
+	}
 	return okEnvelope(map[string]any{
-		"headers": http.Header{
-			"Content-Type":     []string{"text/event-stream"},
-			"Cache-Control":    []string{"no-cache"},
-			bravoTraceIDHeader: []string{routeRecorder.trace.TraceID},
-		},
+		"headers": responseHeaders,
 	})
 }
 

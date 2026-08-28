@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -359,8 +360,9 @@ func TestErrorResponseAddonCarriesOnlyUpstreamHeaders(t *testing.T) {
 
 func TestDownstreamBravoPluginTraceHeaderSurvivesPassthroughOff(t *testing.T) {
 	headers := http.Header{
-		"X-Bravo-Trace-Id": {"trc_0123456789abcdef01234567"},
-		"X-Upstream":       {"must-not-pass"},
+		"X-Bravo-Trace-Id":         {"trc_0123456789abcdef01234567"},
+		BravoStreamHeartbeatHeader: {"15"},
+		"X-Upstream":               {"must-not-pass"},
 	}
 	got := downstreamPluginHeadersFromExecutor("bravo", headers, false)
 	if traceID := got.Get("X-Bravo-Trace-Id"); traceID != "trc_0123456789abcdef01234567" {
@@ -369,8 +371,12 @@ func TestDownstreamBravoPluginTraceHeaderSurvivesPassthroughOff(t *testing.T) {
 	if upstream := got.Get("X-Upstream"); upstream != "" {
 		t.Fatalf("upstream header escaped passthrough gate: %q", upstream)
 	}
+	if interval := BravoStreamHeartbeatInterval(got); interval != 15*time.Second {
+		t.Fatalf("heartbeat interval = %s, want 15s", interval)
+	}
 	if invalid := downstreamPluginHeadersFromExecutor("bravo", http.Header{
-		"X-Bravo-Trace-Id": {"provider-controlled-value"},
+		"X-Bravo-Trace-Id":         {"provider-controlled-value"},
+		BravoStreamHeartbeatHeader: {"1"},
 	}, false); invalid != nil {
 		t.Fatalf("invalid trace header escaped: %#v", invalid)
 	}

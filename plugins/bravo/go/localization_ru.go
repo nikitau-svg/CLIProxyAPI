@@ -54,6 +54,8 @@ func clientExecutionFailureRU(failure executionFailure) executionFailure {
 		}
 	case "bravo_route_temporarily_unavailable", "overloaded_error":
 		failure.Message = "Все подходящие маршруты временно недоступны или перегружены. Подождите время из Retry-After и повторите запрос."
+	case "bravo_duplicate_stream_in_flight":
+		failure.Message = "Идентичный запрос этого проекта уже выполняется. Bravo не отправил повтор провайдеру; дождитесь активного ответа."
 	case "bravo_provider_ambiguous_invalid_request":
 		failure.Message = "Один провайдер неоднозначно отклонил запрос. Bravo продолжит соседний совместимый маршрут; ошибка выйдет наружу только если остальные варианты также недоступны."
 	case "bravo_contract_unavailable", "bravo_contract_rejected", "bravo_contract_unverified", "bravo_capability_conflict", "bravo_capability_undeclared", "bravo_effort_unavailable":

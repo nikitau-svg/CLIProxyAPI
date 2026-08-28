@@ -60,6 +60,10 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	// BravoStreamHeartbeatHeader is an internal, validated hint from the Bravo
+	// executor to the protocol handler. It is consumed before downstream headers
+	// are written and never trusted from an upstream provider.
+	BravoStreamHeartbeatHeader = "X-Bravo-Stream-Heartbeat-Seconds"
 	// Stream interceptor history is intentionally bounded and not configurable in the first SDK surface.
 	maxStreamInterceptorHistoryChunks = 64
 	maxStreamInterceptorHistoryBytes  = 1 << 20
@@ -279,6 +283,20 @@ func StreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 		seconds = cfg.Streaming.KeepAliveSeconds
 	}
 	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// BravoStreamHeartbeatInterval returns a validated executor-authored bootstrap
+// heartbeat interval. The ordinary server setting remains authoritative when
+// configured; this hint only protects Bravo streams while it is unset.
+func BravoStreamHeartbeatInterval(headers http.Header) time.Duration {
+	if headers == nil {
+		return 0
+	}
+	seconds, errParse := strconv.Atoi(strings.TrimSpace(headers.Get(BravoStreamHeartbeatHeader)))
+	if errParse != nil || seconds < 5 || seconds > 60 {
 		return 0
 	}
 	return time.Duration(seconds) * time.Second
@@ -1994,6 +2012,13 @@ func copyBravoControlHeaders(dst, src http.Header) http.Header {
 			dst = make(http.Header)
 		}
 		dst.Set("X-Bravo-Trace-Id", traceID)
+	}
+	heartbeat := BravoStreamHeartbeatInterval(src)
+	if heartbeat > 0 {
+		if dst == nil {
+			dst = make(http.Header)
+		}
+		dst.Set(BravoStreamHeartbeatHeader, strconv.Itoa(int(heartbeat/time.Second)))
 	}
 	return dst
 }
