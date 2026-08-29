@@ -1002,6 +1002,25 @@ func TestCodexExecutorReasoningReplayCacheUsesRequestPrefixForDuplicateOutOfOrde
 	}
 }
 
+func TestCodexReplayInputPrefixFingerprintsMatchExistingFormat(t *testing.T) {
+	body := []byte(`{"input":[` +
+		`{"type":"message","role":"user","content":"first"},` +
+		`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]},` +
+		`{"type":"function_call_output","call_id":"call_1","output":"large result"}` +
+		`]}`)
+	inputItems := gjson.GetBytes(body, "input").Array()
+	got := codexReplayInputPrefixFingerprints(inputItems)
+	if len(got) != len(inputItems)+1 {
+		t.Fatalf("prefix fingerprints = %d, want %d", len(got), len(inputItems)+1)
+	}
+	for end := 0; end <= len(inputItems); end++ {
+		want := codexReplayInputPrefixFingerprint(inputItems, end)
+		if got[end] != want {
+			t.Fatalf("prefix %d = %q, want %q", end, got[end], want)
+		}
+	}
+}
+
 func TestCodexExecutorReasoningReplayCacheDropsFunctionCallWithoutMatchingOutput(t *testing.T) {
 	internalcache.ClearCodexReasoningReplayCache()
 	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)

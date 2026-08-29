@@ -526,6 +526,13 @@ func insertCodexReasoningReplayTurns(body []byte, replayItems [][]byte) ([]byte,
 	}
 	inputItems := input.Array()
 	turns := splitCodexReasoningReplayTurns(replayItems)
+	var prefixFingerprints []string
+	for _, turn := range turns {
+		if turn.marked && turn.requestFingerprint != "" {
+			prefixFingerprints = codexReplayInputPrefixFingerprints(inputItems)
+			break
+		}
+	}
 	insertions := make(map[int][][]byte)
 	usedAnchorIndexes := make(map[int]bool)
 	fallbackAnchorEnd := len(inputItems) - 1
@@ -547,7 +554,7 @@ func insertCodexReasoningReplayTurns(body []byte, replayItems [][]byte) ([]byte,
 			continue
 		}
 
-		anchorIndex, matched := codexReasoningReplayTurnAnchorIndex(inputItems, turn, fallbackAnchorEnd, usedAnchorIndexes)
+		anchorIndex, matched := codexReasoningReplayTurnAnchorIndex(inputItems, prefixFingerprints, turn, fallbackAnchorEnd, usedAnchorIndexes)
 		if !matched {
 			continue
 		}
@@ -616,7 +623,7 @@ func splitCodexReasoningReplayTurns(items [][]byte) []codexReasoningReplayTurn {
 	return turns
 }
 
-func codexReasoningReplayTurnAnchorIndex(inputItems []gjson.Result, turn codexReasoningReplayTurn, fallbackEnd int, used map[int]bool) (int, bool) {
+func codexReasoningReplayTurnAnchorIndex(inputItems []gjson.Result, prefixFingerprints []string, turn codexReasoningReplayTurn, fallbackEnd int, used map[int]bool) (int, bool) {
 	searchEnd := fallbackEnd
 	if turn.requestFingerprint != "" {
 		searchEnd = len(inputItems) - 1
@@ -625,7 +632,8 @@ func codexReasoningReplayTurnAnchorIndex(inputItems []gjson.Result, turn codexRe
 		searchEnd = len(inputItems) - 1
 	}
 	matchesRequestPrefix := func(index int) bool {
-		return turn.requestFingerprint == "" || codexReplayInputPrefixFingerprint(inputItems, index) == turn.requestFingerprint
+		return turn.requestFingerprint == "" ||
+			(index >= 0 && index < len(prefixFingerprints) && prefixFingerprints[index] == turn.requestFingerprint)
 	}
 	if len(turn.callIDs) > 0 {
 		callIDs := make(map[string]bool)
@@ -764,6 +772,22 @@ func codexReplayInputPrefixFingerprint(inputItems []gjson.Result, end int) strin
 		_, _ = hasher.Write([]byte(inputItems[index].Raw))
 	}
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// codexReplayInputPrefixFingerprints computes every prefix digest in one
+// forward pass. Anchor matching used to call codexReplayInputPrefixFingerprint
+// for every candidate index, repeatedly hashing the same large conversation
+// prefix and turning resumed long sessions into quadratic CPU work.
+func codexReplayInputPrefixFingerprints(inputItems []gjson.Result) []string {
+	fingerprints := make([]string, len(inputItems)+1)
+	hasher := sha256.New()
+	fingerprints[0] = hex.EncodeToString(hasher.Sum(nil))
+	for index, item := range inputItems {
+		_, _ = hasher.Write([]byte("\x00item\x00"))
+		_, _ = hasher.Write([]byte(item.Raw))
+		fingerprints[index+1] = hex.EncodeToString(hasher.Sum(nil))
+	}
+	return fingerprints
 }
 
 func filterCodexReasoningReplayItemsForInput(body []byte, items [][]byte) [][]byte {
