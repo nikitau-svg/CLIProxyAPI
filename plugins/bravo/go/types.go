@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.9.0-preview.10"
+	pluginVersion    = "0.9.0-preview.11"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -184,14 +184,19 @@ type candidate struct {
 }
 
 type executionAttempt struct {
-	LogicalModel                          string
-	Candidate                             candidate
-	Auth                                  pluginapi.HostAuthFileEntry
-	RequestedEffort                       string
-	EffectiveEffort                       string
-	ProjectID                             string
-	Primary                               bool
-	AllocatorManaged                      bool
+	LogicalModel     string
+	Candidate        candidate
+	Auth             pluginapi.HostAuthFileEntry
+	RequestedEffort  string
+	EffectiveEffort  string
+	ProjectID        string
+	Primary          bool
+	AllocatorManaged bool
+	AllocatorBypass  bool
+	// AllocatorBypassProbe is shared by copies of a bypass attempt so the
+	// execution path can atomically move a scheduled-reset probe from reserved
+	// to consumed at the exact point where provider dispatch begins.
+	AllocatorBypassProbe                  *allocatorBypassProbeAttemptState
 	ReservationPercent                    float64
 	TariffID                              string
 	CompactBypass                         bool

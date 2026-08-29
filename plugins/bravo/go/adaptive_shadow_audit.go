@@ -71,6 +71,7 @@ type adaptiveShadowAuditRecord struct {
 	OmittedAttempts            int                          `json:"omitted_attempts,omitempty"`
 	FallbackUsed               bool                         `json:"fallback_used"`
 	RoutingEnforced            bool                         `json:"routing_enforced"`
+	RoutingChangesApplied      int                          `json:"routing_changes_applied"`
 	AdditionalProviderRequests int                          `json:"additional_provider_requests"`
 	Attempts                   []adaptiveShadowAuditAttempt `json:"attempts"`
 }
@@ -82,6 +83,7 @@ type adaptiveShadowAuditReport struct {
 	VerdictMessage                      string                      `json:"verdict_message"`
 	Mode                                string                      `json:"mode"`
 	Effect                              string                      `json:"effect"`
+	RoutingEnforced                     bool                        `json:"routing_enforced"`
 	From                                time.Time                   `json:"from"`
 	To                                  time.Time                   `json:"to"`
 	RequestsObserved                    int                         `json:"requests_observed"`
@@ -479,6 +481,7 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 		VerdictMessage:        "Наблюдений пока недостаточно; маршрутизация остаётся прежней.",
 		Mode:                  cfg.AdaptiveAllocatorMode,
 		Effect:                adaptiveShadowEffect(cfg),
+		RoutingEnforced:       cfg.AdaptiveAllocatorMode == "enforce",
 		From:                  now.Add(-period),
 		To:                    now,
 		QueueCapacity:         cap(store.queue),
@@ -506,12 +509,17 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 			continue
 		}
 		report.RequestsObserved++
+		// The report covers a historical window which may span a hot reload.
+		// Preserve evidence that routing was enforced for any included request,
+		// even when the current mode has since returned to observe.
+		report.RoutingEnforced = report.RoutingEnforced || record.RoutingEnforced
 		if record.Success {
 			report.SuccessfulRequests++
 		} else {
 			report.FailedRequests++
 		}
 		report.ActualExecutionAttempts += record.ActualExecutionAttempts
+		report.RoutingChangesApplied += record.RoutingChangesApplied
 		if record.FallbackUsed {
 			report.RequestsWithFallback++
 		}
@@ -694,7 +702,42 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 			report.EdgeGateAttempts,
 		)
 	}
+	if report.RoutingEnforced {
+		report.VerdictMessage = adaptiveEnforcedAuditVerdictMessage(report.Verdict, report.RequestsObserved)
+		report.TokenCalibrationVerdictMessage = adaptiveEnforcedAuditComponentMessage(
+			"токен-калибровка", report.TokenCalibrationVerdict, report.TokenCalibratedAttempts,
+		)
+		report.EdgeGateVerdictMessage = adaptiveEnforcedAuditComponentMessage(
+			"турникет", report.EdgeGateVerdict, report.EdgeGateAttempts,
+		)
+	}
 	return report
+}
+
+func adaptiveEnforcedAuditVerdictMessage(verdict string, requests int) string {
+	switch verdict {
+	case "telemetry_degraded":
+		return "Телеметрия боевого режима частично потеряна; сам маршрутизатор продолжает работать fail-open на неизвестных данных."
+	case "needs_review":
+		return "Боевой режим обнаружил расхождения прогноза с фактическим результатом; требуется проверить пороги или временно вернуть observe."
+	case "ready_for_review":
+		return "Боевой режим работает без обнаруженных расхождений в выбранном окне; аудит можно зафиксировать."
+	default:
+		return fmt.Sprintf("Боевой режим включён; аудит продолжает накапливать подтверждения (%d запросов), не добавляя обращений к провайдеру.", requests)
+	}
+}
+
+func adaptiveEnforcedAuditComponentMessage(component, verdict string, attempts int) string {
+	switch verdict {
+	case "telemetry_degraded":
+		return fmt.Sprintf("Телеметрия компонента «%s» деградировала; неизвестные данные остаются fail-open.", component)
+	case "needs_review":
+		return fmt.Sprintf("Компонент «%s» обнаружил расхождения; требуется ручная проверка.", component)
+	case "ready_for_review":
+		return fmt.Sprintf("Компонент «%s» набрал достаточную чистую выборку в боевом режиме.", component)
+	default:
+		return fmt.Sprintf("Компонент «%s» активен; аудит продолжается (%d попыток).", component, attempts)
+	}
 }
 
 func currentAdaptiveShadowAuditReport(cfg pluginConfig, period time.Duration, recentLimit int, now time.Time) adaptiveShadowAuditReport {
@@ -714,6 +757,7 @@ func currentAdaptiveShadowAuditReport(cfg pluginConfig, period time.Duration, re
 			EdgeGateVerdictMessage:         "Shadow-турникет ещё не инициализирован.",
 			Mode:                           cfg.AdaptiveAllocatorMode,
 			Effect:                         adaptiveShadowEffect(cfg),
+			RoutingEnforced:                cfg.AdaptiveAllocatorMode == "enforce",
 			From:                           now.UTC().Add(-period),
 			To:                             now.UTC(),
 			QueueCapacity:                  adaptiveShadowAuditQueueCapacity,
@@ -733,8 +777,13 @@ func sanitizeAdaptiveShadowAuditRecord(record adaptiveShadowAuditRecord) adaptiv
 	}
 	record.TraceID = adaptiveShadowAuditToken(record.TraceID, 96)
 	record.LogicalModel = adaptiveShadowAuditToken(record.LogicalModel, 160)
-	record.RoutingEnforced = false
 	record.AdditionalProviderRequests = 0
+	if record.RoutingChangesApplied < 0 {
+		record.RoutingChangesApplied = 0
+	}
+	if !record.RoutingEnforced {
+		record.RoutingChangesApplied = 0
+	}
 	if record.ActualExecutionAttempts < 0 {
 		record.ActualExecutionAttempts = 0
 	}

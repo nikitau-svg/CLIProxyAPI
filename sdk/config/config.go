@@ -11,6 +11,7 @@ type SDKConfig = internalconfig.SDKConfig
 type Config = internalconfig.Config
 
 type StreamingConfig = internalconfig.StreamingConfig
+type ErrorLogCaptureConfig = internalconfig.ErrorLogCaptureConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type OAuthModelAlias = internalconfig.OAuthModelAlias
@@ -34,6 +35,9 @@ type TLS = internalconfig.TLSConfig
 
 const (
 	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+	ErrorLogCaptureModeMetadata  = internalconfig.ErrorLogCaptureModeMetadata
+	ErrorLogCaptureModeOff       = internalconfig.ErrorLogCaptureModeOff
+	ErrorLogCaptureModeBody      = internalconfig.ErrorLogCaptureModeBody
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }

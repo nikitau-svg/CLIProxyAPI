@@ -52,12 +52,16 @@ type adaptiveEdgeGateAttemptState struct {
 	guardHeld              bool
 	guardLeaseAt           time.Time
 	probeBreakerKey        string
+	enforce                bool
+	quotaFresh             bool
+	compactBypass          bool
 }
 
 type adaptiveEdgeGateSnapshot struct {
 	State                  string
 	Decision               string
 	Reason                 string
+	Enforce                bool
 	QuotaConfirmed         bool
 	SessionHeadroomPercent float64
 	WeeklyHeadroomPercent  float64
@@ -152,6 +156,9 @@ func newAdaptiveEdgeGateAttemptState(
 		quotaConfirmed:         confirmed,
 		sessionHeadroomPercent: adaptiveShadowRound(sessionHeadroom),
 		weeklyHeadroomPercent:  adaptiveShadowRound(weeklyHeadroom),
+		enforce:                cfg.AdaptiveAllocatorMode == "enforce",
+		quotaFresh:             quotaFreshnessAt(quota, attempt.Candidate.Model, cfg, now) == quotaFreshnessFresh,
+		compactBypass:          attempt.CompactBypass,
 	}
 }
 
@@ -165,12 +172,54 @@ func (state *adaptiveEdgeGateAttemptState) snapshot() adaptiveEdgeGateSnapshot {
 		State:                  state.state,
 		Decision:               state.decision,
 		Reason:                 state.reason,
+		Enforce:                state.enforce,
 		QuotaConfirmed:         state.quotaConfirmed,
 		SessionHeadroomPercent: state.sessionHeadroomPercent,
 		WeeklyHeadroomPercent:  state.weeklyHeadroomPercent,
 		TripRemainingSeconds:   state.tripRemainingSeconds,
 		OutcomeTransition:      state.outcomeTransition,
 	}
+}
+
+// refreshAdaptiveEdgeGateAttemptState updates the plan-time snapshot just
+// before acquisition. Quota may have become stale between planning and the
+// provider call; enforcement must not inherit a stale guarded verdict and turn
+// it into a real skip. Existing started state is never rewritten.
+func refreshAdaptiveEdgeGateAttemptState(
+	attempt executionAttempt,
+	cfg pluginConfig,
+	quota credentialQuotaState,
+	tariff tariffConfig,
+	now time.Time,
+) {
+	state := attempt.AdaptiveEdgeGate
+	if state == nil {
+		return
+	}
+	refreshed := newAdaptiveEdgeGateAttemptState(cfg, attempt, quota, tariff, now)
+	if refreshed == nil {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.started {
+		return
+	}
+	state.authIndex = refreshed.authIndex
+	state.provider = refreshed.provider
+	state.model = refreshed.model
+	state.staticState = refreshed.staticState
+	state.staticReason = refreshed.staticReason
+	state.state = refreshed.state
+	state.decision = ""
+	state.reason = refreshed.reason
+	state.quotaConfirmed = refreshed.quotaConfirmed
+	state.sessionHeadroomPercent = refreshed.sessionHeadroomPercent
+	state.weeklyHeadroomPercent = refreshed.weeklyHeadroomPercent
+	state.tripRemainingSeconds = 0
+	state.enforce = refreshed.enforce
+	state.quotaFresh = refreshed.quotaFresh
+	state.compactBypass = refreshed.compactBypass
 }
 
 func beginAdaptiveEdgeGateShadow(attempt executionAttempt, now time.Time) {
@@ -185,6 +234,15 @@ func beginAdaptiveEdgeGateShadow(attempt executionAttempt, now time.Time) {
 		return
 	}
 	state.started = true
+	if state.enforce && state.compactBypass {
+		// /compact is the explicit, rate-limited escape hatch for the ordinary
+		// reserve floor. Adaptive enforcement may observe it, but must not add a
+		// second gate that changes the bypass contract.
+		state.state = state.staticState
+		state.decision = adaptiveEdgeGateDecisionDispatch
+		state.reason = "compact_bypass_fail_open"
+		return
+	}
 
 	adaptiveEdgeGateRuntime.Lock()
 	defer adaptiveEdgeGateRuntime.Unlock()
@@ -223,6 +281,15 @@ func beginAdaptiveEdgeGateShadow(attempt executionAttempt, now time.Time) {
 
 	state.state = state.staticState
 	state.reason = state.staticReason
+	if state.enforce && (!state.quotaConfirmed || !state.quotaFresh) {
+		state.decision = adaptiveEdgeGateDecisionDispatch
+		if state.quotaConfirmed {
+			state.reason = "quota_stale_fail_open"
+		} else {
+			state.reason = "quota_unconfirmed_fail_open"
+		}
+		return
+	}
 	if state.staticState != adaptiveEdgeGateStateGuarded {
 		state.decision = adaptiveEdgeGateDecisionDispatch
 		return
@@ -238,6 +305,64 @@ func beginAdaptiveEdgeGateShadow(attempt executionAttempt, now time.Time) {
 		return
 	}
 	state.decision = adaptiveEdgeGateDecisionDispatch
+}
+
+// cancelAdaptiveEdgeGateAttempt releases a simulated/enforced guard when the
+// request never reached the provider (for example the ordinary allocator lost
+// a concurrent reservation race). It does not create a breaker.
+func cancelAdaptiveEdgeGateAttempt(attempt executionAttempt) {
+	state := attempt.AdaptiveEdgeGate
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.started || state.outcomeObserved {
+		return
+	}
+	releaseAdaptiveEdgeGateStateLocked(state)
+	state.outcomeObserved = true
+	state.outcomeTransition = "not_dispatched"
+}
+
+// failOpenAdaptiveEdgeGateAttempt removes any guard acquired by this attempt
+// while still allowing its later provider outcome to trip a real breaker.
+func failOpenAdaptiveEdgeGateAttempt(attempt executionAttempt, reason string) {
+	state := attempt.AdaptiveEdgeGate
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.started || state.outcomeObserved {
+		return
+	}
+	releaseAdaptiveEdgeGateStateLocked(state)
+	state.decision = adaptiveEdgeGateDecisionDispatch
+	state.reason = reason
+}
+
+func releaseAdaptiveEdgeGateStateLocked(state *adaptiveEdgeGateAttemptState) {
+	if state == nil {
+		return
+	}
+	adaptiveEdgeGateRuntime.Lock()
+	defer adaptiveEdgeGateRuntime.Unlock()
+	if state.guardHeld {
+		if lease, ok := adaptiveEdgeGateRuntime.InFlight[state.authIndex]; ok &&
+			lease.StartedAt.Equal(state.guardLeaseAt) {
+			delete(adaptiveEdgeGateRuntime.InFlight, state.authIndex)
+		}
+		state.guardHeld = false
+	}
+	if state.probeBreakerKey != "" {
+		if breaker, ok := adaptiveEdgeGateRuntime.Breakers[state.probeBreakerKey]; ok {
+			breaker.ProbeInFlight = false
+			breaker.ProbeStartedAt = time.Time{}
+			adaptiveEdgeGateRuntime.Breakers[state.probeBreakerKey] = breaker
+		}
+		state.probeBreakerKey = ""
+	}
 }
 
 func adaptiveEdgeGateActiveBreakerLocked(
@@ -423,15 +548,17 @@ func adaptiveEdgeGateSummary(cfg pluginConfig, authIndexes []string, now time.Ti
 	view := adaptiveEdgeGatePublicView{
 		Mode:                       cfg.AdaptiveAllocatorMode,
 		Effect:                     adaptiveShadowEffect(cfg),
-		RoutingEnforced:            false,
+		RoutingEnforced:            cfg.AdaptiveAllocatorMode == "enforce",
 		QueuesRequests:             false,
 		AdditionalProviderRequests: false,
 		SessionGuardPercent:        adaptiveEdgeGateSessionGuardPercent,
 		WeeklyGuardPercent:         adaptiveEdgeGateWeeklyGuardPercent,
-		Note:                       "Турникет только моделирует мгновенный переход к следующему маршруту; он не ждёт, не блокирует и не меняет фактическое выполнение.",
+		Note:                       "Турникет моделирует мгновенный переход к следующему маршруту; он не ждёт, не ставит запросы в очередь и не добавляет обращений к провайдеру.",
 	}
 	if cfg.AdaptiveAllocatorMode == "off" {
 		view.Note = "Shadow-турникет отключён вместе с адаптивным наблюдением."
+	} else if cfg.AdaptiveAllocatorMode == "enforce" {
+		view.Note = "Турникет мгновенно пропускает подтверждённо опасную попытку и продолжает соседний маршрут; неизвестные и устаревшие квоты fail-open, очередей нет."
 	}
 	now = now.UTC()
 	adaptiveEdgeGateRuntime.Lock()

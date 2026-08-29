@@ -13,11 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +31,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -212,8 +216,8 @@ func (s *FileBodySource) Paths() []string {
 	return out
 }
 
-// WriteTo merges all ordered parts into w.
-func (s *FileBodySource) WriteTo(w io.Writer) error {
+// WriteAllTo merges all ordered parts into w.
+func (s *FileBodySource) WriteAllTo(w io.Writer) error {
 	if s == nil || w == nil {
 		return nil
 	}
@@ -253,7 +257,7 @@ func (s *FileBodySource) WriteTo(w io.Writer) error {
 // Bytes merges all ordered parts into memory.
 func (s *FileBodySource) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
-	if errWrite := s.WriteTo(&buf); errWrite != nil {
+	if errWrite := s.WriteAllTo(&buf); errWrite != nil {
 		return nil, errWrite
 	}
 	return buf.Bytes(), nil
@@ -422,6 +426,9 @@ type FileRequestLogger struct {
 	errorLogsMaxFiles int
 
 	homeEnabled bool
+
+	policyMu            sync.RWMutex
+	errorLogCaptureMode string
 }
 
 type homeRequestLogPayload struct {
@@ -434,6 +441,109 @@ type safeErrorLogDiagnostic string
 
 func (e safeErrorLogDiagnostic) Error() string { return string(e) }
 
+const (
+	errorRequestBodyMetadataPrefix  = "[REQUEST BODY METADATA] "
+	errorResponseBodyMetadataPrefix = "[RESPONSE BODY METADATA] "
+	errorRequestBodyOmitted         = "[OMITTED: production error logs do not persist request bodies]"
+	errorResponseBodyOmitted        = "[OMITTED: production error logs do not persist response bodies]"
+)
+
+// ErrorRequestBodyMetadata is the complete body-related information retained by
+// metadata-mode error logs. It deliberately contains no body bytes or digest.
+type ErrorRequestBodyMetadata struct {
+	DeclaredBytes int64 `json:"declared_bytes"`
+	ConsumedBytes int64 `json:"consumed_bytes"`
+	Complete      bool  `json:"complete"`
+}
+
+// ErrorResponseBodyMetadata is the only response-body information retained by
+// metadata-mode error logs.
+type ErrorResponseBodyMetadata struct {
+	WrittenBytes int64 `json:"written_bytes"`
+}
+
+// FormatErrorRequestBodyMetadata creates an internal marker which is accepted
+// only by the forced-error sanitization path. Arbitrary request content cannot
+// use this marker to bypass body omission because it is decoded into the closed
+// numeric schema again before being written.
+func FormatErrorRequestBodyMetadata(metadata ErrorRequestBodyMetadata) []byte {
+	metadata = normalizeErrorRequestBodyMetadata(metadata)
+	payload, errMarshal := json.Marshal(metadata)
+	if errMarshal != nil {
+		return nil
+	}
+	return append([]byte(errorRequestBodyMetadataPrefix), payload...)
+}
+
+func normalizeErrorRequestBodyMetadata(metadata ErrorRequestBodyMetadata) ErrorRequestBodyMetadata {
+	if metadata.DeclaredBytes < -1 {
+		metadata.DeclaredBytes = -1
+	}
+	if metadata.ConsumedBytes < 0 {
+		metadata.ConsumedBytes = 0
+	}
+	return metadata
+}
+
+func safeForcedRequestBody(body []byte) []byte {
+	omitted := []byte(errorRequestBodyOmitted)
+	if !bytes.HasPrefix(body, []byte(errorRequestBodyMetadataPrefix)) {
+		return omitted
+	}
+	payload := bytes.TrimPrefix(body, []byte(errorRequestBodyMetadataPrefix))
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var metadata ErrorRequestBodyMetadata
+	if errDecode := decoder.Decode(&metadata); errDecode != nil {
+		return omitted
+	}
+	var trailing any
+	if errTrailing := decoder.Decode(&trailing); !errors.Is(errTrailing, io.EOF) {
+		return omitted
+	}
+	formatted := FormatErrorRequestBodyMetadata(metadata)
+	if len(formatted) == 0 {
+		return omitted
+	}
+	return append(append(omitted, '\n'), formatted...)
+}
+
+// FormatErrorResponseBodyMetadata creates a closed numeric marker for the
+// response bytes actually written to the downstream client.
+func FormatErrorResponseBodyMetadata(metadata ErrorResponseBodyMetadata) []byte {
+	if metadata.WrittenBytes < 0 {
+		metadata.WrittenBytes = 0
+	}
+	payload, errMarshal := json.Marshal(metadata)
+	if errMarshal != nil {
+		return nil
+	}
+	return append([]byte(errorResponseBodyMetadataPrefix), payload...)
+}
+
+func safeForcedResponseBody(body []byte) []byte {
+	omitted := []byte(errorResponseBodyOmitted)
+	if !bytes.HasPrefix(body, []byte(errorResponseBodyMetadataPrefix)) {
+		return omitted
+	}
+	payload := bytes.TrimPrefix(body, []byte(errorResponseBodyMetadataPrefix))
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var metadata ErrorResponseBodyMetadata
+	if errDecode := decoder.Decode(&metadata); errDecode != nil {
+		return omitted
+	}
+	var trailing any
+	if errTrailing := decoder.Decode(&trailing); !errors.Is(errTrailing, io.EOF) {
+		return omitted
+	}
+	formatted := FormatErrorResponseBodyMetadata(metadata)
+	if len(formatted) == 0 {
+		return omitted
+	}
+	return append(append(omitted, '\n'), formatted...)
+}
+
 func safeErrorLogMessages(messages []*interfaces.ErrorMessage) []*interfaces.ErrorMessage {
 	if len(messages) == 0 {
 		return nil
@@ -443,49 +553,284 @@ func safeErrorLogMessages(messages []*interfaces.ErrorMessage) []*interfaces.Err
 		if message == nil {
 			continue
 		}
-		code := "unclassified_request_failure"
-		diagnostic := "code=" + code
+		code := safeErrorLogFallbackCode(message.StatusCode)
+		errorType, scope, reason, class := "", "", "", ""
 		if message.Error != nil {
 			var coded interface{ ErrorCode() string }
 			if errors.As(message.Error, &coded) && coded != nil {
-				if value := strings.TrimSpace(coded.ErrorCode()); value != "" {
-					code = providererror.Sanitize(providererror.Detail{Code: value}).Code
-					diagnostic = "code=" + code
+				if value := safeKnownErrorLogCode(coded.ErrorCode(), message.ExecutorPluginID); value != "" {
+					code = value
 				}
 			}
 			if detail, ok := providererror.FromError(message.Error); ok {
-				diagnostic = fmt.Sprintf(
-					"code=%s type=%s scope=%s reason=%s",
-					firstNonEmptyLogValue(detail.Code, code),
-					detail.Type,
-					detail.Scope,
-					detail.Reason,
-				)
-				if detail.Message != "" {
-					diagnostic += " message=" + detail.Message
+				providerCode, providerType, providerScope, providerReason, providerClass := safeProviderErrorLogFields(detail)
+				if code == safeErrorLogFallbackCode(message.StatusCode) && providerCode != "" {
+					code = providerCode
 				}
+				errorType, scope, reason, class = providerType, providerScope, providerReason, providerClass
 			}
 		}
+		diagnostic := fmt.Sprintf(
+			"code=%s type=%s scope=%s reason=%s class=%s",
+			code, errorType, scope, reason, class,
+		)
 		safe = append(safe, &interfaces.ErrorMessage{
 			StatusCode: message.StatusCode,
 			Error:      safeErrorLogDiagnostic(strings.TrimSpace(diagnostic)),
-			Addon:      redactedHTTPHeader(message.Addon),
+			Addon:      safeMetadataHTTPHeader(message.Addon),
 		})
 	}
 	return safe
 }
 
-func firstNonEmptyLogValue(values ...string) string {
-	for _, value := range values {
-		if value = strings.TrimSpace(value); value != "" {
-			return value
+func safeErrorLogFallbackCode(status int) string {
+	if status >= 400 && status <= 599 {
+		return "http_" + strconv.Itoa(status) + "_failure"
+	}
+	return "unclassified_request_failure"
+}
+
+// safeKnownErrorLogCode is deliberately a closed registry. ErrorCode is an
+// interface implemented by providers and plugins, so syntax validation alone
+// is not enough: an upstream can put a credential-shaped value in error.code.
+func safeKnownErrorLogCode(raw, executorPluginID string) string {
+	code := strings.ToLower(strings.TrimSpace(raw))
+	if strings.EqualFold(strings.TrimSpace(executorPluginID), "bravo") {
+		switch code {
+		case "bravo_adaptive_edge_busy",
+			"bravo_adaptive_edge_tripped",
+			"bravo_adaptive_quota_withheld",
+			"bravo_allocator_reserve_floor",
+			"bravo_allocator_withheld",
+			"bravo_attempt_superseded",
+			"bravo_capability_conflict",
+			"bravo_capability_undeclared",
+			"bravo_capability_unsupported",
+			"bravo_compact_bypass_cooldown",
+			"bravo_context_target_incompatible",
+			"bravo_context_window_exceeded",
+			"bravo_contract_rejected",
+			"bravo_contract_unavailable",
+			"bravo_contract_unverified",
+			"bravo_count_response_invalid",
+			"bravo_count_unavailable",
+			"bravo_duplicate_stream_in_flight",
+			"bravo_effort_conflict",
+			"bravo_effort_invalid",
+			"bravo_effort_unavailable",
+			"bravo_execution_failed",
+			"bravo_host_call_failed",
+			"bravo_host_response_invalid",
+			"bravo_host_stream_chunk_invalid",
+			"bravo_host_stream_error",
+			"bravo_host_stream_invalid",
+			"bravo_host_stream_missing",
+			"bravo_model_forbidden",
+			"bravo_model_unknown",
+			"bravo_no_eligible_account",
+			"bravo_project_api_unavailable",
+			"bravo_project_limits_cache_unavailable",
+			"bravo_project_model_gate",
+			"bravo_project_model_unknown",
+			"bravo_project_not_found",
+			"bravo_project_revoked",
+			"bravo_protocol_unsupported",
+			"bravo_provider_ambiguous_invalid_request",
+			"bravo_provider_invalid_request",
+			"bravo_provider_stream_error",
+			"bravo_provider_unsupported",
+			"bravo_quota_then_context_exhausted",
+			"bravo_request_invalid",
+			"bravo_route_temporarily_unavailable",
+			"bravo_smart_key_required",
+			"bravo_stream_attempt_aborted",
+			"bravo_stream_id_required",
+			"bravo_stream_panic",
+			"bravo_subscription_access_denied",
+			"bravo_subscription_auth_unavailable",
+			"bravo_subscription_cooling_down",
+			"bravo_subscription_model_credits_exhausted",
+			"bravo_subscription_model_unavailable",
+			"bravo_subscription_quota_exhausted",
+			"bravo_unknown_prefixed_model":
+			return code
+		default:
+			return "bravo_failure"
 		}
 	}
-	return ""
+
+	switch code {
+	case "api_error",
+		"authentication_error",
+		"bad_request_error",
+		"billing_error",
+		"context_length_exceeded",
+		"context_window_exceeded",
+		"credits_required",
+		"invalid_request_error",
+		"model_not_supported",
+		"overloaded_error",
+		"permission_error",
+		"provider_stream_incomplete",
+		"rate_limit_error",
+		"request_canceled",
+		"request_too_large",
+		"server_error",
+		"timeout_error":
+		return code
+	default:
+		return ""
+	}
+}
+
+// safeProviderErrorLogFields derives every persisted token from the reviewed
+// taxonomy. Provider-authored Code, Type and Reason are intentionally ignored.
+func safeProviderErrorLogFields(detail providererror.Detail) (code, errorType, scope, reason, class string) {
+	detail = providererror.Sanitize(detail)
+	if detail.TaxonomyVersion != providererror.FailureTaxonomyV1 {
+		return "", "", "", "", ""
+	}
+	switch detail.Scope {
+	case providererror.ScopeRequest, providererror.ScopeModel, providererror.ScopeAccount:
+		scope = detail.Scope
+	default:
+		return "", "", "", "", ""
+	}
+	class = detail.Class
+	switch detail.Class {
+	case providererror.ClassInvalidRequest:
+		code, reason = "provider_invalid_request", "invalid_request"
+	case providererror.ClassContextWindow:
+		code, reason = "provider_context_window", "context_window"
+	case providererror.ClassPayloadTooLarge:
+		code, reason = "provider_payload_too_large", "payload_too_large"
+	case providererror.ClassAuthentication:
+		code, reason = "provider_authentication", "authentication"
+	case providererror.ClassPermission:
+		code, reason = "provider_permission", "permission"
+	case providererror.ClassBilling:
+		code, reason = "provider_billing", "billing"
+	case providererror.ClassQuota:
+		code, reason = "provider_quota", "quota"
+	case providererror.ClassRateLimit:
+		code, reason = "provider_rate_limit", "rate_limit"
+	case providererror.ClassNotFound:
+		code, reason = "provider_not_found", "not_found"
+	case providererror.ClassConflict:
+		code, reason = "provider_conflict", "conflict"
+	case providererror.ClassTimeout:
+		code, reason = "provider_timeout", "timeout"
+	case providererror.ClassOverloaded:
+		code, reason = "provider_overloaded", "overloaded"
+	case providererror.ClassProviderInternal:
+		code, reason = "provider_internal", "provider_internal"
+	case providererror.ClassTransport:
+		code, reason = "provider_transport", "transport"
+	case providererror.ClassCanceled:
+		code, reason = "provider_canceled", "canceled"
+	default:
+		return "", "", "", "", ""
+	}
+	return code, "provider_error", scope, reason, class
 }
 
 func redactedHTTPHeader(headers map[string][]string) http.Header {
 	return http.Header(redactedHeaders(headers))
+}
+
+func safeMetadataHTTPHeader(headers map[string][]string) http.Header {
+	return http.Header(safeMetadataHeaders(headers))
+}
+
+// safeMetadataHeaders is a closed allowlist for forced production diagnostics.
+// Header names are useful for debugging, but arbitrary values may carry a
+// credential, cookie, prompt fragment, or signed URL under an innocent name.
+func safeMetadataHeaders(headers map[string][]string) map[string][]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(headers))
+	for rawKey, values := range headers {
+		key := safeMetadataHeaderName(rawKey)
+		if key == "" {
+			continue
+		}
+		if len(values) == 0 {
+			out[key] = []string{"[REDACTED]"}
+			continue
+		}
+		safeValues := make([]string, len(values))
+		for index, value := range values {
+			safeValues[index] = safeMetadataHeaderValue(key, value)
+		}
+		out[key] = safeValues
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func safeMetadataHeaderName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z',
+			char >= 'A' && char <= 'Z',
+			char >= '0' && char <= '9',
+			char == '-':
+		default:
+			return ""
+		}
+	}
+	return http.CanonicalHeaderKey(value)
+}
+
+func safeMetadataHeaderValue(key, value string) string {
+	value = strings.TrimSpace(value)
+	switch strings.ToLower(key) {
+	case "content-length":
+		if len(value) <= 20 {
+			if parsed, errParse := strconv.ParseUint(value, 10, 64); errParse == nil {
+				return strconv.FormatUint(parsed, 10)
+			}
+		}
+	case "content-type":
+		if mediaType, _, errParse := mime.ParseMediaType(value); errParse == nil && len(mediaType) <= 128 {
+			return strings.ToLower(mediaType)
+		}
+	case "retry-after":
+		if len(value) <= 20 {
+			if seconds, errParse := strconv.ParseUint(value, 10, 64); errParse == nil {
+				return strconv.FormatUint(seconds, 10)
+			}
+		}
+		if parsed, errParse := http.ParseTime(value); errParse == nil {
+			return parsed.UTC().Format(http.TimeFormat)
+		}
+	}
+	return "[REDACTED]"
+}
+
+func safeForcedRequestURL(raw string) string {
+	parsed, errParse := url.Parse(strings.TrimSpace(raw))
+	if errParse != nil {
+		return "/[REDACTED]"
+	}
+	path := parsed.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	if len(path) > 512 || strings.ContainsAny(path, "\r\n") {
+		path = "/[REDACTED]"
+	}
+	if parsed.RawQuery != "" {
+		path += "?[REDACTED]"
+	}
+	return path
 }
 
 func redactedHeaders(headers map[string][]string) map[string][]string {
@@ -510,7 +855,13 @@ func redactedHeaders(headers map[string][]string) map[string][]string {
 }
 
 func (l *FileRequestLogger) forwardRequestLogToHome(ctx context.Context, headers map[string][]string, requestID string, logText string) error {
-	if l == nil || !l.homeEnabled {
+	if l == nil {
+		return nil
+	}
+	l.policyMu.RLock()
+	homeEnabled := l.homeEnabled
+	l.policyMu.RUnlock()
+	if !homeEnabled {
 		return nil
 	}
 	client := currentHomeRequestLogClient()
@@ -552,10 +903,11 @@ func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorL
 		}
 	}
 	return &FileRequestLogger{
-		enabled:           enabled,
-		logsDir:           logsDir,
-		errorLogsMaxFiles: errorLogsMaxFiles,
-		homeEnabled:       false,
+		enabled:             enabled,
+		logsDir:             logsDir,
+		errorLogsMaxFiles:   errorLogsMaxFiles,
+		homeEnabled:         false,
+		errorLogCaptureMode: config.ErrorLogCaptureModeMetadata,
 	}
 }
 
@@ -565,7 +917,9 @@ func (l *FileRequestLogger) SetHomeEnabled(enabled bool) {
 	if l == nil {
 		return
 	}
+	l.policyMu.Lock()
 	l.homeEnabled = enabled
+	l.policyMu.Unlock()
 }
 
 // IsEnabled returns whether request logging is currently enabled.
@@ -573,7 +927,13 @@ func (l *FileRequestLogger) SetHomeEnabled(enabled bool) {
 // Returns:
 //   - bool: True if logging is enabled, false otherwise
 func (l *FileRequestLogger) IsEnabled() bool {
-	return l.enabled
+	if l == nil {
+		return false
+	}
+	l.policyMu.RLock()
+	enabled := l.enabled
+	l.policyMu.RUnlock()
+	return enabled
 }
 
 // SetEnabled updates the request logging enabled state.
@@ -582,12 +942,54 @@ func (l *FileRequestLogger) IsEnabled() bool {
 // Parameters:
 //   - enabled: Whether request logging should be enabled
 func (l *FileRequestLogger) SetEnabled(enabled bool) {
+	if l == nil {
+		return
+	}
+	l.policyMu.Lock()
 	l.enabled = enabled
+	l.policyMu.Unlock()
 }
+
+// SetErrorLogCaptureMode updates the error-only capture policy. Config parsing
+// rejects unsupported values; the defensive fallback here keeps metadata mode.
+func (l *FileRequestLogger) SetErrorLogCaptureMode(mode string) {
+	if l == nil {
+		return
+	}
+	if mode != config.ErrorLogCaptureModeOff {
+		mode = config.ErrorLogCaptureModeMetadata
+	}
+	l.policyMu.Lock()
+	l.errorLogCaptureMode = mode
+	l.policyMu.Unlock()
+}
+
+// ErrorLogCaptureMode returns a concurrency-safe snapshot for one request.
+func (l *FileRequestLogger) ErrorLogCaptureMode() string {
+	if l == nil {
+		return config.ErrorLogCaptureModeMetadata
+	}
+	l.policyMu.RLock()
+	mode := l.errorLogCaptureMode
+	l.policyMu.RUnlock()
+	if mode == config.ErrorLogCaptureModeOff {
+		return config.ErrorLogCaptureModeOff
+	}
+	return config.ErrorLogCaptureModeMetadata
+}
+
+// SupportsSafeErrorLogCapture declares that forced error logs are sanitized by
+// this implementation before any bytes are persisted or forwarded.
+func (l *FileRequestLogger) SupportsSafeErrorLogCapture() bool { return l != nil }
 
 // SetErrorLogsMaxFiles updates the maximum number of error log files to retain.
 func (l *FileRequestLogger) SetErrorLogsMaxFiles(maxFiles int) {
+	if l == nil {
+		return
+	}
+	l.policyMu.Lock()
 	l.errorLogsMaxFiles = maxFiles
+	l.policyMu.Unlock()
 }
 
 // NewFileBodySource creates a temp-backed source under the request log directory.
@@ -646,12 +1048,19 @@ func (l *FileRequestLogger) LogRequestWithOptionsAndAllSources(url, method strin
 func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline []byte, websocketTimelineSource *FileBodySource, apiRequest []byte, apiRequestSource *FileBodySource, apiResponse []byte, apiResponseSource *FileBodySource, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
 	defer cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource, apiWebsocketTimelineSource)
 
-	if !l.enabled && !force {
+	l.policyMu.RLock()
+	enabled := l.enabled
+	homeEnabled := l.homeEnabled
+	l.policyMu.RUnlock()
+	if !enabled && !force {
 		return nil
 	}
-	if force && !l.enabled {
-		body = []byte("[OMITTED: production error logs do not persist request bodies]")
-		response = []byte("[OMITTED: production error logs do not persist response bodies]")
+	if force {
+		url = safeForcedRequestURL(url)
+		requestHeaders = safeMetadataHeaders(requestHeaders)
+		body = safeForcedRequestBody(body)
+		responseHeaders = safeMetadataHeaders(responseHeaders)
+		response = safeForcedResponseBody(response)
 		websocketTimeline = nil
 		websocketTimelineSource = nil
 		apiRequest = nil
@@ -663,7 +1072,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		apiResponseErrors = safeErrorLogMessages(apiResponseErrors)
 	}
 
-	if l.homeEnabled && l.enabled {
+	if homeEnabled && enabled && !force {
 		responseToWrite, decompressErr := l.decompressResponse(responseHeaders, response)
 		if decompressErr != nil {
 			responseToWrite = response
@@ -706,14 +1115,18 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 
 	// Generate filename with request ID
 	filename := l.generateFilename(url, requestID)
-	if force && !l.enabled {
+	if force {
 		filename = l.generateErrorFilename(url, requestID)
 	}
 	filePath := filepath.Join(l.logsDir, filename)
 
-	requestBodyPath, errTemp := l.writeRequestBodyTempFile(body)
-	if errTemp != nil {
-		log.WithError(errTemp).Warn("failed to create request body temp file, falling back to direct write")
+	var requestBodyPath string
+	if !force {
+		var errTemp error
+		requestBodyPath, errTemp = l.writeRequestBodyTempFile(body)
+		if errTemp != nil {
+			log.WithError(errTemp).Warn("failed to create request body temp file, falling back to direct write")
+		}
 	}
 	if requestBodyPath != "" {
 		defer func() {
@@ -729,9 +1142,19 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		responseToWrite = response
 	}
 
-	logFile, errOpen := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	fileMode := os.FileMode(0644)
+	if force {
+		fileMode = 0600
+	}
+	logFile, errOpen := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fileMode)
 	if errOpen != nil {
 		return fmt.Errorf("failed to create log file: %w", errOpen)
+	}
+	if force {
+		if errChmod := logFile.Chmod(0600); errChmod != nil {
+			_ = logFile.Close()
+			return fmt.Errorf("failed to secure error log file: %w", errChmod)
+		}
 	}
 
 	writeErr := l.writeNonStreamingLog(
@@ -767,7 +1190,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		return fmt.Errorf("failed to write log file: %w", writeErr)
 	}
 
-	if force && !l.enabled {
+	if force {
 		if errCleanup := l.cleanupOldErrorLogs(); errCleanup != nil {
 			log.WithError(errCleanup).Warn("failed to clean up old error logs")
 		}
@@ -789,11 +1212,15 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 //   - StreamingLogWriter: A writer for streaming response chunks
 //   - error: An error if logging initialization fails, nil otherwise
 func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[string][]string, body []byte, requestID string) (StreamingLogWriter, error) {
-	if !l.enabled {
+	l.policyMu.RLock()
+	enabled := l.enabled
+	homeEnabled := l.homeEnabled
+	l.policyMu.RUnlock()
+	if !enabled {
 		return &NoOpStreamingLogWriter{}, nil
 	}
 
-	if l.homeEnabled {
+	if homeEnabled {
 		client := currentHomeRequestLogClient()
 		if client == nil || !client.HeartbeatOK() {
 			return &NoOpStreamingLogWriter{}, nil
@@ -860,8 +1287,11 @@ func (l *FileRequestLogger) generateErrorFilename(url string, requestID ...strin
 // Returns:
 //   - error: An error if directory creation fails, nil otherwise
 func (l *FileRequestLogger) ensureLogsDir() error {
-	if _, err := os.Stat(l.logsDir); os.IsNotExist(err) {
-		return os.MkdirAll(l.logsDir, 0755)
+	if _, errStat := os.Stat(l.logsDir); errStat != nil {
+		if os.IsNotExist(errStat) {
+			return os.MkdirAll(l.logsDir, 0700)
+		}
+		return errStat
 	}
 	return nil
 }
@@ -940,7 +1370,10 @@ func (l *FileRequestLogger) sanitizeForFilename(path string) string {
 
 // cleanupOldErrorLogs keeps only the newest errorLogsMaxFiles forced error log files.
 func (l *FileRequestLogger) cleanupOldErrorLogs() error {
-	if l.errorLogsMaxFiles <= 0 {
+	l.policyMu.RLock()
+	maxFiles := l.errorLogsMaxFiles
+	l.policyMu.RUnlock()
+	if maxFiles <= 0 {
 		return nil
 	}
 
@@ -971,7 +1404,7 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 		files = append(files, logFile{name: name, modTime: info.ModTime()})
 	}
 
-	if len(files) <= l.errorLogsMaxFiles {
+	if len(files) <= maxFiles {
 		return nil
 	}
 
@@ -979,7 +1412,7 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 		return files[i].modTime.After(files[j].modTime)
 	})
 
-	for _, file := range files[l.errorLogsMaxFiles:] {
+	for _, file := range files[maxFiles:] {
 		if errRemove := os.Remove(filepath.Join(l.logsDir, file.name)); errRemove != nil {
 			log.WithError(errRemove).Warnf("failed to remove old error log: %s", file.name)
 		}
@@ -1299,7 +1732,7 @@ func writeAPISectionWithSource(w io.Writer, sectionHeader string, sectionPrefix 
 		}
 	}
 	tracker := &trailingNewlineTrackingWriter{writer: w}
-	if errWrite := source.WriteTo(tracker); errWrite != nil {
+	if errWrite := source.WriteAllTo(tracker); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeSectionSpacing(w, tracker.trailingNewlines); errWrite != nil {
@@ -1318,7 +1751,7 @@ func writePreformattedAPISectionWithSource(w io.Writer, sectionHeader string, se
 		}
 	}
 	tracker := &trailingNewlineTrackingWriter{writer: w}
-	if errWrite := source.WriteTo(tracker); errWrite != nil {
+	if errWrite := source.WriteAllTo(tracker); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeSectionSpacing(w, tracker.trailingNewlines); errWrite != nil {

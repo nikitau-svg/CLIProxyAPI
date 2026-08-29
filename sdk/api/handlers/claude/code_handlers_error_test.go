@@ -10,6 +10,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	basehandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -140,6 +141,36 @@ func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "error.message").String(); got != "Your input exceeds the context window of this model. Please adjust your input and try again." {
 		t.Fatalf("error.message = %q; body=%s", got, body)
+	}
+}
+
+func TestWriteClaudeErrorResponseCapturesMetadataDiagnostic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	base := basehandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		ErrorLogCapture: sdkconfig.ErrorLogCaptureConfig{
+			Mode: sdkconfig.ErrorLogCaptureModeMetadata,
+		},
+	}, nil)
+	handler := NewClaudeCodeAPIHandler(base)
+	errMsg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error: codedClaudeHandlerError{
+			code:    "bravo_route_temporarily_unavailable",
+			message: "provider message",
+		},
+	}
+
+	handler.WriteErrorResponse(c, errMsg)
+
+	value, ok := c.Get("API_RESPONSE_ERROR")
+	if !ok {
+		t.Fatal("metadata diagnostic was not captured")
+	}
+	errorsForLog, ok := value.([]*interfaces.ErrorMessage)
+	if !ok || len(errorsForLog) != 1 || errorsForLog[0] != errMsg {
+		t.Fatalf("API_RESPONSE_ERROR = %#v, want the request-scoped error", value)
 	}
 }
 

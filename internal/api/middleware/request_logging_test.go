@@ -3,11 +3,13 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -114,14 +116,14 @@ func TestShouldCaptureRequestBody(t *testing.T) {
 				ContentLength: 2,
 				Header:        http.Header{"Content-Type": []string{"application/json"}},
 			},
-			want: true,
+			want: false,
 		},
 		{
 			name:          "large known size skipped in error-only mode",
 			loggerEnabled: false,
 			req: &http.Request{
 				Body:          io.NopCloser(strings.NewReader("x")),
-				ContentLength: maxErrorOnlyCapturedRequestBodyBytes + 1,
+				ContentLength: 2<<20 + 1,
 				Header:        http.Header{"Content-Type": []string{"application/json"}},
 			},
 			want: false,
@@ -156,49 +158,47 @@ func TestShouldCaptureRequestBody(t *testing.T) {
 	}
 }
 
-func TestDeferredRequestBodyCaptureDoesNotDrainUnreadBody(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	logger := logging.NewFileRequestLogger(false, t.TempDir(), "", 10)
+func TestRequestBodyMetadataCaptureIsTransparentAndCountsConsumption(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("remaining-body"))
-	request.ContentLength = -1
-	request.Header.Set("Content-Type", "application/json")
-	requestInfo := &RequestInfo{Headers: map[string][]string{"Content-Type": {"application/json"}}}
-	capture := attachDeferredRequestBodyCapture(request, logger, requestInfo, false, false)
+	request.ContentLength = int64(len("remaining-body"))
+	requestInfo := &RequestInfo{}
+	capture := attachRequestBodyMetadata(request, requestInfo)
 	if capture == nil {
-		t.Fatal("deferred request body capture was not attached")
+		t.Fatal("request body metadata capture was not attached")
 	}
-	defer capture.Cleanup()
 
-	firstByte := make([]byte, 1)
-	if _, errRead := request.Body.Read(firstByte); errRead != nil {
-		t.Fatalf("read first request byte: %v", errRead)
+	first := make([]byte, 3)
+	n, errRead := request.Body.Read(first)
+	if errRead != nil {
+		t.Fatalf("read first request bytes: %v", errRead)
 	}
-	captured, marker, errCaptured := capture.Bytes()
-	if errCaptured != nil {
-		t.Fatalf("read captured body: %v", errCaptured)
+	if got := string(first[:n]); got != "rem" {
+		t.Fatalf("first read = %q, want rem", got)
 	}
-	if string(captured) != "r" {
-		t.Fatalf("captured body = %q, want %q", string(captured), "r")
+	partial := capture.snapshot()
+	if partial.ConsumedBytes != 3 || partial.DeclaredBytes != int64(len("remaining-body")) || partial.Complete {
+		t.Fatalf("partial metadata = %+v", partial)
 	}
-	if !strings.Contains(marker, "REQUEST BODY CAPTURE INCOMPLETE") {
-		t.Fatalf("capture marker = %q, want incomplete marker", marker)
-	}
-	remaining, errRemaining := io.ReadAll(capture.body)
+
+	rest, errRemaining := io.ReadAll(request.Body)
 	if errRemaining != nil {
 		t.Fatalf("read remaining body: %v", errRemaining)
 	}
-	if string(remaining) != "emaining-body" {
-		t.Fatalf("remaining body = %q, want %q", string(remaining), "emaining-body")
+	if got := string(first[:n]) + string(rest); got != "remaining-body" {
+		t.Fatalf("handler body = %q, want remaining-body", got)
+	}
+	complete := capture.snapshot()
+	if complete.ConsumedBytes != int64(len("remaining-body")) || !complete.Complete {
+		t.Fatalf("complete metadata = %+v", complete)
 	}
 }
 
-func TestRequestLoggingMiddlewareCapturesLargeErrorRequestAndDeferredAPIRequest(t *testing.T) {
+func TestRequestLoggingMiddlewareLargeErrorKeepsOnlyMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	logsDir := t.TempDir()
 	logger := logging.NewFileRequestLogger(false, logsDir, "", 10)
-	payload := append([]byte(`{"marker":"large-error-body","padding":"`), bytes.Repeat([]byte("x"), int(maxErrorOnlyCapturedRequestBodyBytes))...)
+	payload := append([]byte(`{"marker":"large-error-body","padding":"`), bytes.Repeat([]byte("x"), 2<<20)...)
 	payload = append(payload, []byte(`"}`)...)
 	upstreamBody := []byte(`{"model":"upstream-model","input":"translated"}`)
 
@@ -258,6 +258,204 @@ func TestRequestLoggingMiddlewareCapturesLargeErrorRequestAndDeferredAPIRequest(
 	}
 	if bytes.Contains(content, []byte("=== API REQUEST 1 ===")) || bytes.Contains(content, upstreamBody) {
 		t.Fatal("production error log leaked the deferred upstream request")
+	}
+	metadata := []byte(`"declared_bytes":` + fmt.Sprint(len(payload)) + `,"consumed_bytes":` + fmt.Sprint(len(payload)) + `,"complete":true`)
+	if !bytes.Contains(content, metadata) {
+		t.Fatalf("production error log metadata = %q, want %q", content, metadata)
+	}
+	responseMetadata := []byte(`"written_bytes":` + fmt.Sprint(response.Body.Len()))
+	if !bytes.Contains(content, responseMetadata) {
+		t.Fatalf("production response metadata = %q, want %q", content, responseMetadata)
+	}
+	info, errStat := os.Stat(logPath)
+	if errStat != nil {
+		t.Fatalf("stat error log: %v", errStat)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("error log mode = %04o, want 0600", got)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("logs directory contains temp/spool files: %v", entries)
+	}
+}
+
+func TestRequestLoggingMiddlewareMetadataSuccessCreatesNoFiles(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logsDir := t.TempDir()
+	logger := logging.NewFileRequestLogger(false, logsDir, "", 10)
+	payload := bytes.Repeat([]byte("unknown-length-body"), 100000)
+
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(logger))
+	router.POST("/v1/responses", func(c *gin.Context) {
+		body, errRead := io.ReadAll(c.Request.Body)
+		if errRead != nil || !bytes.Equal(body, payload) {
+			c.Status(http.StatusInternalServerError)
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(payload))
+	request.ContentLength = -1
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+	entries, errReadDir := os.ReadDir(logsDir)
+	if errReadDir != nil {
+		t.Fatalf("read logs dir: %v", errReadDir)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("successful metadata request created files: %v", entries)
+	}
+}
+
+func TestRequestLoggingMiddlewareMetadataCountsPartialBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logsDir := t.TempDir()
+	logger := logging.NewFileRequestLogger(false, logsDir, "", 10)
+	payload := []byte("secret-request-body")
+
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(logger))
+	router.POST("/v1/responses", func(c *gin.Context) {
+		consumed := make([]byte, 3)
+		if _, errRead := io.ReadFull(c.Request.Body, consumed); errRead != nil {
+			c.Status(http.StatusInternalServerError)
+			return
+		}
+		c.Status(http.StatusBadRequest)
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(payload))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	entries, errReadDir := os.ReadDir(logsDir)
+	if errReadDir != nil || len(entries) != 1 {
+		t.Fatalf("error log entries = %v, err=%v", entries, errReadDir)
+	}
+	content, errReadLog := os.ReadFile(filepath.Join(logsDir, entries[0].Name()))
+	if errReadLog != nil {
+		t.Fatalf("read error log: %v", errReadLog)
+	}
+	if bytes.Contains(content, payload) {
+		t.Fatal("error log retained a partially consumed request body")
+	}
+	for _, want := range []string{`"declared_bytes":19`, `"consumed_bytes":3`, `"complete":false`} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("error log missing %q: %s", want, content)
+		}
+	}
+}
+
+func TestRequestLoggingMiddlewareOffCreatesNoErrorFile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logsDir := t.TempDir()
+	logger := logging.NewFileRequestLogger(false, logsDir, "", 10)
+	logger.SetErrorLogCaptureMode(config.ErrorLogCaptureModeOff)
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(logger))
+	router.POST("/v1/responses", func(c *gin.Context) { c.Status(http.StatusBadRequest) })
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("secret")))
+	entries, errReadDir := os.ReadDir(logsDir)
+	if errReadDir != nil {
+		t.Fatalf("read logs dir: %v", errReadDir)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("off mode created files: %v", entries)
+	}
+}
+
+func TestRequestLoggingMiddlewareCustomLoggerFailsClosedForMetadataCapture(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logger := &testRequestLogger{enabled: false}
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(logger))
+	router.POST("/v1/responses", func(c *gin.Context) { c.Status(http.StatusBadRequest) })
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("secret")))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+	if logger.requests != 0 {
+		t.Fatalf("legacy custom logger received %d forced metadata logs, want 0", logger.requests)
+	}
+}
+
+func TestRequestLoggingMiddlewareSnapshotsMetadataPolicyPerRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logsDir := t.TempDir()
+	logger := logging.NewFileRequestLogger(false, logsDir, "", 10)
+	payload := []byte("request-secret")
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(logger))
+	router.POST("/v1/responses", func(c *gin.Context) {
+		if _, errRead := io.ReadAll(c.Request.Body); errRead != nil {
+			c.Status(http.StatusInternalServerError)
+			return
+		}
+		// Simulate a hot reload while this request is in flight. The request
+		// must finish under its original metadata policy.
+		logger.SetErrorLogCaptureMode(config.ErrorLogCaptureModeOff)
+		logger.SetEnabled(true)
+		c.Status(http.StatusBadRequest)
+	})
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(payload)))
+	entries, errReadDir := os.ReadDir(logsDir)
+	if errReadDir != nil || len(entries) != 1 {
+		t.Fatalf("error log entries = %v, err=%v", entries, errReadDir)
+	}
+	if !strings.HasPrefix(entries[0].Name(), "error-") {
+		t.Fatalf("hot reload changed forced log filename: %s", entries[0].Name())
+	}
+	content, errReadLog := os.ReadFile(filepath.Join(logsDir, entries[0].Name()))
+	if errReadLog != nil {
+		t.Fatalf("read error log: %v", errReadLog)
+	}
+	if bytes.Contains(content, payload) || !bytes.Contains(content, []byte(`"consumed_bytes":14`)) {
+		t.Fatalf("hot reload changed metadata policy: %s", content)
+	}
+}
+
+func TestRequestLoggingMiddlewareMetadataHotReloadDoesNotStartStreamingLog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logsDir := t.TempDir()
+	logger := logging.NewFileRequestLogger(false, logsDir, "", 10)
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(logger))
+	router.POST("/v1/responses", func(c *gin.Context) {
+		// Simulate request-log being enabled after this request already entered
+		// metadata mode but before the first streaming response header.
+		logger.SetEnabled(true)
+		c.Header("Content-Type", "text/event-stream")
+		c.Status(http.StatusOK)
+		_, _ = c.Writer.Write([]byte("data: safe\n\n"))
+	})
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("secret")))
+	if response.Code != http.StatusOK || response.Body.String() != "data: safe\n\n" {
+		t.Fatalf("stream response = %d %q", response.Code, response.Body.String())
+	}
+	entries, errReadDir := os.ReadDir(logsDir)
+	if errReadDir != nil {
+		t.Fatalf("read logs dir: %v", errReadDir)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("metadata request started a streaming logger after hot reload: %v", entries)
 	}
 }
 

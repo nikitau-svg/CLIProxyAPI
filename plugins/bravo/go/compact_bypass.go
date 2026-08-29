@@ -169,11 +169,45 @@ func compactBypassQuotaEligible(
 
 func acquireExecutionAttemptLease(attempt executionAttempt) (func(bool), bool, *executionFailure) {
 	if !attempt.CompactBypass {
-		release, acquired := acquireAttemptLease(attempt)
-		if acquired {
-			release = wrapAdaptiveShadowLease(attempt, release)
+		var release func(bool)
+		if attempt.AdaptiveShadow && loadedConfig().AdaptiveAllocatorMode == "enforce" {
+			adaptiveRelease, adaptiveAcquired, adaptiveFailure := acquireAdaptiveEnforcementLease(attempt, adaptiveShadowNow())
+			if adaptiveFailure != nil || !adaptiveAcquired {
+				return func(bool) {}, false, adaptiveFailure
+			}
+			baseRelease, acquired := acquireAttemptLease(attempt)
+			if !acquired {
+				adaptiveRelease(false)
+				cancelAdaptiveEdgeGateAttempt(attempt)
+				return func(bool) {}, false, nil
+			}
+			var once sync.Once
+			release = func(commit bool) {
+				once.Do(func() {
+					adaptiveRelease(commit)
+					baseRelease(commit)
+				})
+			}
+		} else {
+			baseRelease, acquired := acquireAttemptLease(attempt)
+			if !acquired {
+				return func(bool) {}, false, nil
+			}
+			release = wrapAdaptiveShadowLease(attempt, baseRelease)
 		}
-		return release, acquired, nil
+		probeRelease, probeAcquired := acquireAllocatorBypassProbeLease(attempt, time.Now())
+		if !probeAcquired {
+			release(false)
+			cancelAdaptiveEdgeGateAttempt(attempt)
+			return func(bool) {}, false, nil
+		}
+		var once sync.Once
+		return func(commit bool) {
+			once.Do(func() {
+				probeRelease(commit)
+				release(commit)
+			})
+		}, true, nil
 	}
 	cooldown := time.Duration(attempt.CompactBypassCooldownSeconds) * time.Second
 	release, wait, acquired := reserveCompactBypass(attempt.CompactBypassKey, cooldown, time.Now())

@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -156,19 +158,42 @@ type httpConnectDialer struct {
 }
 
 func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
-	proxyConn, errDial := d.dialer.Dial(network, proxyDialAddr(d.proxyURL))
+	return d.DialContext(context.Background(), network, addr)
+}
+
+func (d *httpConnectDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	proxyConn, errDial := dialProxyContext(ctx, d.dialer, network, proxyDialAddr(d.proxyURL))
 	if errDial != nil {
 		return nil, fmt.Errorf("dial HTTP proxy failed: %w", errDial)
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = proxyConn.Close()
+	})
+	fail := func(stage string, cause error) (net.Conn, error) {
+		stopCancel()
+		errClose := proxyConn.Close()
+		if errContext := ctx.Err(); errContext != nil {
+			cause = errContext
+		}
+		if errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			return nil, fmt.Errorf("%s: %w; close failed: %v", stage, cause, errClose)
+		}
+		return nil, fmt.Errorf("%s: %w", stage, cause)
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if errDeadline := proxyConn.SetDeadline(deadline); errDeadline != nil {
+			return fail("set HTTP proxy deadline failed", errDeadline)
+		}
 	}
 
 	conn := proxyConn
 	if d.proxyURL.Scheme == "https" {
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: d.proxyURL.Hostname()})
-		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
-			if errClose := conn.Close(); errClose != nil {
-				return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w; close failed: %v", errHandshake, errClose)
-			}
-			return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w", errHandshake)
+		if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
+			return fail("HTTPS proxy TLS handshake failed", errHandshake)
 		}
 		conn = tlsConn
 	}
@@ -183,34 +208,70 @@ func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
 		req.Header.Set("Proxy-Authorization", proxyAuthorization(d.proxyURL.User))
 	}
 	if errWrite := req.Write(conn); errWrite != nil {
-		if errClose := conn.Close(); errClose != nil {
-			return nil, fmt.Errorf("write CONNECT request failed: %w; close failed: %v", errWrite, errClose)
-		}
-		return nil, fmt.Errorf("write CONNECT request failed: %w", errWrite)
+		return fail("write CONNECT request failed", errWrite)
 	}
 
 	reader := bufio.NewReader(conn)
 	resp, errRead := http.ReadResponse(reader, req)
 	if errRead != nil {
-		if errClose := conn.Close(); errClose != nil {
-			return nil, fmt.Errorf("read CONNECT response failed: %w; close failed: %v", errRead, errClose)
-		}
-		return nil, fmt.Errorf("read CONNECT response failed: %w", errRead)
+		return fail("read CONNECT response failed", errRead)
 	}
 	if resp.StatusCode != http.StatusOK {
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		if errClose := conn.Close(); errClose != nil {
-			return nil, fmt.Errorf("proxy CONNECT returned status %s; close failed: %v", resp.Status, errClose)
-		}
-		return nil, fmt.Errorf("proxy CONNECT returned status %s", resp.Status)
+		return fail("proxy CONNECT returned status "+resp.Status, errors.New("CONNECT rejected"))
+	}
+	if !stopCancel() {
+		return fail("HTTP proxy CONNECT canceled", context.Canceled)
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		return fail("HTTP proxy CONNECT canceled", errContext)
+	}
+	if errDeadline := proxyConn.SetDeadline(time.Time{}); errDeadline != nil {
+		return fail("clear HTTP proxy deadline failed", errDeadline)
 	}
 
 	if reader.Buffered() > 0 {
 		return &bufferedConn{Conn: conn, reader: reader}, nil
 	}
 	return conn, nil
+}
+
+func dialProxyContext(ctx context.Context, dialer proxy.Dialer, network, addr string) (net.Conn, error) {
+	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+		return contextDialer.DialContext(ctx, network, addr)
+	}
+	if ctx.Done() == nil {
+		return dialer.Dial(network, addr)
+	}
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	result := make(chan dialResult)
+	go func() {
+		conn, errDial := dialer.Dial(network, addr)
+		select {
+		case result <- dialResult{conn: conn, err: errDial}:
+		case <-ctx.Done():
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
+	}()
+	select {
+	case dialed := <-result:
+		if errContext := ctx.Err(); errContext != nil {
+			if dialed.conn != nil {
+				_ = dialed.conn.Close()
+			}
+			return nil, errContext
+		}
+		return dialed.conn, dialed.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func proxyDialAddr(proxyURL *url.URL) string {

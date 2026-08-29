@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"math"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,8 @@ const (
 	adaptiveShadowMaximumAccounts           = 4096
 	adaptiveShadowMaximumCommitsPerAccount  = 256
 	adaptiveShadowMaximumOverflowModels     = 64
+	adaptiveEnforcementMaximumInFlight      = 512
+	adaptiveEnforcementMaximumLeaseAge      = 2 * time.Hour
 	adaptiveShadowDecisionAdmit             = "would_admit"
 	adaptiveShadowDecisionWithhold          = "would_withhold"
 	adaptiveShadowDecisionUnknown           = "unknown"
@@ -71,6 +74,7 @@ type adaptiveShadowCommit struct {
 
 type adaptiveShadowAccount struct {
 	Commits                           []adaptiveShadowCommit
+	InFlight                          map[uint64]adaptiveShadowCommit
 	OverflowAt                        time.Time
 	OverflowPercent                   float64
 	OverflowSessionPercent            float64
@@ -84,9 +88,11 @@ type adaptiveShadowAccount struct {
 
 var adaptiveShadowRuntime = struct {
 	sync.Mutex
-	Accounts        map[string]*adaptiveShadowAccount
-	Saturated       bool
-	DroppedAccounts uint64
+	Accounts            map[string]*adaptiveShadowAccount
+	NextLeaseID         uint64
+	Saturated           bool
+	DroppedAccounts     uint64
+	DroppedReservations uint64
 }{Accounts: make(map[string]*adaptiveShadowAccount)}
 
 // adaptiveShadowPublicView deliberately contains no credential or project
@@ -102,11 +108,13 @@ type adaptiveShadowPublicView struct {
 	CoolingMaxAgeSeconds       int                                `json:"cooling_max_age_seconds"`
 	TrackedAccounts            int                                `json:"tracked_accounts"`
 	TrackedCommitments         int                                `json:"tracked_commitments"`
+	InFlightReservations       int                                `json:"in_flight_reservations"`
 	RawPendingPercent          float64                            `json:"raw_pending_percent"`
 	EffectivePendingPercent    float64                            `json:"effective_pending_percent"`
 	MaximumLearnedScale        float64                            `json:"maximum_learned_scale"`
 	Saturated                  bool                               `json:"saturated"`
 	DroppedAccounts            uint64                             `json:"dropped_accounts"`
+	DroppedReservations        uint64                             `json:"dropped_reservations"`
 	TokenCalibration           adaptiveTokenCalibrationPublicView `json:"token_calibration"`
 	ForecastBacktest           adaptiveForecastBacktestPublicView `json:"forecast_backtest"`
 	EdgeGate                   adaptiveEdgeGatePublicView         `json:"edge_gate"`
@@ -114,10 +122,14 @@ type adaptiveShadowPublicView struct {
 }
 
 func adaptiveShadowEffect(cfg pluginConfig) string {
-	if cfg.AdaptiveAllocatorMode == "off" {
+	switch cfg.AdaptiveAllocatorMode {
+	case "off":
 		return "disabled"
+	case "enforce":
+		return "routing_enforced"
+	default:
+		return "shadow_only"
 	}
-	return "shadow_only"
 }
 
 func buildAdaptiveShadowRequestFeatures(body []byte) adaptiveShadowRequestFeatures {
@@ -219,7 +231,7 @@ func annotateAdaptiveShadowPlan(
 	features adaptiveShadowRequestFeatures,
 	now time.Time,
 ) []executionAttempt {
-	if cfg.AdaptiveAllocatorMode != "observe" || strings.TrimSpace(project.ID) == "" {
+	if cfg.AdaptiveAllocatorMode == "off" || strings.TrimSpace(project.ID) == "" {
 		return attempts
 	}
 	primary := resolvedPrimaryAuthIndexes(project.PrimaryAuthIDs, auths)
@@ -290,7 +302,8 @@ func adaptiveShadowDecisionFor(
 	sessionPending := adaptiveShadowEffectivePendingForWindow(authIndex, pluginapi.HostAuthQuotaWindowKindSession, "", cfg, now)
 	weeklyKind, quotaModel := adaptiveShadowWeeklyWindow(quota, attempt.Candidate.Model)
 	weeklyPending := adaptiveShadowEffectivePendingForWindow(authIndex, weeklyKind, quotaModel, cfg, now)
-	if quotaRoutingConfidenceAt(quota, attempt.Candidate.Model, cfg, now) != "confirmed" {
+	if quotaRoutingConfidenceAt(quota, attempt.Candidate.Model, cfg, now) != "confirmed" ||
+		(cfg.AdaptiveAllocatorMode == "enforce" && quotaFreshnessAt(quota, attempt.Candidate.Model, cfg, now) != quotaFreshnessFresh) {
 		return adaptiveShadowDecisionUnknown, adaptiveShadowRound(math.Max(sessionPending, weeklyPending)), 0, 0
 	}
 	session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
@@ -352,6 +365,23 @@ func adaptiveShadowEffectivePendingForWindow(authIndex, kind, quotaModel string,
 		return 0
 	}
 	pruneAdaptiveShadowAccount(account, cfg, now)
+	pruneAdaptiveEnforcementLeasesLocked(account, now)
+	return adaptiveShadowEffectivePendingForWindowLocked(account, kind, quotaModel, cfg, now)
+}
+
+// adaptiveShadowEffectivePendingForWindowLocked includes both accepted,
+// cooling commitments and live reservations. Callers that decide and reserve
+// under adaptiveShadowRuntime's lock use this helper so concurrent requests
+// cannot all observe the same headroom before any of them commits.
+func adaptiveShadowEffectivePendingForWindowLocked(
+	account *adaptiveShadowAccount,
+	kind, quotaModel string,
+	cfg pluginConfig,
+	now time.Time,
+) float64 {
+	if account == nil {
+		return 0
+	}
 	overflow := account.OverflowPercent
 	switch kind {
 	case pluginapi.HostAuthQuotaWindowKindSession:
@@ -368,28 +398,233 @@ func adaptiveShadowEffectivePendingForWindow(authIndex, kind, quotaModel string,
 	}
 	effective := adaptiveShadowCommitWeight(overflow, account.OverflowAt, cfg, now)
 	for _, item := range account.Commits {
-		percent := item.Percent
-		switch kind {
-		case pluginapi.HostAuthQuotaWindowKindSession:
-			if item.SessionPercent > 0 {
-				percent = item.SessionPercent
-			}
-		case pluginapi.HostAuthQuotaWindowKindWeekly:
-			if item.WeeklyPercent > 0 {
-				percent = item.WeeklyPercent
-			}
-		case pluginapi.HostAuthQuotaWindowKindModelWeekly:
-			if item.ModelWeeklyPercent > 0 &&
-				(strings.EqualFold(strings.TrimSpace(item.ModelWeeklyName), strings.TrimSpace(quotaModel)) ||
-					(item.ModelWeeklyName == "" && quotaModelMatches(item.Model, quotaModel))) {
-				percent = item.ModelWeeklyPercent
-			} else {
-				continue
-			}
+		percent, applies := adaptiveShadowCommitWindowPercent(item, kind, quotaModel)
+		if !applies {
+			continue
 		}
 		effective += adaptiveShadowCommitWeight(percent, item.At, cfg, now)
 	}
+	for _, item := range account.InFlight {
+		percent, applies := adaptiveShadowCommitWindowPercent(item, kind, quotaModel)
+		if applies {
+			// Live provider work has not cooled. Its full reservation remains in
+			// headroom until the attempt is accepted or released.
+			effective += percent
+		}
+	}
 	return effective
+}
+
+func adaptiveShadowCommitWindowPercent(item adaptiveShadowCommit, kind, quotaModel string) (float64, bool) {
+	percent := item.Percent
+	switch kind {
+	case pluginapi.HostAuthQuotaWindowKindSession:
+		if item.SessionPercent > 0 {
+			percent = item.SessionPercent
+		}
+	case pluginapi.HostAuthQuotaWindowKindWeekly:
+		if item.WeeklyPercent > 0 {
+			percent = item.WeeklyPercent
+		}
+	case pluginapi.HostAuthQuotaWindowKindModelWeekly:
+		if item.ModelWeeklyPercent > 0 &&
+			(strings.EqualFold(strings.TrimSpace(item.ModelWeeklyName), strings.TrimSpace(quotaModel)) ||
+				(item.ModelWeeklyName == "" && quotaModelMatches(item.Model, quotaModel))) {
+			percent = item.ModelWeeklyPercent
+		} else {
+			return 0, false
+		}
+	}
+	return percent, percent > 0 && !math.IsNaN(percent) && !math.IsInf(percent, 0)
+}
+
+// acquireAdaptiveEnforcementLease is the only adaptive routing gate. It never
+// waits: a denied attempt returns immediately so the executor can continue the
+// already-authorized neighboring account/model route. Unknown or stale quota,
+// an unavailable estimate, and bounded-runtime saturation all fail open.
+func acquireAdaptiveEnforcementLease(
+	attempt executionAttempt,
+	now time.Time,
+) (func(bool), bool, *executionFailure) {
+	cfg := loadedConfig()
+	if cfg.AdaptiveAllocatorMode != "enforce" || !attempt.AdaptiveShadow || attempt.CompactBypass {
+		return wrapAdaptiveShadowLease(attempt, func(bool) {}), true, nil
+	}
+	now = now.UTC()
+	authIndex := strings.TrimSpace(attempt.Auth.AuthIndex)
+	quota := normalizedQuotaState(quotaSnapshot(authIndex))
+	subscription := subscriptionPolicy(cfg, authIndex)
+	tariff := effectiveTariff(cfg, subscription, firstNonEmpty(attempt.Auth.Provider, attempt.Auth.Type), quota)
+	refreshAdaptiveEdgeGateAttemptState(attempt, cfg, quota, tariff, now)
+	beginAdaptiveEdgeGateShadow(attempt, now)
+	switch attempt.AdaptiveEdgeGate.snapshot().Decision {
+	case adaptiveEdgeGateDecisionSkipBusy:
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_busy",
+			"Адаптивный турникет уже проверяет эту подписку у границы лимита; Bravo сразу продолжил соседний маршрут.",
+		)
+	case adaptiveEdgeGateDecisionSkipTripped:
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_tripped",
+			"Подтверждённая ошибка квоты временно закрыла этот маршрут; Bravo сразу продолжил соседний маршрут.",
+		)
+	}
+
+	if authIndex == "" ||
+		quotaRoutingConfidenceAt(quota, attempt.Candidate.Model, cfg, now) != "confirmed" ||
+		quotaFreshnessAt(quota, attempt.Candidate.Model, cfg, now) != quotaFreshnessFresh ||
+		attempt.AdaptiveReservationPercent <= 0 ||
+		math.IsNaN(attempt.AdaptiveReservationPercent) || math.IsInf(attempt.AdaptiveReservationPercent, 0) {
+		failOpenAdaptiveForecastGate(attempt, "quota_or_forecast_unconfirmed_fail_open")
+		return adaptiveEnforcementFailOpenLease(attempt), true, nil
+	}
+
+	_, pendingCommit, validCommit := adaptiveShadowCommitForAttempt(attempt, now)
+	if !validCommit {
+		failOpenAdaptiveForecastGate(attempt, "forecast_unavailable_fail_open")
+		return adaptiveEnforcementFailOpenLease(attempt), true, nil
+	}
+
+	adaptiveShadowRuntime.Lock()
+	account := adaptiveShadowRuntime.Accounts[authIndex]
+	if account == nil {
+		if len(adaptiveShadowRuntime.Accounts) >= adaptiveShadowMaximumAccounts {
+			adaptiveShadowRuntime.Saturated = true
+			adaptiveShadowRuntime.DroppedReservations++
+			adaptiveShadowRuntime.Unlock()
+			failOpenAdaptiveForecastGate(attempt, "runtime_saturated_fail_open")
+			return adaptiveEnforcementFailOpenLease(attempt), true, nil
+		}
+		account = &adaptiveShadowAccount{LearnedScale: 1}
+		adaptiveShadowRuntime.Accounts[authIndex] = account
+	}
+	pruneAdaptiveShadowAccount(account, cfg, now)
+	pruneAdaptiveEnforcementLeasesLocked(account, now)
+	if len(account.InFlight) >= adaptiveEnforcementMaximumInFlight {
+		adaptiveShadowRuntime.Saturated = true
+		adaptiveShadowRuntime.DroppedReservations++
+		adaptiveShadowRuntime.Unlock()
+		failOpenAdaptiveForecastGate(attempt, "runtime_saturated_fail_open")
+		return adaptiveEnforcementFailOpenLease(attempt), true, nil
+	}
+
+	weeklyKind, quotaModel := adaptiveShadowWeeklyWindow(quota, attempt.Candidate.Model)
+	sessionPending := adaptiveShadowEffectivePendingForWindowLocked(
+		account, pluginapi.HostAuthQuotaWindowKindSession, "", cfg, now,
+	)
+	weeklyPending := adaptiveShadowEffectivePendingForWindowLocked(account, weeklyKind, quotaModel, cfg, now)
+	session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
+	sessionFloor, weeklyFloor := tariff.SessionFloorPercent, tariff.WeeklyFloorPercent
+	if attempt.Primary {
+		sessionFloor, weeklyFloor = 0, 0
+	}
+	sessionReservation := attempt.AdaptiveSessionReservationPercent
+	if sessionReservation <= 0 {
+		sessionReservation = attempt.AdaptiveReservationPercent
+	}
+	weeklyReservation := attempt.AdaptiveWeeklyReservationPercent
+	if weeklyKind == pluginapi.HostAuthQuotaWindowKindModelWeekly && attempt.AdaptiveModelWeeklyReservationPercent > 0 {
+		weeklyReservation = attempt.AdaptiveModelWeeklyReservationPercent
+	}
+	if weeklyReservation <= 0 {
+		weeklyReservation = attempt.AdaptiveReservationPercent
+	}
+	after := math.Min(
+		session.RemainingPercent-sessionFloor-sessionPending-sessionReservation,
+		weekly.RemainingPercent-weeklyFloor-weeklyPending-weeklyReservation,
+	)
+	if after <= 0 {
+		adaptiveShadowRuntime.Unlock()
+		cancelAdaptiveEdgeGateAttempt(attempt)
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_quota_withheld",
+			"Подтверждённого остатка этой подписки недостаточно для прогноза запроса; Bravo сразу продолжил соседний маршрут.",
+		)
+	}
+
+	adaptiveShadowRuntime.NextLeaseID++
+	leaseID := adaptiveShadowRuntime.NextLeaseID
+	if leaseID == 0 {
+		adaptiveShadowRuntime.NextLeaseID++
+		leaseID = adaptiveShadowRuntime.NextLeaseID
+	}
+	if account.InFlight == nil {
+		account.InFlight = make(map[uint64]adaptiveShadowCommit)
+	}
+	pendingCommit.At = now
+	account.InFlight[leaseID] = pendingCommit
+	account.UpdatedAt = now
+	adaptiveShadowRuntime.Unlock()
+
+	var once sync.Once
+	return func(commit bool) {
+		once.Do(func() {
+			completedAt := adaptiveShadowNow().UTC()
+			adaptiveShadowRuntime.Lock()
+			account := adaptiveShadowRuntime.Accounts[authIndex]
+			if account != nil {
+				delete(account.InFlight, leaseID)
+				if len(account.InFlight) == 0 {
+					account.InFlight = nil
+				}
+				if commit {
+					pendingCommit.At = completedAt
+					account.Commits = append(account.Commits, pendingCommit)
+					boundAdaptiveShadowCommits(account)
+				}
+				account.UpdatedAt = completedAt
+			}
+			adaptiveShadowRuntime.Unlock()
+		})
+	}, true, nil
+}
+
+func failOpenAdaptiveForecastGate(attempt executionAttempt, reason string) {
+	// A half-open probe exists because a real provider quota failure tripped the
+	// breaker. Forecast uncertainty must not cancel that evidence-backed
+	// single-flight; the selected probe still dispatches while competitors skip.
+	if attempt.AdaptiveEdgeGate.snapshot().Decision == adaptiveEdgeGateDecisionProbe {
+		return
+	}
+	failOpenAdaptiveEdgeGateAttempt(attempt, reason)
+}
+
+func adaptiveEnforcementFailOpenLease(attempt executionAttempt) func(bool) {
+	var once sync.Once
+	return func(commit bool) {
+		once.Do(func() {
+			if commit {
+				recordAdaptiveShadowAttemptCommit(attempt, adaptiveShadowNow())
+			}
+		})
+	}
+}
+
+func adaptiveEnforcementFailure(code, message string) *executionFailure {
+	return &executionFailure{
+		Code:          code,
+		Message:       message,
+		Status:        http.StatusServiceUnavailable,
+		Retryable:     true,
+		RouteFallback: true,
+	}
+}
+
+func pruneAdaptiveEnforcementLeasesLocked(account *adaptiveShadowAccount, now time.Time) {
+	if account == nil || len(account.InFlight) == 0 {
+		return
+	}
+	cutoff := now.UTC().Add(-adaptiveEnforcementMaximumLeaseAge)
+	for id, item := range account.InFlight {
+		if !item.At.After(cutoff) {
+			delete(account.InFlight, id)
+			adaptiveShadowRuntime.Saturated = true
+			adaptiveShadowRuntime.DroppedReservations++
+		}
+	}
+	if len(account.InFlight) == 0 {
+		account.InFlight = nil
+	}
 }
 
 func wrapAdaptiveShadowLease(attempt executionAttempt, release func(bool)) func(bool) {
@@ -409,10 +644,18 @@ func wrapAdaptiveShadowLease(attempt executionAttempt, release func(bool)) func(
 }
 
 func recordAdaptiveShadowAttemptCommit(attempt executionAttempt, at time.Time) {
+	authIndex, item, ok := adaptiveShadowCommitForAttempt(attempt, at)
+	if !ok {
+		return
+	}
+	recordAdaptiveShadowCommitValue(authIndex, item)
+}
+
+func adaptiveShadowCommitForAttempt(attempt executionAttempt, at time.Time) (string, adaptiveShadowCommit, bool) {
 	authIndex := strings.TrimSpace(attempt.Auth.AuthIndex)
 	percent := attempt.AdaptiveReservationPercent
 	if authIndex == "" || percent <= 0 || math.IsNaN(percent) || math.IsInf(percent, 0) {
-		return
+		return "", adaptiveShadowCommit{}, false
 	}
 	cfg := loadedConfig()
 	quota := normalizedQuotaState(quotaSnapshot(authIndex))
@@ -438,7 +681,7 @@ func recordAdaptiveShadowAttemptCommit(attempt executionAttempt, at time.Time) {
 		ModelCalibrated:    attempt.AdaptiveModelWeeklyTokenCalibrated,
 		EstimateConfidence: attempt.AdaptiveEstimateConfidence,
 	}
-	recordAdaptiveShadowCommitValue(authIndex, item)
+	return authIndex, item, true
 }
 
 func recordAdaptiveShadowCommit(authIndex string, percent float64, at time.Time) {
@@ -526,7 +769,7 @@ func reconcileAdaptiveShadow(
 ) {
 	authIndex = strings.TrimSpace(authIndex)
 	previousAt := quotaConfirmedAt(previous)
-	if cfg.AdaptiveAllocatorMode != "observe" || authIndex == "" || observedAt.IsZero() ||
+	if cfg.AdaptiveAllocatorMode == "off" || authIndex == "" || observedAt.IsZero() ||
 		quotaConfidence(previous) != "confirmed" || quotaConfidence(refreshed) != "confirmed" ||
 		previousAt.IsZero() || !observedAt.After(previousAt) {
 		return
@@ -698,7 +941,7 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 	view := adaptiveShadowPublicView{
 		Mode:                       cfg.AdaptiveAllocatorMode,
 		Effect:                     adaptiveShadowEffect(cfg),
-		RoutingEnforced:            false,
+		RoutingEnforced:            cfg.AdaptiveAllocatorMode == "enforce",
 		AdditionalProviderRequests: false,
 		QuotaSnapshotSource:        "existing_background_cache",
 		CoolingHalfLifeSeconds:     cfg.AdaptiveCoolingHalfLifeSeconds,
@@ -709,8 +952,14 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 		EdgeGate:                   adaptiveEdgeGateSummary(cfg, authIndexes, now),
 		Note:                       "Теневой расчёт не блокирует запросы и не меняет маршруты; он не выполняет дополнительных обращений к подпискам.",
 	}
+	if cfg.AdaptiveAllocatorMode == "enforce" {
+		view.Note = "Адаптивный расчёт атомарно резервирует подтверждённый прогноз и пропускает только текущую опасную попытку; неизвестные или устаревшие квоты fail-open, очередей и дополнительных обращений нет."
+	} else if cfg.AdaptiveAllocatorMode == "off" {
+		view.Note = "Адаптивный расчёт отключён."
+	}
 	adaptiveShadowRuntime.Lock()
 	defer adaptiveShadowRuntime.Unlock()
+	runtimeHasCapacity := len(adaptiveShadowRuntime.Accounts) < adaptiveShadowMaximumAccounts
 	for authIndex, account := range adaptiveShadowRuntime.Accounts {
 		if filter {
 			if _, ok := allowed[authIndex]; !ok {
@@ -718,13 +967,19 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 			}
 		}
 		pruneAdaptiveShadowAccount(account, cfg, now)
+		pruneAdaptiveEnforcementLeasesLocked(account, now)
 		raw, effective := account.OverflowPercent, adaptiveShadowCommitWeight(account.OverflowPercent, account.OverflowAt, cfg, now)
 		for _, item := range account.Commits {
 			raw += item.Percent
 			effective += adaptiveShadowCommitWeight(item.Percent, item.At, cfg, now)
 		}
+		for _, item := range account.InFlight {
+			raw += item.Percent
+			effective += item.Percent
+		}
 		learned := effectiveAdaptiveShadowLearnedScale(account, cfg, now)
-		if raw <= 0 && learned <= 1 && now.UTC().Sub(account.UpdatedAt) >= time.Duration(cfg.AdaptiveCoolingMaxAgeSeconds)*time.Second {
+		if raw <= 0 && learned <= 1 && len(account.InFlight) == 0 &&
+			now.UTC().Sub(account.UpdatedAt) >= time.Duration(cfg.AdaptiveCoolingMaxAgeSeconds)*time.Second {
 			delete(adaptiveShadowRuntime.Accounts, authIndex)
 			continue
 		}
@@ -733,15 +988,20 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 		if account.OverflowPercent > 0 {
 			view.TrackedCommitments++
 		}
+		view.InFlightReservations += len(account.InFlight)
+		if len(account.InFlight) >= adaptiveEnforcementMaximumInFlight {
+			runtimeHasCapacity = false
+		}
 		view.RawPendingPercent += raw
 		view.EffectivePendingPercent += effective
 		view.MaximumLearnedScale = math.Max(view.MaximumLearnedScale, learned)
 	}
-	if len(adaptiveShadowRuntime.Accounts) < adaptiveShadowMaximumAccounts {
+	if runtimeHasCapacity {
 		adaptiveShadowRuntime.Saturated = false
 	}
 	view.Saturated = adaptiveShadowRuntime.Saturated
 	view.DroppedAccounts = adaptiveShadowRuntime.DroppedAccounts
+	view.DroppedReservations = adaptiveShadowRuntime.DroppedReservations
 	view.RawPendingPercent = adaptiveShadowRound(view.RawPendingPercent)
 	view.EffectivePendingPercent = adaptiveShadowRound(view.EffectivePendingPercent)
 	view.MaximumLearnedScale = adaptiveShadowRound(view.MaximumLearnedScale)
@@ -800,8 +1060,10 @@ func adaptiveShadowEffortFactor(effort string) float64 {
 func resetAdaptiveShadowForTest() {
 	adaptiveShadowRuntime.Lock()
 	adaptiveShadowRuntime.Accounts = make(map[string]*adaptiveShadowAccount)
+	adaptiveShadowRuntime.NextLeaseID = 0
 	adaptiveShadowRuntime.Saturated = false
 	adaptiveShadowRuntime.DroppedAccounts = 0
+	adaptiveShadowRuntime.DroppedReservations = 0
 	adaptiveShadowRuntime.Unlock()
 	resetAdaptiveTokenCalibrationForTest()
 	resetAdaptiveEdgeGateForTest()

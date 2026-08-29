@@ -67,6 +67,9 @@ const (
 	// Stream interceptor history is intentionally bounded and not configurable in the first SDK surface.
 	maxStreamInterceptorHistoryChunks = 64
 	maxStreamInterceptorHistoryBytes  = 1 << 20
+	// Error diagnostics live only for the duration of the request. Keep the
+	// collection bounded even if a websocket path encounters repeated errors.
+	maxAPIResponseErrorsForLog = 16
 )
 
 type pinnedAuthContextKey struct{}
@@ -1256,6 +1259,10 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		}, execOptions.SkipInterceptorPluginID)
 		applyStreamHeaders(intercepted.Headers)
 	}
+	// http.Header is a map. Once it is returned to the protocol handler it must
+	// be immutable; per-chunk interceptor work continues asynchronously and may
+	// only affect chunk bodies, not mutate the caller-visible map.
+	streamHeadersCommitted = true
 
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -1327,7 +1334,6 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 					return
 				}
 			}
-			streamHeadersCommitted = true
 			select {
 			case dataChan <- payload:
 				if streamInterceptorsActive {
@@ -1491,6 +1497,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 	}
 	readInitialStreamChunks()
+	// Header-init interception above is the last synchronous opportunity to
+	// shape the caller-visible map. Freeze it before the stream goroutine starts
+	// so a client reading headers cannot race per-chunk interception or a
+	// bootstrap retry.
+	streamHeadersCommitted = true
 
 	go func() {
 		defer close(dataChan)
@@ -1569,9 +1580,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 							if retryErr == nil {
 								rawStreamHeaders = cloneHeader(retryResult.Headers)
 								baseStreamHeaders = cloneHeader(retryResult.Headers)
-								replaceHeader(upstreamHeaders, downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled))
 								streamHeaderInitialized = false
-								streamHeadersCommitted = false
 								pendingChunks = nil
 								streamClosedBeforeRead = false
 								chunks = retryResult.Chunks
@@ -1635,8 +1644,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 					}
 				}
 			}
-			applyStreamHeaderInit()
-			return
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
@@ -2483,6 +2490,8 @@ func WriteBravoTraceHeader(c *gin.Context, msg *interfaces.ErrorMessage) {
 
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
+	h.CaptureAPIResponseError(c, msg)
+
 	status := http.StatusInternalServerError
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
@@ -2537,19 +2546,47 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	_, _ = c.Writer.Write(body)
 }
 
-func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
-	if h.Cfg.RequestLog {
-		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
-			if apiResponseErrors, isExist := ginContext.Get("API_RESPONSE_ERROR"); isExist {
-				if slicesAPIResponseError, isOk := apiResponseErrors.([]*interfaces.ErrorMessage); isOk {
-					slicesAPIResponseError = append(slicesAPIResponseError, err)
-					ginContext.Set("API_RESPONSE_ERROR", slicesAPIResponseError)
-				}
-			} else {
-				// Create new response data entry
-				ginContext.Set("API_RESPONSE_ERROR", []*interfaces.ErrorMessage{err})
-			}
+// CaptureAPIResponseError attaches a bounded, request-scoped error diagnostic
+// for request logging. Metadata mode records the existing error object only
+// until middleware finalization; the logger persists machine fields and never
+// the provider message or request/response bodies.
+func (h *BaseAPIHandler) CaptureAPIResponseError(c *gin.Context, err *interfaces.ErrorMessage) {
+	if h == nil || h.Cfg == nil || c == nil || err == nil {
+		return
+	}
+
+	capture := h.Cfg.RequestLog
+	if !capture {
+		mode := strings.ToLower(strings.TrimSpace(h.Cfg.ErrorLogCapture.Mode))
+		capture = mode == "" || mode == config.ErrorLogCaptureModeMetadata
+	}
+	if !capture {
+		return
+	}
+
+	errorsForLog := make([]*interfaces.ErrorMessage, 0, 1)
+	if existing, ok := c.Get("API_RESPONSE_ERROR"); ok {
+		if typed, typedOK := existing.([]*interfaces.ErrorMessage); typedOK {
+			errorsForLog = typed
 		}
+	}
+	for _, existing := range errorsForLog {
+		if existing == err {
+			return
+		}
+	}
+	if len(errorsForLog) >= maxAPIResponseErrorsForLog {
+		return
+	}
+	c.Set("API_RESPONSE_ERROR", append(errorsForLog, err))
+}
+
+func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
+	if ctx == nil {
+		return
+	}
+	if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+		h.CaptureAPIResponseError(ginContext, err)
 	}
 }
 

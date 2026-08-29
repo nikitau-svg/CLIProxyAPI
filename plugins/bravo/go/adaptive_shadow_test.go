@@ -16,19 +16,22 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-func TestAdaptiveShadowPreviewConfigCannotEnforce(t *testing.T) {
+func TestAdaptiveAllocatorConfigAllowsEnforceAndRejectsAssist(t *testing.T) {
 	cfg := defaultPluginConfig()
 	if cfg.AdaptiveAllocatorMode != "observe" ||
 		cfg.AdaptiveCoolingHalfLifeSeconds != 5*60 ||
 		cfg.AdaptiveCoolingMaxAgeSeconds != 30*60 {
 		t.Fatalf("adaptive defaults = %#v", cfg)
 	}
-	for _, mode := range []string{"assist", "enforce"} {
-		invalid := cfg
-		invalid.AdaptiveAllocatorMode = mode
-		if errNormalize := normalizeConfig(&invalid); errNormalize == nil || !strings.Contains(errNormalize.Error(), "not available") {
-			t.Fatalf("mode %q error = %v, want preview rejection", mode, errNormalize)
-		}
+	enforce := cfg
+	enforce.AdaptiveAllocatorMode = "enforce"
+	if errNormalize := normalizeConfig(&enforce); errNormalize != nil || enforce.AdaptiveAllocatorMode != "enforce" {
+		t.Fatalf("enforce mode rejected: %v (%q)", errNormalize, enforce.AdaptiveAllocatorMode)
+	}
+	invalidMode := cfg
+	invalidMode.AdaptiveAllocatorMode = "assist"
+	if errNormalize := normalizeConfig(&invalidMode); errNormalize == nil || !strings.Contains(errNormalize.Error(), "not supported") {
+		t.Fatalf("assist mode error = %v, want unsupported rejection", errNormalize)
 	}
 	invalid := cfg
 	invalid.AdaptiveCoolingHalfLifeSeconds = 30

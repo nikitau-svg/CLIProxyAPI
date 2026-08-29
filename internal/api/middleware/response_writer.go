@@ -21,30 +21,31 @@ const websocketTimelineOverrideContextKey = "WEBSOCKET_TIMELINE_OVERRIDE"
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
-	URL                 string                      // URL is the request URL.
-	Method              string                      // Method is the HTTP method (e.g., GET or POST).
-	Headers             map[string][]string         // Headers contains the request headers.
-	Body                []byte                      // Body is the raw request body.
-	RequestID           string                      // RequestID is the unique identifier for the request.
-	Timestamp           time.Time                   // Timestamp is when the request was received.
-	deferredBodyCapture *deferredRequestBodyCapture // deferredBodyCapture spools large error-only request bodies.
+	URL          string                      // URL is the request URL.
+	Method       string                      // Method is the HTTP method (e.g., GET or POST).
+	Headers      map[string][]string         // Headers contains the request headers.
+	Body         []byte                      // Body is the raw request body.
+	RequestID    string                      // RequestID is the unique identifier for the request.
+	Timestamp    time.Time                   // Timestamp is when the request was received.
+	bodyMetadata *requestBodyMetadataCapture // bodyMetadata counts bytes without retaining request content.
 }
 
 // ResponseWriterWrapper wraps the standard gin.ResponseWriter to intercept and log response data.
 // It is designed to handle both standard and streaming responses, ensuring that logging operations do not block the client response.
 type ResponseWriterWrapper struct {
 	gin.ResponseWriter
-	body                *bytes.Buffer              // body is a buffer to store the response body for non-streaming responses.
-	isStreaming         bool                       // isStreaming indicates whether the response is a streaming type (e.g., text/event-stream).
-	streamWriter        logging.StreamingLogWriter // streamWriter is a writer for handling streaming log entries.
-	chunkChannel        chan []byte                // chunkChannel is a channel for asynchronously passing response chunks to the logger.
-	streamDone          chan struct{}              // streamDone signals when the streaming goroutine completes.
-	logger              logging.RequestLogger      // logger is the instance of the request logger service.
-	requestInfo         *RequestInfo               // requestInfo holds the details of the original request.
-	statusCode          int                        // statusCode stores the HTTP status code of the response.
-	headers             map[string][]string        // headers stores the response headers.
-	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
-	firstChunkTimestamp time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
+	body                 *bytes.Buffer              // body is a buffer to store the response body for non-streaming responses.
+	isStreaming          bool                       // isStreaming indicates whether the response is a streaming type (e.g., text/event-stream).
+	streamWriter         logging.StreamingLogWriter // streamWriter is a writer for handling streaming log entries.
+	chunkChannel         chan []byte                // chunkChannel is a channel for asynchronously passing response chunks to the logger.
+	streamDone           chan struct{}              // streamDone signals when the streaming goroutine completes.
+	logger               logging.RequestLogger      // logger is the instance of the request logger service.
+	requestInfo          *RequestInfo               // requestInfo holds the details of the original request.
+	statusCode           int                        // statusCode stores the HTTP status code of the response.
+	headers              map[string][]string        // headers stores the response headers.
+	logOnErrorOnly       bool                       // logOnErrorOnly enables logging only when an error response is detected.
+	firstChunkTimestamp  time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
+	responseBytesWritten int64                      // responseBytesWritten counts downstream bytes without retaining content.
 }
 
 // NewResponseWriterWrapper creates and initializes a new ResponseWriterWrapper.
@@ -79,6 +80,7 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.Write(data)
+	w.responseBytesWritten += int64(n)
 
 	// THEN: Handle logging based on response type
 	if w.isStreaming && w.chunkChannel != nil {
@@ -102,21 +104,15 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 }
 
 func (w *ResponseWriterWrapper) shouldBufferResponseBody() bool {
+	// Error-only metadata mode never retains response content. Full request
+	// logging keeps the legacy buffering behavior.
+	if w.logOnErrorOnly {
+		return false
+	}
 	if w.logger != nil && w.logger.IsEnabled() {
 		return true
 	}
-	if !w.logOnErrorOnly {
-		return false
-	}
-	status := w.statusCode
-	if status == 0 {
-		if statusWriter, ok := w.ResponseWriter.(interface{ Status() int }); ok && statusWriter != nil {
-			status = statusWriter.Status()
-		} else {
-			status = http.StatusOK
-		}
-	}
-	return status >= http.StatusBadRequest
+	return false
 }
 
 // WriteString wraps the underlying ResponseWriter's WriteString method to capture response data.
@@ -127,6 +123,7 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.WriteString(data)
+	w.responseBytesWritten += int64(n)
 
 	// THEN: Capture for logging
 	if w.isStreaming && w.chunkChannel != nil {
@@ -161,7 +158,7 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 	w.isStreaming = w.detectStreaming(contentType)
 
 	// If streaming, initialize streaming log writer
-	if w.isStreaming && w.logger.IsEnabled() {
+	if w.isStreaming && !w.logOnErrorOnly && w.logger.IsEnabled() {
 		streamWriter, err := w.logger.LogStreamingRequest(
 			w.requestInfo.URL,
 			w.requestInfo.Method,
@@ -259,9 +256,6 @@ func (w *ResponseWriterWrapper) processStreamingChunks(done chan struct{}) {
 // For non-streaming responses, it logs the complete request and response details,
 // including any API-specific request/response data stored in the Gin context.
 func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
-	if w.requestInfo != nil && w.requestInfo.deferredBodyCapture != nil {
-		defer w.requestInfo.deferredBodyCapture.Cleanup()
-	}
 	if w.logger == nil {
 		return nil
 	}
@@ -284,12 +278,14 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	}
 
 	hasAPIError := len(slicesAPIResponseError) > 0 || finalStatusCode >= http.StatusBadRequest
-	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
+	// logOnErrorOnly is a per-request policy snapshot. A hot reload during the
+	// handler must not turn a metadata-only request into a full-body log.
+	forceLog := w.logOnErrorOnly && hasAPIError
 	websocketTimelineSource := w.extractWebsocketTimelineSource(c)
 	apiRequestSource := w.extractAPIRequestSource(c)
 	apiResponseSource := w.extractAPIResponseSource(c)
 	apiWebsocketTimelineSource := w.extractAPIWebsocketTimelineSource(c)
-	if !w.logger.IsEnabled() && !forceLog {
+	if (w.logOnErrorOnly && !forceLog) || (!w.logOnErrorOnly && !w.logger.IsEnabled()) {
 		cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource, apiWebsocketTimelineSource)
 		return nil
 	}
@@ -476,29 +472,10 @@ func (w *ResponseWriterWrapper) extractRequestBody(c *gin.Context) []byte {
 	if len(w.requestInfo.Body) > 0 {
 		return w.requestInfo.Body
 	}
-	if w.requestInfo.deferredBodyCapture == nil {
+	if w.requestInfo.bodyMetadata == nil {
 		return nil
 	}
-	body, statusMarker, errRead := w.requestInfo.deferredBodyCapture.Bytes()
-	if errRead != nil {
-		log.WithError(errRead).Warn("failed to read deferred request body capture")
-		return nil
-	}
-	encoding := ""
-	for key, values := range w.requestInfo.Headers {
-		if strings.EqualFold(key, "Content-Encoding") && len(values) > 0 {
-			encoding = values[0]
-			break
-		}
-	}
-	body = decodeCapturedRequestBodyForLogWithLimit(body, encoding, maxDeferredErrorRequestBodyBytes)
-	if statusMarker == "" {
-		return body
-	}
-	if len(body) > 0 && !bytes.HasSuffix(body, []byte("\n")) {
-		body = append(body, '\n')
-	}
-	return append(body, statusMarker...)
+	return logging.FormatErrorRequestBodyMetadata(w.requestInfo.bodyMetadata.snapshot())
 }
 
 func (w *ResponseWriterWrapper) extractResponseBody(c *gin.Context) []byte {
@@ -506,6 +483,11 @@ func (w *ResponseWriterWrapper) extractResponseBody(c *gin.Context) []byte {
 		return body
 	}
 	if w.body == nil || w.body.Len() == 0 {
+		if w.logOnErrorOnly {
+			return logging.FormatErrorResponseBodyMetadata(logging.ErrorResponseBodyMetadata{
+				WrittenBytes: w.responseBytesWritten,
+			})
+		}
 		return nil
 	}
 	return bytes.Clone(w.body.Bytes())
@@ -703,7 +685,7 @@ func mergeFileBodySource(payload []byte, source *logging.FileBodySource) ([]byte
 		}
 		buf.WriteByte('\n')
 	}
-	if errWrite := source.WriteTo(&buf); errWrite != nil {
+	if errWrite := source.WriteAllTo(&buf); errWrite != nil {
 		return nil, errWrite
 	}
 	return buf.Bytes(), nil

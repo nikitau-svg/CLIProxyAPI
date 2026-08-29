@@ -58,9 +58,9 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		// ordering, and every off/observe/enforce allocator branch.
 		authResp.Files = filterProjectAllowedAuths(project, authResp.Files)
 	}
-	shadowEnabled := authenticatedProject && cfg.AdaptiveAllocatorMode == "observe"
+	adaptiveEnabled := authenticatedProject && cfg.AdaptiveAllocatorMode != "off"
 	var shadowFeatures adaptiveShadowRequestFeatures
-	if shadowEnabled {
+	if adaptiveEnabled {
 		// This is local, read-only request inspection. It neither waits for nor
 		// schedules quota/provider I/O.
 		shadowFeatures = buildAdaptiveShadowRequestFeatures(executionBodyView(req))
@@ -144,14 +144,14 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 		// Degrade to the authorized, healthy pool instead of answering 503.
 		if fallback := allocatorBypassPlan(logicalName, model, contract, authResp.Files, rejections, sticky, now); len(fallback) > 0 {
 			logAllocatorBypass(logicalName, rejections)
-			if shadowEnabled {
+			if adaptiveEnabled {
 				fallback = annotateAdaptiveShadowPlan(cfg, project, authResp.Files, fallback, shadowFeatures, now)
 			}
 			return fallback, nil
 		}
 		return nil, noEligibleCandidateError(logicalName, contract, rejections)
 	}
-	if shadowEnabled {
+	if adaptiveEnabled {
 		plan = annotateAdaptiveShadowPlan(cfg, project, authResp.Files, plan, shadowFeatures, now)
 	}
 	if len(rejections) > 0 {
@@ -227,9 +227,14 @@ func allocatorBypassPlan(
 	sticky string,
 	now time.Time,
 ) []executionAttempt {
+	cfg := loadedConfig()
 	withheld := make(map[string]struct{}, len(rejections))
 	for _, rejection := range rejections {
-		if rejection.Stage == "allocator" {
+		// A reserve floor protects capacity for the subscription owner. It is
+		// intentionally stronger than the generic availability bypass below;
+		// otherwise a shared consumer can spend the very reserve the allocator
+		// just withheld on the owner's behalf.
+		if rejection.Stage == "allocator" && rejection.Code != "bravo_allocator_reserve_floor" {
 			withheld[normalizeProvider(rejection.Provider)+"\x00"+rejection.Model] = struct{}{}
 		}
 	}
@@ -251,12 +256,18 @@ func allocatorBypassPlan(
 		}
 		orderAuths(eligible, sticky, resolved)
 		for _, auth := range eligible {
+			decision := allocatorBypassAuthDecision(cfg, resolved, auth, now)
+			if !decision.Eligible {
+				continue
+			}
 			plan = append(plan, executionAttempt{
-				LogicalModel:    logicalName,
-				Candidate:       resolved,
-				Auth:            auth,
-				RequestedEffort: requestedEffortValue(contract.Effort),
-				EffectiveEffort: normalizeEffort(resolved.Effort),
+				LogicalModel:         logicalName,
+				Candidate:            resolved,
+				Auth:                 auth,
+				RequestedEffort:      requestedEffortValue(contract.Effort),
+				EffectiveEffort:      normalizeEffort(resolved.Effort),
+				AllocatorBypass:      true,
+				AllocatorBypassProbe: newAllocatorBypassProbeAttemptState(decision),
 				// AllocatorManaged stays false: the allocator already declined
 				// these, and re-checking its floors here would withhold them again.
 				AllocatorManaged: false,
@@ -264,6 +275,19 @@ func allocatorBypassPlan(
 		}
 	}
 	return plan
+}
+
+// allocatorBypassAuthEligible applies subscription-owner boundaries per auth.
+// Candidate-level rejection codes are intentionally not sufficient here: a
+// mixed pool can contain one exhausted auth and another secondary sitting at
+// its owner's floor, which produces a generic aggregate rejection.
+func allocatorBypassAuthEligible(
+	cfg pluginConfig,
+	item candidate,
+	auth pluginapi.HostAuthFileEntry,
+	now time.Time,
+) bool {
+	return allocatorBypassAuthDecision(cfg, item, auth, now).Eligible
 }
 
 // logAllocatorBypass records that budget policy was overridden to keep a request

@@ -27,6 +27,12 @@ debug: false
 logging-to-file: true
 logs-max-total-size-mb: 512
 error-logs-max-files: 10
+# Error-only diagnostics when full request logging is disabled. The default
+# metadata mode records bounded request/response sizes, status and sanitized
+# machine-readable error fields, never request, response or upstream bodies.
+# Use off to disable these forced error files. body is intentionally rejected.
+error-log-capture:
+  mode: metadata
 # Bravo keeps its own persistent analytics; this disables only legacy host stats.
 usage-statistics-enabled: false
 
@@ -46,6 +52,11 @@ plugins:
       fallback_hedge_delay_seconds: 40
       state_path: bravo-data/bravo-state.json
       allocator_mode: enforce
+      # preview.11: enforce skips only a confirmed unsafe local attempt and
+      # immediately continues the configured neighboring route. It never waits,
+      # queues, or performs an extra provider/quota request. Use observe for a
+      # behavior-preserving canary, or off to disable adaptive telemetry.
+      adaptive_allocator_mode: enforce
       quota_refresh_seconds: 60
       unknown_secondary_policy: block
       smart_keys: []

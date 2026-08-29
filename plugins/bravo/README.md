@@ -147,49 +147,69 @@ snapshot with HTTP 200 and `cached: true`. It performs no provider request.
 `routes` returns the effective logical routes allowed by this key, their
 preferred/fallback order, physical provider/model, effort, capabilities, and
 whether each route comes from the built-in default or an operator override. In
-the 0.9 preview both responses also state that the adaptive allocator is
-`shadow_only`, has no routing
-authority, and generates no additional provider requests.
+the 0.9 preview both responses also state the selected adaptive mode, whether
+routing is enforced, and the invariant that the allocator generates no
+additional provider requests.
 
 ## Adaptive allocator 0.9 preview
 
-Preview.8 adds an independent **edge-gate shadow**. It deliberately stops
-using a predicted per-request quota percentage as a routing premise. The old
-token calibration and forecast backtest stay available for analytics and
-capacity planning, while the new state machine uses only cached headroom and
-actual provider outcomes:
+Preview.11 promotes the reviewed adaptive gate to an explicit, reversible
+runtime mode. The default remains `observe`; production routing changes happen
+only when the operator sets `adaptive_allocator_mode: enforce`.
+
+The modes have deliberately small contracts:
+
+- `off` disables adaptive telemetry and routing decisions;
+- `observe` records the counterfactual decision while preserving the ordinary
+  allocator's attempt order, provider-call count, fallback and responses;
+- `enforce` atomically reserves the predicted session and weekly/model-weekly
+  cost against a fresh, provider-confirmed quota. If the current attempt is
+  confirmed unsafe, busy at the guarded edge, or behind a provider-confirmed
+  breaker, it is not dispatched and Bravo immediately continues the already
+  configured neighboring account/model route.
+
+`enforce` never waits, creates a cross-project queue, wakes quota polling or
+adds a provider request. Unknown or stale quota, an unavailable estimate, and
+bounded-runtime saturation all fail open to the ordinary allocator. The
+ordinary allocator remains authoritative for project allowlists, ownership,
+disabled credentials, cooldowns and tariff floors. A primary has a zero
+owner floor but confirmed zero quota is still exhausted.
+
+The ordinary allocator's narrow scheduled-reset bypass is stampede-safe too.
+When a confirmed zero belongs to an already elapsed reset but the background
+snapshot has not refreshed yet, exactly one non-blocking request may probe that
+auth plus reset generation. Competitors immediately continue the neighboring
+route. A pre-dispatch failure releases the lease; once provider dispatch starts,
+that generation stays consumed until a fresh confirmed snapshot or a newer
+reset generation supersedes it. This gate is bounded to 4096 entries, never
+waits, and does not wake quota polling.
+
+The independent edge state machine deliberately uses cached headroom and
+actual provider outcomes rather than treating a token forecast as proof of a
+provider failure:
 
 ```text
-Green    -> normal concurrency
-Guarded  -> near/stale/unknown quota: one simulated in-flight request
-Tripped  -> only after an actual quota/rate-limit failure
-Half-open -> after expiry: exactly one simulated probe
+Green     -> normal concurrency
+Guarded   -> fresh confirmed quota near its guard band: one in-flight attempt
+Tripped   -> only after an actual quota/rate-limit failure
+Half-open -> after expiry: exactly one non-queued probe
 ```
 
-`would_skip_busy` and `would_skip_tripped` mean “an enforcing version would
-immediately try the next route”. They never mean wait: the shadow gate has no
-queue. Preview.8 still executes the original route byte-for-byte, so it can
-compare each counterfactual decision with the actual result. Runtime state is
-bounded; saturation is explicit and fail-open. There is no migration and no
-new provider or quota call.
-
-The existing adaptive-audit endpoint now reports edge-gate states, decisions,
-trip/reopen transitions, successful counterfactual skips and quota failures on
-both skipped and dispatched attempts. `edge_gate_verdict=ready_for_review`
-requires at least 100 edge-gate attempts spanning six hours and never enables
-routing by itself.
-
-The first 0.9 phase deliberately observes without enforcing. It estimates the
-possible quota cost of the request that Bravo actually attempts, then compares
-that estimate only with quota snapshots produced by the existing background
-poller. It does not wake the poller, shorten its interval, call a subscription,
-withhold an account, reorder a route, or change fallback behavior.
+In `observe`, `would_skip_busy`, `would_skip_tripped` and
+`would_withhold` remain counterfactual and the attempt still runs. In
+`enforce`, the corresponding attempt is recorded as `not_dispatched`, the
+audit increments `routing_changes_applied`, and execution continues without a
+retry loop. Only a real provider quota/rate-limit outcome may trip a breaker;
+after expiry exactly one Half-open probe owns the turnstile.
 
 Shadow commitments and learned uncertainty have a five-minute half-life by
 default and become exactly inert after thirty minutes. Runtime state is bounded
-and is intentionally discarded on restart. The standard Management Center,
-`/v1/bravo/limits`, and `/v1/bravo/routes` show the current mode and aggregate
-cooling state without credential identities.
+to 4096 tracked identities, 256 cooled commitments per identity and 512 live
+forecast reservations per identity; stale live leases recover after two hours.
+Edge leases and breakers are separately bounded. Saturation is visible and
+fail-open. Runtime state is intentionally discarded on restart. The standard
+Management Center, `/v1/bravo/limits`, and `/v1/bravo/routes` show the current
+mode and aggregate cooling state without credential identities.
 
 Every real inference attempt also feeds a separate privacy-safe shadow audit.
 The request path performs only a non-blocking enqueue; JSON encoding, disk
@@ -213,11 +233,11 @@ GET /v0/management/bravo/adaptive-audit?hours=24&recent=0&format=text
 The same 24-hour summary is visible in the existing subscription page. It
 reports actual requests/execution attempts/fallbacks, shadow `would_admit` and
 `would_withhold` decisions, successful attempts shadow would have withheld,
-quota failures shadow would have admitted, queue/disk loss, and the invariant
-zero routing changes/zero extra provider requests. A clean report becomes
-`ready_for_review` only after at least 100 requests spanning at least six hours,
-with no unknown shadow decisions; this is evidence for a human decision, never
-automatic promotion.
+quota failures shadow would have admitted, enforced `not_dispatched` attempts,
+applied routing changes, and queue/disk loss. Additional provider requests must
+remain zero in every mode. A clean observe report becomes `ready_for_review`
+only after at least 100 requests spanning at least six hours; this is evidence
+for a human decision, never an automatic mode switch.
 
 Preview.5 additionally calibrates the shadow estimate against actual usage
 tokens already emitted by normal inference. Session, weekly and model-weekly
@@ -228,17 +248,47 @@ Management/project status exposes only aggregate per-window calibration rows,
 and the audit separates fully `token_calibrated_*` attempts from partial and
 cold/legacy ones, with an independent verdict for the new formula.
 Profiles are bounded, decay with a 24-hour half-life, survive restart, contain
-no prompts or responses, and still have no routing authority.
+no prompts or responses, and gain routing authority only under the explicit
+`enforce` mode with fresh confirmed quota.
 The invariants and release gates are in
-[`docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md`](docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md)
+[`docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md`](docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md),
 [`ADAPTIVE_TOKEN_CALIBRATION_TEST_PLAN.md`](ADAPTIVE_TOKEN_CALIBRATION_TEST_PLAN.md),
 and [`ADAPTIVE_EDGE_GATE_TEST_PLAN.md`](ADAPTIVE_EDGE_GATE_TEST_PLAN.md).
 
-`adaptive_allocator_mode` accepts only `off` or `observe` in this preview.
-`assist` and `enforce` are rejected at configuration time, so a partial rollout
-cannot accidentally turn telemetry into a routing gate. The full contract and
-promotion gates are documented in
-[`docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md`](docs/architecture/ADAPTIVE_QUOTA_0_9_CONTRACT.md).
+No database, credential, YAML or state-file migration is required. Existing
+analytics continue to load, while runtime leases are rebuilt empty. A safe
+rollout starts in `observe`, checks the adaptive audit, then hot-reloads the
+explicit `enforce` value. Returning to `observe` removes adaptive routing
+authority without replacing the image; Bravo 0.8.11 remains the stable binary
+rollback point.
+
+## Shared transport pool and safe error diagnostics
+
+Provider HTTP/2 transports are shared within a strict
+subscription/provider/egress boundary. Auth material and HPACK state therefore
+never cross identities. The process retains at most 256 idle transport
+identities for ten minutes and retires an idle HTTP/2 connection after 90
+seconds. Active entries may temporarily exceed the idle bound and are never
+evicted or forced through a hidden queue; they are trimmed after becoming
+idle. Request-scoped custom transports are never cached, and a request without
+a stable auth identity gets an isolated transport.
+
+When full `request-log` is disabled, the default error-only policy is safe
+metadata capture:
+
+```yaml
+error-log-capture:
+  mode: metadata
+```
+
+`metadata` records method/path, masked headers, bounded declared/consumed byte
+counts, completion, HTTP status and sanitized machine-readable error fields.
+It does not retain or write request, response or upstream bodies, unmasked
+authentication headers, prompts, model output or raw provider messages. `off`
+disables forced request-error files. `body` is reserved and rejected by
+configuration rather than silently enabling payload capture.
+Forced files use mode `0600` in a `0700` directory and are never forwarded to
+Home logging. `error-logs-max-files` still bounds retained files.
 
 ## Per-project prompt caching
 
@@ -281,6 +331,7 @@ plugins:
       max_attempts: 0
       cooldown_seconds: 30
       compact_bypass_cooldown_seconds: 900
+      adaptive_allocator_mode: observe # off, observe, or explicit enforce
       smart_keys:
         - id: prj_example
           name: default-project
@@ -338,12 +389,24 @@ retry, and fallback; stale entries fail closed.
 
 ## Per-project allocation and live quota
 
-The current release applies project ownership, strict pools, and reserve policy:
+The current release implements the **subscription-communism** contract: all
+authorized projects may borrow genuinely free shared capacity, but ownership
+and its protected reserve remain enforceable. There is no fixed per-project or
+per-agent concurrency cap; concurrent reservations are instead accounted
+atomically against the relevant subscription windows.
+
+Project ownership, strict pools, and reserve policy work as follows:
 
 - the persistent usage ledger is keyed by stable project ID and exact
   `auth_index`;
-- a project can own one or more primary subscriptions, tried before the shared
-  pool and permitted to drain to zero;
+- a project can own one or more primary subscriptions; they are attempted before
+  shared capacity regardless of host list order or current shared-account
+  stress;
+- a confirmed exhausted or unavailable primary immediately falls through to
+  eligible shared capacity instead of failing the whole logical route;
+- an owner may consume its own primary reserve down to confirmed zero, while a
+  secondary may borrow only capacity that remains above the owner's configured
+  session and weekly/model-weekly floors after all in-flight reservations;
 - `allowed_auth_ids` limits every allocator path to the project's selected
   personal/work pool;
 - secondary `x1` subscriptions default to 50% session/week floors and `x5`
@@ -356,6 +419,9 @@ The current release applies project ownership, strict pools, and reserve policy:
   rendezvous tie-break;
 - unknown/stale quota is blocked for secondary use by default rather than
   treated as full;
+- ordinary allocator bypass/fallback cannot cross an owner floor, known
+  exhaustion, a disabled subscription or a mixed-pool rejection that contains
+  any of those protected conditions;
 - Claude accounts with an unused session (`utilization=0`, `resets_at=null`)
   remain confirmed at 100% with an `inactive` reset mode; a missing Codex
   window can be explicitly `not_applicable`.
@@ -386,6 +452,8 @@ persisted outside the credential discovery directory in
 `bravo-data/bravo-state.json`. The same schema-v3 snapshot optionally stores
 active provider/auth/physical-model cooldowns with reviewed, sanitized
 provider detail. Existing snapshots without that field continue to load.
+Preview.11 adds no schema migration: transport entries, adaptive in-flight
+reservations and edge leases are runtime-only and start empty after restart.
 
 Schema v3 also retains hourly analytics for 31 days and daily analytics for
 400 days. The authenticated analytics endpoint supports project,
@@ -514,7 +582,7 @@ install -m 0644 dist/index.html \
   ../CLIProxyAPI/.canary-dist/management.html
 ```
 
-Then, from the CLIProxyAPI repository root, load the stable release manifest
+Then, from the CLIProxyAPI repository root, load the pinned release manifest
 and build the matching image:
 
 ```bash
@@ -547,10 +615,11 @@ The live harnesses read credentials from files and avoid printing secrets or
 image payloads.
 
 `bravo/main` and `deploy/aws/release.env` are the installation channel.
-Release tags are retained only as immutable rollback points. Moving the stable
-channel requires the full Go suite, plugin race/vet, risk-relevant protocol
-and management smoke checks, and controlled pre-payload failover. Real Claude
-Code is additionally required when client request/response translation,
+Release tags are retained only as immutable rollback points. Moving the
+installation channel requires the full Go suite, plugin race/vet,
+risk-relevant protocol and management smoke checks, and controlled pre-payload
+failover. Real Claude Code is additionally required when client
+request/response translation,
 effort/tool handling, stream presentation, or deadline behavior changes; a
 provider-error-classification-only change may instead use the verbatim
 production error in a protocol-level canary. A release that changes Management
@@ -558,6 +627,15 @@ UI bytes additionally requires WebUI tests/lint/typecheck/build and
 Chrome/Playwright desktop/mobile QA. A backend-only release may reuse the exact
 previously verified UI artifact when its pinned commit and SHA-256 are recorded
 and the served bytes are verified after cutover.
+
+Preview.11 has no one-shot migration. Preserve the mounted auth directory,
+configuration and `bravo-data` volume; retain the previous image plus a
+pre-cutover state copy. For a conservative canary, start with
+`adaptive_allocator_mode: observe`, run the protocol/management smokes and
+inspect `/v0/management/bravo/adaptive-audit`. Then hot-reload explicit
+`enforce`. Returning to `observe` is the first rollback; restoring the retained
+0.8.11 image and its state copy is the stable rollback. Never delete auth or
+usage state to perform a rollback.
 
 The current clean-install guide is
 [`AWS_INSTALL_RU.md`](../../AWS_INSTALL_RU.md). The operator guide for project

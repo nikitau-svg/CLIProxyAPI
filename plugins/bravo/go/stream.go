@@ -290,6 +290,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			return nil, nil, false
 		}
 		attempt.AdaptiveProviderDispatched = true
+		markAllocatorBypassProbeDispatched(attempt, time.Now())
 		providerCalls++
 		run := launchBravoStreamAttempt(
 			req,

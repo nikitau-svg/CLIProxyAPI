@@ -99,6 +99,7 @@ func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.
 	configDir := filepath.Dir(configPath)
 	logsDir := logging.ResolveLogDirectory(cfg)
 	logger := logging.NewFileRequestLogger(cfg.RequestLog, logsDir, configDir, cfg.ErrorLogsMaxFiles)
+	logger.SetErrorLogCaptureMode(cfg.ErrorLogCapture.Mode)
 	logger.SetHomeEnabled(cfg != nil && cfg.Home.Enabled)
 	return logger
 }
@@ -1863,6 +1864,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		} else if toggler, ok := s.requestLogger.(interface{ SetEnabled(bool) }); ok {
 			toggler.SetEnabled(cfg.RequestLog)
 		}
+	}
+	if setter, ok := s.requestLogger.(interface{ SetErrorLogCaptureMode(string) }); ok {
+		setter.SetErrorLogCaptureMode(cfg.ErrorLogCapture.Mode)
 	}
 
 	if oldCfg == nil || oldCfg.Home.Enabled != cfg.Home.Enabled {

@@ -119,7 +119,7 @@ func handleProjectRoutes(req rpcManagementRequest) ([]byte, error) {
 			FallbackUntil:                      "first_response_payload",
 			AdaptiveAllocatorMode:              cfg.AdaptiveAllocatorMode,
 			AdaptiveAllocatorEffect:            adaptiveShadowEffect(cfg),
-			AdaptiveRoutingEnforced:            false,
+			AdaptiveRoutingEnforced:            cfg.AdaptiveAllocatorMode == "enforce",
 			AdaptiveAdditionalProviderRequests: false,
 		},
 		Routes: routes,

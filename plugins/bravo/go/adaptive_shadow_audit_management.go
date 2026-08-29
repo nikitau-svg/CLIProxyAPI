@@ -78,9 +78,17 @@ func boundedAdaptiveAuditQueryInt(raw string, fallback, minimum, maximum int) (i
 
 func renderAdaptiveShadowAuditText(report adaptiveShadowAuditReport, hours int) string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "Bravo: теневой аудит адаптивного распределителя (%d ч)\n", hours)
+	title := "теневой аудит адаптивного распределителя"
+	if report.RoutingEnforced {
+		title = "аудит боевого адаптивного распределителя"
+	}
+	fmt.Fprintf(&out, "Bravo: %s (%d ч)\n", title, hours)
 	fmt.Fprintf(&out, "Вердикт: %s — %s\n", report.Verdict, report.VerdictMessage)
-	fmt.Fprintf(&out, "Режим: %s; влияние на маршрутизацию: нет\n", report.Mode)
+	influence := "нет"
+	if report.RoutingEnforced {
+		influence = "да"
+	}
+	fmt.Fprintf(&out, "Режим: %s; влияние на маршрутизацию: %s\n", report.Mode, influence)
 	fmt.Fprintf(&out, "Запросы: %d; фактические попытки выполнения: %d; fallback: %d\n",
 		report.RequestsObserved, report.ActualExecutionAttempts, report.RequestsWithFallback)
 	fmt.Fprintf(&out, "Shadow-решения: пропустить %d; удержать %d; неизвестно %d\n",

@@ -139,6 +139,7 @@ func execute(raw []byte) ([]byte, error) {
 			continue
 		}
 		attempt.AdaptiveProviderDispatched = true
+		markAllocatorBypassProbeDispatched(attempt, time.Now())
 		providerCalls++
 		started := time.Now()
 		responseRaw, errCall := callHost(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{

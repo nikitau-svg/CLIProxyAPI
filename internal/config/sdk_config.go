@@ -4,6 +4,24 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+const (
+	// ErrorLogCaptureModeMetadata keeps safe request metadata for failed requests
+	// without retaining request bodies.
+	ErrorLogCaptureModeMetadata = "metadata"
+	// ErrorLogCaptureModeOff disables forced request error logs when full request
+	// logging is disabled.
+	ErrorLogCaptureModeOff = "off"
+	// ErrorLogCaptureModeBody is reserved for a future bounded, expiring capture
+	// implementation. Configuration validation currently rejects it.
+	ErrorLogCaptureModeBody = "body"
+)
+
+// ErrorLogCaptureConfig controls error-only request diagnostics when RequestLog
+// is false. Full request logging keeps its existing behavior.
+type ErrorLogCaptureConfig struct {
+	Mode string `yaml:"mode" json:"mode"`
+}
+
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
@@ -41,6 +59,10 @@ type SDKConfig struct {
 
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
+
+	// ErrorLogCapture controls safe error-only diagnostics when RequestLog is false.
+	// The default metadata mode never retains request or response bodies.
+	ErrorLogCapture ErrorLogCaptureConfig `yaml:"error-log-capture" json:"error-log-capture"`
 
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`

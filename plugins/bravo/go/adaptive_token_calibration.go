@@ -147,7 +147,7 @@ var adaptiveTokenRuntime = struct {
 
 func buildAdaptiveTokenUsageEvent(record pluginapi.UsageRecord) (adaptiveTokenUsageEvent, bool) {
 	cfg := loadedConfig()
-	if cfg.AdaptiveAllocatorMode != "observe" || !record.Generate {
+	if cfg.AdaptiveAllocatorMode == "off" || !record.Generate {
 		return adaptiveTokenUsageEvent{}, false
 	}
 	authIndex := strings.TrimSpace(record.AuthIndex)
@@ -294,7 +294,7 @@ func reconcileAdaptiveTokenCalibration(
 	observedAt time.Time,
 ) []adaptiveTokenUsageEvent {
 	authIndex = strings.TrimSpace(authIndex)
-	if cfg.AdaptiveAllocatorMode != "observe" || authIndex == "" || previousAt.IsZero() ||
+	if cfg.AdaptiveAllocatorMode == "off" || authIndex == "" || previousAt.IsZero() ||
 		observedAt.IsZero() || !observedAt.After(previousAt) {
 		return nil
 	}

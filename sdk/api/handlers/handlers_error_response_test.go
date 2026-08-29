@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -51,6 +52,68 @@ func TestWriteErrorResponsePreservesExecutorErrorCode(t *testing.T) {
 	}
 	if response.Error.Message != `reasoning_effort has unsupported effort "turbo"` {
 		t.Fatalf("error.message = %q", response.Error.Message)
+	}
+}
+
+func TestWriteErrorResponseCapturesMetadataDiagnosticWithoutFullRequestLog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		RequestLog: false,
+		ErrorLogCapture: sdkconfig.ErrorLogCaptureConfig{
+			Mode: sdkconfig.ErrorLogCaptureModeMetadata,
+		},
+	}, nil)
+	errMsg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error: codedHandlerResponseError{
+			code:    "bravo_no_eligible_account",
+			message: "prompt text that must not be persisted",
+		},
+	}
+
+	handler.WriteErrorResponse(c, errMsg)
+
+	value, ok := c.Get("API_RESPONSE_ERROR")
+	if !ok {
+		t.Fatal("metadata diagnostic was not captured")
+	}
+	errorsForLog, ok := value.([]*interfaces.ErrorMessage)
+	if !ok || len(errorsForLog) != 1 || errorsForLog[0] != errMsg {
+		t.Fatalf("API_RESPONSE_ERROR = %#v, want the request-scoped error", value)
+	}
+
+	// A second legacy/websocket capture of the same object must not grow the
+	// request-scoped diagnostic collection.
+	handler.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+	value, _ = c.Get("API_RESPONSE_ERROR")
+	errorsForLog, _ = value.([]*interfaces.ErrorMessage)
+	if len(errorsForLog) != 1 {
+		t.Fatalf("duplicate API_RESPONSE_ERROR count = %d, want 1", len(errorsForLog))
+	}
+}
+
+func TestWriteErrorResponseDoesNotCaptureDiagnosticWhenDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		ErrorLogCapture: sdkconfig.ErrorLogCaptureConfig{
+			Mode: sdkconfig.ErrorLogCaptureModeOff,
+		},
+	}, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      errors.New("do not retain this error"),
+	})
+
+	if _, ok := c.Get("API_RESPONSE_ERROR"); ok {
+		t.Fatal("API_RESPONSE_ERROR was captured while error-log-capture is off")
 	}
 }
 

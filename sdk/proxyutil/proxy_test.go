@@ -2,14 +2,20 @@ package proxyutil
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 func mustDefaultTransport(t *testing.T) *http.Transport {
@@ -241,10 +247,18 @@ func TestBuildDialerHTTPProxyCONNECT(t *testing.T) {
 		t.Fatal("expected dialer, got nil")
 	}
 
-	conn, errDial := dialer.Dial("tcp", "target.example.com:443")
-	if errDial != nil {
-		t.Fatalf("dialer.Dial returned error: %v", errDial)
+	contextDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		t.Fatalf("dialer = %T, want proxy.ContextDialer", dialer)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	conn, errDial := contextDialer.DialContext(ctx, "tcp", "target.example.com:443")
+	if errDial != nil {
+		t.Fatalf("dialer.DialContext returned error: %v", errDial)
+	}
+	// The context controls tunnel establishment only. Once CONNECT succeeds,
+	// cancellation must not close the returned connection or retain deadlines.
+	cancel()
 	defer func() {
 		if errClose := conn.Close(); errClose != nil {
 			t.Errorf("conn.Close returned error: %v", errClose)
@@ -266,6 +280,139 @@ func TestBuildDialerHTTPProxyCONNECT(t *testing.T) {
 
 	if errServer := <-done; errServer != nil {
 		t.Fatalf("proxy server returned error: %v", errServer)
+	}
+}
+
+type blockingProxyDialer struct {
+	started chan struct{}
+	release chan struct{}
+	conn    net.Conn
+	once    sync.Once
+}
+
+func (d *blockingProxyDialer) Dial(string, string) (net.Conn, error) {
+	d.once.Do(func() { close(d.started) })
+	<-d.release
+	return d.conn, nil
+}
+
+func TestHTTPConnectDialerCancelBeforeProxyConnectReturns(t *testing.T) {
+	proxyURL, errParse := url.Parse("http://proxy.example:8080")
+	if errParse != nil {
+		t.Fatalf("parse proxy URL: %v", errParse)
+	}
+	clientConn, peerConn := net.Pipe()
+	defer func() { _ = peerConn.Close() }()
+	underlying := &blockingProxyDialer{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		conn:    clientConn,
+	}
+	dialer := &httpConnectDialer{proxyURL: proxyURL, dialer: underlying}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		conn, errDial := dialer.DialContext(ctx, "tcp", "target.example:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		result <- errDial
+	}()
+	<-underlying.started
+	cancel()
+	select {
+	case errDial := <-result:
+		if !errors.Is(errDial, context.Canceled) {
+			t.Fatalf("DialContext error = %v, want context.Canceled", errDial)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DialContext did not return after cancellation")
+	}
+
+	close(underlying.release)
+	peerRead := make(chan error, 1)
+	go func() {
+		var buffer [1]byte
+		_, errRead := peerConn.Read(buffer[:])
+		peerRead <- errRead
+	}()
+	select {
+	case errRead := <-peerRead:
+		if errRead == nil {
+			t.Fatal("late proxy connection remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late proxy connection was not closed")
+	}
+}
+
+func TestHTTPConnectDialerCancelWhileWaitingForCONNECTResponse(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("listen: %v", errListen)
+	}
+	defer func() { _ = listener.Close() }()
+	connectReceived := make(chan struct{})
+	serverResult := make(chan error, 1)
+	go func() {
+		conn, errAccept := listener.Accept()
+		if errAccept != nil {
+			serverResult <- errAccept
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if errDeadline := conn.SetDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
+			serverResult <- errDeadline
+			return
+		}
+		if _, errRead := http.ReadRequest(bufio.NewReader(conn)); errRead != nil {
+			serverResult <- errRead
+			return
+		}
+		close(connectReceived)
+		var buffer [1]byte
+		_, errRead := conn.Read(buffer[:])
+		serverResult <- errRead
+	}()
+
+	dialer, _, errBuild := BuildDialer("http://" + listener.Addr().String())
+	if errBuild != nil {
+		t.Fatalf("BuildDialer: %v", errBuild)
+	}
+	contextDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		t.Fatalf("dialer = %T, want proxy.ContextDialer", dialer)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	dialResult := make(chan error, 1)
+	go func() {
+		conn, errDial := contextDialer.DialContext(ctx, "tcp", "target.example:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		dialResult <- errDial
+	}()
+	select {
+	case <-connectReceived:
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not receive CONNECT request")
+	}
+	cancel()
+	select {
+	case errDial := <-dialResult:
+		if !errors.Is(errDial, context.Canceled) {
+			t.Fatalf("DialContext error = %v, want context.Canceled", errDial)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DialContext remained blocked waiting for CONNECT response")
+	}
+	select {
+	case errServer := <-serverResult:
+		if errServer == nil {
+			t.Fatal("proxy connection remained open after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy server did not observe connection close")
 	}
 }
 

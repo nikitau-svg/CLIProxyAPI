@@ -15,7 +15,9 @@ type routeTraceRecorder struct {
 	adaptiveAuditDisabled          bool
 	adaptiveAuditAttempts          []adaptiveShadowAuditAttempt
 	adaptiveAuditExecutionAttempts int
+	adaptiveAuditRoutingChanges    int
 	adaptiveAuditOmittedAttempts   int
+	adaptiveAuditRoutingEnforced   bool
 }
 
 func (recorder *routeTraceRecorder) disableAdaptiveAudit() {
@@ -33,21 +35,44 @@ func (recorder *routeTraceRecorder) captureAdaptiveAuditAttempt(
 	outcome string,
 	errorCode string,
 ) {
-	if recorder == nil || recorder.finished || recorder.adaptiveAuditDisabled ||
-		!attempt.AdaptiveShadow || !attempt.AdaptiveProviderDispatched {
+	if recorder == nil || recorder.finished || recorder.adaptiveAuditDisabled || !attempt.AdaptiveShadow {
 		return
 	}
-	recorder.adaptiveAuditExecutionAttempts++
+	edgeGate := attempt.AdaptiveEdgeGate.snapshot()
+	localEnforcedSkip := !attempt.AdaptiveProviderDispatched &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(errorCode)), "bravo_adaptive_")
+	if edgeGate.Enforce || localEnforcedSkip {
+		// The attempt owns the routing-mode snapshot used to build its plan.
+		// Config may hot-reload before the asynchronous audit record is written;
+		// a never-dispatched local adaptive error independently proves enforce.
+		recorder.adaptiveAuditRoutingEnforced = true
+	}
+	if !attempt.AdaptiveProviderDispatched && !localEnforcedSkip {
+		return
+	}
+	if attempt.AdaptiveProviderDispatched {
+		recorder.adaptiveAuditExecutionAttempts++
+	} else {
+		recorder.adaptiveAuditRoutingChanges++
+		outcome = "withheld"
+	}
 	if len(recorder.adaptiveAuditAttempts) >= adaptiveShadowAuditAttemptsPerRecord {
 		recorder.adaptiveAuditOmittedAttempts++
 		return
 	}
-	edgeGate := attempt.AdaptiveEdgeGate.snapshot()
+	decision := attempt.AdaptiveShadowDecision
+	if localEnforcedSkip {
+		decision = adaptiveShadowDecisionWithhold
+	}
+	providerAcceptance := adaptiveShadowProviderAcceptance(attempt)
+	if localEnforcedSkip {
+		providerAcceptance = "not_dispatched"
+	}
 	recorder.adaptiveAuditAttempts = append(recorder.adaptiveAuditAttempts, adaptiveShadowAuditAttempt{
 		Provider:                      normalizeProvider(attempt.Candidate.Provider),
 		Model:                         strings.TrimSpace(attempt.Candidate.Model),
 		Primary:                       attempt.Primary,
-		Decision:                      attempt.AdaptiveShadowDecision,
+		Decision:                      decision,
 		EstimateConfidence:            attempt.AdaptiveEstimateConfidence,
 		ReservationPercent:            attempt.AdaptiveReservationPercent,
 		SessionReservationPercent:     attempt.AdaptiveSessionReservationPercent,
@@ -61,7 +86,7 @@ func (recorder *routeTraceRecorder) captureAdaptiveAuditAttempt(
 		Outcome:                       outcome,
 		Status:                        status,
 		Success:                       success,
-		ProviderAcceptance:            adaptiveShadowProviderAcceptance(attempt),
+		ProviderAcceptance:            providerAcceptance,
 		LatencyMilliseconds:           time.Since(started).Milliseconds(),
 		ErrorCode:                     errorCode,
 		EdgeGateState:                 edgeGate.State,
@@ -87,18 +112,21 @@ func newRouteTraceRecorder(
 	logicalModel, protocol string,
 	stream bool,
 ) *routeTraceRecorder {
+	cfg := loadedConfig()
 	projectID := ""
-	if project, ok := authenticatedExecutionProject(req, loadedConfig()); ok {
+	if project, ok := authenticatedExecutionProject(req, cfg); ok {
 		projectID = project.ID
 	}
-	return &routeTraceRecorder{trace: routeTrace{
-		TraceID:        newRouteTraceID(),
-		StartedAt:      time.Now().UTC(),
-		ProjectID:      projectID,
-		LogicalModel:   strings.TrimSpace(logicalModel),
-		SourceProtocol: normalizeContractProtocol(protocol),
-		Stream:         stream,
-	}}
+	return &routeTraceRecorder{
+		trace: routeTrace{
+			TraceID:        newRouteTraceID(),
+			StartedAt:      time.Now().UTC(),
+			ProjectID:      projectID,
+			LogicalModel:   strings.TrimSpace(logicalModel),
+			SourceProtocol: normalizeContractProtocol(protocol),
+			Stream:         stream,
+		},
+	}
 }
 
 func (recorder *routeTraceRecorder) setLogicalModel(logicalModel string) {
@@ -332,8 +360,9 @@ func (recorder *routeTraceRecorder) finish(success bool, status int, failure exe
 			Status:                     status,
 			ActualExecutionAttempts:    recorder.adaptiveAuditExecutionAttempts,
 			OmittedAttempts:            recorder.adaptiveAuditOmittedAttempts,
-			FallbackUsed:               recorder.adaptiveAuditExecutionAttempts > 1,
-			RoutingEnforced:            false,
+			FallbackUsed:               recorder.adaptiveAuditExecutionAttempts > 1 || recorder.adaptiveAuditRoutingChanges > 0,
+			RoutingEnforced:            recorder.adaptiveAuditRoutingEnforced,
+			RoutingChangesApplied:      recorder.adaptiveAuditRoutingChanges,
 			AdditionalProviderRequests: 0,
 			Attempts:                   recorder.adaptiveAuditAttempts,
 		})
