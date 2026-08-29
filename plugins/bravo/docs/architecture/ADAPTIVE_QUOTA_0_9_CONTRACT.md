@@ -1,30 +1,37 @@
 # Bravo Adaptive Quota 0.9 Preview Contract
 
-Status: Bravo 0.9.0-preview.11, phase 2 with explicit `observe` and `enforce`
-modes, token calibration v2, forecast backtest v3 and edge-gate state machine
-v4. Base and stable rollback: published Bravo 0.8.11.
+Status: Bravo 0.9.0-preview.12, phase 3 with explicit `observe`, evidence-only
+`breaker`, and experimental full `enforce` modes, token calibration v2,
+forecast backtest v3 and edge-gate state machine v5. Base and stable rollback:
+published Bravo 0.8.11.
 
 ## Purpose
 
 The preview measures subscription use and provides a reversible local routing
 gate without changing the logical-route contract. Token math remains useful for
-analytics and capacity planning and, only in explicit `enforce`, may reserve a
-fresh provider-confirmed quota before dispatch. The separate edge gate does not
-predict the cost of a request: it uses cached headroom, non-queued single-flight
-at the edge and provider-confirmed breaker transitions.
+analytics and capacity planning and, only in experimental full `enforce`, may
+reserve a fresh provider-confirmed quota before dispatch. Production `breaker`
+does not predict request cost or act on cached low headroom: only a real reviewed
+quota/rate-limit outcome may close a route.
 
 ## Non-negotiable invariants
 
-1. `adaptive_allocator_mode` accepts `off`, `observe`, and `enforce`; an empty
-   value normalizes to `observe`. `assist` and unknown values fail configuration
-   with an explicit error.
+1. `adaptive_allocator_mode` accepts `off`, `observe`, `breaker`, and `enforce`;
+   an empty value normalizes to `observe`. `assist` and unknown values fail
+   configuration with an explicit error.
 2. `observe` preserves the exact 0.8.11 execution order, eligibility decisions,
    fallback behavior and provider-call count. Shadow data cannot withhold an
    account or change a tariff floor.
-3. `enforce` may reject only the current confirmed-unsafe attempt. It returns
-   immediately to the existing executor so the already configured neighboring
-   account/model route can continue. It never waits, queues, synthesizes a
-   retry, or invents a route.
+3. `breaker` may skip only an auth/model protected by a real reviewed quota or
+   rate-limit failure. It returns immediately to the existing executor so an
+   already configured neighboring route can continue. If no ordinary neighbor
+   answers and the configured provider-call budget remains, exactly one
+   previously skipped attempt may run as a global single-flight recovery probe.
+   At most one recovery call is dispatched per breaker generation; competing
+   requests never wait. The coordinator never reserves that slot by withholding
+   a potentially healthy neighbor. A local `bravo_adaptive_*` decision can never
+   be the final client error, including when `max_attempts` is exhausted. The
+   mechanism never waits, queues, or creates background work.
 4. The ordinary allocator remains authoritative for project allowlists,
    primary ownership, disabled subscriptions, cooldowns and tariff floors. A
    project primary precedes shared capacity and has a zero owner floor, but
@@ -34,11 +41,14 @@ at the edge and provider-confirmed breaker transitions.
 5. The adaptive module performs no provider I/O, does not wake quota polling and
    does not shorten its cadence. It may only consume quota snapshots already
    produced by the existing background poller.
-6. Enforcement requires a fresh, provider-confirmed quota and a valid local
-   forecast. Unknown or stale quota, missing calibration and bounded-runtime
-   saturation fail open to the ordinary allocator. A live forecast reservation
-   is atomic per credential; at most 512 are retained per identity and every
-   stale lease has a hard two-hour recovery bound.
+6. `breaker` ignores forecast/headroom admission entirely. Full `enforce`
+   requires a fresh, provider-confirmed quota and valid local forecast; unknown
+   or stale quota, missing calibration and bounded-runtime saturation fail open
+   to the ordinary allocator. A protected scheduled or recovery proof is the
+   narrow exception: coordination saturation skips it locally instead of
+   risking a retry stampede. Full `enforce` live forecast reservation is atomic per
+   credential; at most 512 are retained per identity and every stale lease has
+   a hard two-hour recovery bound.
 7. Legacy shadow state is bounded to 4096 credential identities and 256 recent
    commitments per identity. Token calibration is separately bounded to 4096
    identities, 2048 unreconciled usage events per identity, 32768 runtime events
@@ -52,7 +62,7 @@ at the edge and provider-confirmed breaker transitions.
    runtime-only. Reconciled token-rate profiles and aggregate consumption
    analytics persist so that observation can continue across restarts. No
    database, credential, YAML or state-file migration is required for
-   preview.11.
+   preview.12.
 10. Public project views expose only aggregate values after the project's allowed
    account pool is applied. Credential identities are not returned.
 11. The durable audit writer is telemetry-only. Enqueue is non-blocking; queue,
@@ -65,16 +75,21 @@ at the edge and provider-confirmed breaker transitions.
     attached to a real attempt and the next confirmed quota snapshot. It never
     trains on an interval before scoring that interval and never replays a
     request against a provider.
-14. Only an actual quota/rate-limit provider outcome may trip the edge-gate
-    breaker. Cached quota selects Green or Guarded but cannot fabricate a trip.
-    After expiry, exactly one attempt becomes the Half-open probe. Observe
-    records counterfactual skips; enforce applies them locally.
+14. A valid taxonomy-v1 classification is authoritative even when legacy text
+    or HTTP status contradicts it. Only taxonomy-v1 `quota`/`rate_limit` with a
+    reviewed model/account scope, or bare HTTP 429 when valid taxonomy is
+    absent (model scope), may trip the breaker. Raw provider strings and cached
+    quota cannot fabricate a trip. After expiry, exactly one attempt becomes
+    the Half-open probe. `observe` records counterfactual behavior; `breaker`
+    applies only evidence-backed Tripped/Half-open decisions.
 15. Edge-gate runtime is bounded to 4096 in-flight account leases and 4096
-    breakers. Saturation is visible and fail-open. A stale simulated lease has
-    a hard two-hour recovery bound.
-16. The attempt snapshots whether it was built under `observe` or `enforce`.
-    A concurrent hot reload cannot retroactively apply or erase routing
-    authority in its asynchronous audit record.
+    breakers. Saturation is visible. Shadow/forecast work fails open, while a
+    scheduled or recovery proof for an existing breaker skips locally when its
+    coordination lease cannot be acquired. A stale simulated lease has a hard
+    two-hour recovery bound.
+16. The attempt snapshots whether it was built under `observe`, `breaker`, or
+    `enforce`. A concurrent hot reload cannot retroactively apply or erase
+    routing authority in its asynchronous audit record.
 17. A stale confirmed zero whose scheduled reset already elapsed may bypass the
     ordinary allocator only through one non-queued probe per credential and
     reset generation. Competitors continue a neighboring route without a
@@ -82,7 +97,7 @@ at the edge and provider-confirmed breaker transitions.
     consumed generations are reconciled by fresh confirmed quota, and the
     runtime is bounded to 4096 entries with a two-hour abandoned-lease bound.
 
-## Edge gate v4
+## Edge gate v5
 
 The state machine is scoped to one subscription and, for reviewed model-scoped
 provider failures, one physical model:
@@ -95,19 +110,27 @@ Tripped   an actual quota/rate-limit result supplied a cooldown/reset window
 Half-open the window expired and one non-queued probe owns the turnstile
 ```
 
-For secondary subscriptions, headroom is measured after the configured tariff
-floor; primary subscriptions use a zero floor. No predicted token cost or
-cooled pending percentage enters this state decision. Green attempts remain
-fully concurrent. A fresh confirmed Guarded state and Half-open use one
-nonblocking account lease. A concurrent attempt records `would_skip_busy`
-immediately. An unexpired breaker records `would_skip_tripped`. In `observe`
-those attempts still execute so the counterfactual can be audited. In
-`enforce`, the attempt is recorded as `not_dispatched` and the executor
-immediately continues the neighboring route. Unknown or stale quota does not
-create a Guarded enforcement lease and fails open.
+For secondary subscriptions, observed headroom is still measured after the
+configured tariff floor; primary subscriptions use a zero floor. This remains
+useful shadow telemetry, but `breaker` never serializes or skips a route merely
+because it is Green/Guarded, stale, unknown, or forecast-unsafe. Without an
+active breaker all attempts remain fully concurrent. An unexpired trusted
+breaker records `would_skip_tripped`; after expiry one Half-open user request
+owns the nonblocking probe and peers record `would_skip_busy`. In `observe`
+these decisions remain counterfactual. In `breaker`, the skipped attempt is
+`not_dispatched` while neighbors are tried, with one synchronous baseline last
+chance if none answers. Full proactive Guarded/forecast behavior exists only in
+experimental `enforce`.
 
 The simulated lease is acquired only after the real allocator grants an
 attempt and is settled only after the provider outcome has been classified.
+Scheduled and last-chance recovery proofs also share one per-auth nonblocking
+turnstile across every model/account breaker for that subscription. A new
+trusted quota fact advances a monotonic evidence revision. A late result from
+an older proof may release only its own turnstile lease; it cannot reopen or
+weaken the newer breaker, including after model-to-account rescope. Local
+cancellation, supersede, callback failure and bootstrap panic remain
+inconclusive and keep the breaker closed.
 This closes the race between releasing an in-flight slot and observing a 429.
 Token-count probes never acquire the lease. Account-wide credential failures
 trip the account key; explicit provider model scope trips only that physical
@@ -221,8 +244,9 @@ carry a confidence state until enough confirmed observations exist.
 `/v1/bravo/limits`, `/v1/bravo/routes`, the subscription Management API and the
 Bravo status response disclose:
 
-- mode and effective `disabled`, `shadow_only`, or `routing_enforced` effect;
-- the mode-derived `routing_enforced` boolean;
+- mode and effective `disabled`, `shadow_only`, `breaker_routing_enforced`, or
+  `routing_enforced` effect;
+- the mode-derived `routing_enforced` and `forecast_routing_enforced` booleans;
 - `additional_provider_requests=false`;
 - cooling half-life and hard maximum age;
 - bounded aggregate commitment, effective pending and learned-scale values;
@@ -251,7 +275,7 @@ continued collection rather than reallocation.
 and an optional limited recent-record sample. It is built exclusively from real
 inference attempts; token-count probes are excluded.
 `routing_changes_applied` must remain zero in `off`/`observe` and must equal the
-actual `not_dispatched` adaptive attempts in `enforce`.
+actual `not_dispatched` adaptive attempts in `breaker`/`enforce`.
 `additional_provider_requests` remains zero in every mode. The audit worker uses
 a 1024-record queue, 4096-record memory ring, at most 16 attempts per request,
 and two 4 MiB JSONL files. Disk errors degrade telemetry only.
@@ -278,7 +302,8 @@ no automatic routing authority.
 
 ## Release and rollback gate
 
-Preview.11 is the first release that may receive local routing authority. A
+Preview.12 is the first release with a production-safe evidence-only routing
+authority. A
 release candidate must prove:
 
 - identical route/provider-call behavior between `off` and `observe`;
@@ -287,15 +312,21 @@ release candidate must prove:
   saturation;
 - primary-before-shared ordering, shared fallback after primary exhaustion and
   independent owner floors under concurrency;
-- Guarded never queues and immediately selects a later route in `enforce`;
+- 100 concurrent low-headroom attempts without a breaker all dispatch;
+- an active breaker immediately selects a later route without a queue;
+- a single-route or exhausted-neighbor request receives one baseline last
+  chance and never a final `bravo_adaptive_*` error;
 - exactly one probe across concurrent Half-open attempts;
+- one per-auth proof turnstile across scheduled/recovery and model/account
+  scope, including evidence-revision and rescope races;
 - only a provider-confirmed quota/rate-limit outcome trips a breaker;
+- inconclusive local termination never reopens a protected route;
 - unknown/stale quota and missing calibration fail open;
 - post-snapshot usage remains queued by the refresh watermark;
 - independent session/weekly/model-weekly token rates survive restart;
 - deterministic half-life and hard-expiry behavior;
-- hot reload cannot relabel an already planned attempt between `observe` and
-  `enforce`;
+- hot reload cannot relabel an already planned attempt between `observe`,
+  `breaker`, and `enforce`;
 - the bounded audit accurately records `not_dispatched`, routing changes and
   zero additional provider requests without identity or payload data;
 - acceptable latency and allocation behavior on maximum supported request
@@ -305,7 +336,8 @@ There is no one-shot migration. Existing schema-v3 analytics continue to load;
 runtime commitments, transports and gates start empty. A production rollout
 must retain the previous image plus pre-cutover configuration and state, run
 first in `observe`, verify protocol/management smoke tests and the adaptive
-audit, then set explicit `enforce`. Returning to `observe` is the immediate
+audit, then set explicit `breaker`. Full `enforce` remains experimental until a
+separate clean forecast gate is met. Returning to `observe` is the immediate
 configuration rollback. Bravo 0.8.11 and the retained pre-cutover state remain
 the stable binary rollback; auth files and usage state must never be deleted as
 a rollback mechanism.

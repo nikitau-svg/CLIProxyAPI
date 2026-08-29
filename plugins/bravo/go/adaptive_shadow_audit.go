@@ -481,7 +481,7 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 		VerdictMessage:        "Наблюдений пока недостаточно; маршрутизация остаётся прежней.",
 		Mode:                  cfg.AdaptiveAllocatorMode,
 		Effect:                adaptiveShadowEffect(cfg),
-		RoutingEnforced:       cfg.AdaptiveAllocatorMode == "enforce",
+		RoutingEnforced:       adaptiveRoutingEnforced(cfg),
 		From:                  now.Add(-period),
 		To:                    now,
 		QueueCapacity:         cap(store.queue),
@@ -711,7 +711,39 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 			"турникет", report.EdgeGateVerdict, report.EdgeGateAttempts,
 		)
 	}
+	if cfg.AdaptiveAllocatorMode == "breaker" {
+		// Forecast verdicts remain counterfactual in breaker mode. A poor
+		// forecast is useful calibration evidence, not a reason to disable the
+		// independently evidence-backed breaker.
+		report.VerdictMessage = adaptiveBreakerForecastAuditMessage(report.Verdict, report.RequestsObserved)
+		report.TokenCalibrationVerdictMessage = adaptiveBreakerForecastComponentMessage(
+			report.TokenCalibrationVerdict, report.TokenCalibratedAttempts,
+		)
+		report.EdgeGateVerdictMessage = adaptiveEnforcedAuditComponentMessage(
+			"breaker", report.EdgeGateVerdict, report.EdgeGateAttempts,
+		)
+	}
 	return report
+}
+
+func adaptiveBreakerForecastAuditMessage(verdict string, requests int) string {
+	switch verdict {
+	case "telemetry_degraded":
+		return "Телеметрия теневого прогноза частично потеряна; breaker продолжает опираться только на фактические доверенные ошибки квоты."
+	case "needs_review":
+		return "Теневой прогноз обнаружил расхождения и требует калибровки; он не блокирует маршруты и не влияет на evidence-based breaker."
+	case "ready_for_review":
+		return "Теневой прогноз набрал достаточную выборку для ручной проверки; маршруты закрывает только evidence-based breaker."
+	default:
+		return fmt.Sprintf("Теневой прогноз продолжает сбор (%d запросов) и не блокирует маршруты; breaker реагирует только на фактические доверенные ошибки квоты.", requests)
+	}
+}
+
+func adaptiveBreakerForecastComponentMessage(verdict string, attempts int) string {
+	if verdict == "needs_review" {
+		return "Теневая токен-калибровка обнаружила расхождения; она не блокирует маршруты и не требует выключать breaker."
+	}
+	return fmt.Sprintf("Токен-калибровка остаётся теневой в breaker-режиме (%d попыток; вердикт %s).", attempts, verdict)
 }
 
 func adaptiveEnforcedAuditVerdictMessage(verdict string, requests int) string {
@@ -757,7 +789,7 @@ func currentAdaptiveShadowAuditReport(cfg pluginConfig, period time.Duration, re
 			EdgeGateVerdictMessage:         "Shadow-турникет ещё не инициализирован.",
 			Mode:                           cfg.AdaptiveAllocatorMode,
 			Effect:                         adaptiveShadowEffect(cfg),
-			RoutingEnforced:                cfg.AdaptiveAllocatorMode == "enforce",
+			RoutingEnforced:                adaptiveRoutingEnforced(cfg),
 			From:                           now.UTC().Add(-period),
 			To:                             now.UTC(),
 			QueueCapacity:                  adaptiveShadowAuditQueueCapacity,

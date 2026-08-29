@@ -102,6 +102,7 @@ type adaptiveShadowPublicView struct {
 	Mode                       string                             `json:"mode"`
 	Effect                     string                             `json:"effect"`
 	RoutingEnforced            bool                               `json:"routing_enforced"`
+	ForecastRoutingEnforced    bool                               `json:"forecast_routing_enforced"`
 	AdditionalProviderRequests bool                               `json:"additional_provider_requests"`
 	QuotaSnapshotSource        string                             `json:"quota_snapshot_source"`
 	CoolingHalfLifeSeconds     int                                `json:"cooling_half_life_seconds"`
@@ -125,11 +126,32 @@ func adaptiveShadowEffect(cfg pluginConfig) string {
 	switch cfg.AdaptiveAllocatorMode {
 	case "off":
 		return "disabled"
+	case "breaker":
+		return "breaker_routing_enforced"
 	case "enforce":
 		return "routing_enforced"
 	default:
 		return "shadow_only"
 	}
+}
+
+func adaptiveEdgeRoutingEnforced(cfg pluginConfig) bool {
+	return cfg.AdaptiveAllocatorMode == "breaker" || cfg.AdaptiveAllocatorMode == "enforce"
+}
+
+func adaptiveForecastRoutingEnforced(cfg pluginConfig) bool {
+	return cfg.AdaptiveAllocatorMode == "enforce"
+}
+
+func adaptiveRoutingEnforced(cfg pluginConfig) bool {
+	return adaptiveEdgeRoutingEnforced(cfg) || adaptiveForecastRoutingEnforced(cfg)
+}
+
+func adaptiveAttemptConfig(attempt executionAttempt, cfg pluginConfig) pluginConfig {
+	if mode := strings.ToLower(strings.TrimSpace(attempt.AdaptiveAllocatorMode)); mode != "" {
+		cfg.AdaptiveAllocatorMode = mode
+	}
+	return cfg
 }
 
 func buildAdaptiveShadowRequestFeatures(body []byte) adaptiveShadowRequestFeatures {
@@ -249,6 +271,7 @@ func annotateAdaptiveShadowPlan(
 		}
 		estimate := adaptiveShadowEstimateFor(cfg, attempts[index].Auth, item, tariff, quota, features, now)
 		attempts[index].AdaptiveShadow = true
+		attempts[index].AdaptiveAllocatorMode = cfg.AdaptiveAllocatorMode
 		attempts[index].AdaptiveReservationPercent = estimate.ReservationPercent
 		attempts[index].AdaptiveSessionReservationPercent = estimate.SessionReservationPercent
 		attempts[index].AdaptiveWeeklyReservationPercent = estimate.WeeklyReservationPercent
@@ -303,7 +326,7 @@ func adaptiveShadowDecisionFor(
 	weeklyKind, quotaModel := adaptiveShadowWeeklyWindow(quota, attempt.Candidate.Model)
 	weeklyPending := adaptiveShadowEffectivePendingForWindow(authIndex, weeklyKind, quotaModel, cfg, now)
 	if quotaRoutingConfidenceAt(quota, attempt.Candidate.Model, cfg, now) != "confirmed" ||
-		(cfg.AdaptiveAllocatorMode == "enforce" && quotaFreshnessAt(quota, attempt.Candidate.Model, cfg, now) != quotaFreshnessFresh) {
+		(adaptiveForecastRoutingEnforced(cfg) && quotaFreshnessAt(quota, attempt.Candidate.Model, cfg, now) != quotaFreshnessFresh) {
 		return adaptiveShadowDecisionUnknown, adaptiveShadowRound(math.Max(sessionPending, weeklyPending)), 0, 0
 	}
 	session, weekly := effectiveQuotaWindows(quota, attempt.Candidate.Model)
@@ -447,7 +470,8 @@ func acquireAdaptiveEnforcementLease(
 	now time.Time,
 ) (func(bool), bool, *executionFailure) {
 	cfg := loadedConfig()
-	if cfg.AdaptiveAllocatorMode != "enforce" || !attempt.AdaptiveShadow || attempt.CompactBypass {
+	cfg = adaptiveAttemptConfig(attempt, cfg)
+	if !adaptiveForecastRoutingEnforced(cfg) || !attempt.AdaptiveShadow || attempt.CompactBypass {
 		return wrapAdaptiveShadowLease(attempt, func(bool) {}), true, nil
 	}
 	now = now.UTC()
@@ -941,7 +965,8 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 	view := adaptiveShadowPublicView{
 		Mode:                       cfg.AdaptiveAllocatorMode,
 		Effect:                     adaptiveShadowEffect(cfg),
-		RoutingEnforced:            cfg.AdaptiveAllocatorMode == "enforce",
+		RoutingEnforced:            adaptiveRoutingEnforced(cfg),
+		ForecastRoutingEnforced:    adaptiveForecastRoutingEnforced(cfg),
 		AdditionalProviderRequests: false,
 		QuotaSnapshotSource:        "existing_background_cache",
 		CoolingHalfLifeSeconds:     cfg.AdaptiveCoolingHalfLifeSeconds,
@@ -952,8 +977,10 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 		EdgeGate:                   adaptiveEdgeGateSummary(cfg, authIndexes, now),
 		Note:                       "Теневой расчёт не блокирует запросы и не меняет маршруты; он не выполняет дополнительных обращений к подпискам.",
 	}
-	if cfg.AdaptiveAllocatorMode == "enforce" {
+	if adaptiveForecastRoutingEnforced(cfg) {
 		view.Note = "Адаптивный расчёт атомарно резервирует подтверждённый прогноз и пропускает только текущую опасную попытку; неизвестные или устаревшие квоты fail-open, очередей и дополнительных обращений нет."
+	} else if cfg.AdaptiveAllocatorMode == "breaker" {
+		view.Note = "Только breaker после фактической подтверждённой ошибки квоты влияет на маршрут; прогнозные token/reservation решения остаются теневыми, очередей и дополнительных обращений нет."
 	} else if cfg.AdaptiveAllocatorMode == "off" {
 		view.Note = "Адаптивный расчёт отключён."
 	}

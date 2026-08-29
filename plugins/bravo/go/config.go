@@ -361,11 +361,11 @@ func normalizeConfig(cfg *pluginConfig) error {
 	switch cfg.AdaptiveAllocatorMode {
 	case "":
 		cfg.AdaptiveAllocatorMode = "observe"
-	case "off", "observe", "enforce":
+	case "off", "observe", "breaker", "enforce":
 	case "assist":
-		return fmt.Errorf("adaptive_allocator_mode %q is not supported; use off, observe, or enforce", cfg.AdaptiveAllocatorMode)
+		return fmt.Errorf("adaptive_allocator_mode %q is not supported; use off, observe, breaker, or enforce", cfg.AdaptiveAllocatorMode)
 	default:
-		return fmt.Errorf("adaptive_allocator_mode must be off, observe, or enforce")
+		return fmt.Errorf("adaptive_allocator_mode must be off, observe, breaker, or enforce")
 	}
 	if cfg.AdaptiveCoolingHalfLifeSeconds <= 0 {
 		cfg.AdaptiveCoolingHalfLifeSeconds = defaultAdaptiveCoolingHalfLifeSeconds

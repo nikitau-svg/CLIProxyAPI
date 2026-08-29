@@ -15,6 +15,7 @@ func finalExecutionFailureForRequest(
 	traces []executionFailureTrace,
 	fallback executionFailure,
 ) executionFailure {
+	traces, fallback = adaptiveBreakerOutwardFailures(traces, fallback)
 	failure := finalExecutionFailure(traces, fallback)
 	project, authenticated := authenticatedExecutionProject(req, loadedConfig())
 	if !authenticated {

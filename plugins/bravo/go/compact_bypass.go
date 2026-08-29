@@ -170,7 +170,9 @@ func compactBypassQuotaEligible(
 func acquireExecutionAttemptLease(attempt executionAttempt) (func(bool), bool, *executionFailure) {
 	if !attempt.CompactBypass {
 		var release func(bool)
-		if attempt.AdaptiveShadow && loadedConfig().AdaptiveAllocatorMode == "enforce" {
+		cfg := loadedConfig()
+		cfg = adaptiveAttemptConfig(attempt, cfg)
+		if attempt.AdaptiveShadow && adaptiveForecastRoutingEnforced(cfg) {
 			adaptiveRelease, adaptiveAcquired, adaptiveFailure := acquireAdaptiveEnforcementLease(attempt, adaptiveShadowNow())
 			if adaptiveFailure != nil || !adaptiveAcquired {
 				return func(bool) {}, false, adaptiveFailure
@@ -185,6 +187,24 @@ func acquireExecutionAttemptLease(attempt executionAttempt) (func(bool), bool, *
 			release = func(commit bool) {
 				once.Do(func() {
 					adaptiveRelease(commit)
+					baseRelease(commit)
+				})
+			}
+		} else if attempt.AdaptiveShadow && cfg.AdaptiveAllocatorMode == "breaker" {
+			edgeRelease, edgeAcquired, edgeFailure := acquireAdaptiveBreakerEnforcementLease(attempt, adaptiveShadowNow())
+			if edgeFailure != nil || !edgeAcquired {
+				return func(bool) {}, false, edgeFailure
+			}
+			baseRelease, acquired := acquireAttemptLease(attempt)
+			if !acquired {
+				edgeRelease(false)
+				cancelAdaptiveEdgeGateAttempt(attempt)
+				return func(bool) {}, false, nil
+			}
+			var once sync.Once
+			release = func(commit bool) {
+				once.Do(func() {
+					edgeRelease(commit)
 					baseRelease(commit)
 				})
 			}

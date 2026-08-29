@@ -76,7 +76,11 @@ func (r *bravoStreamAttemptRun) execute(req rpcExecutorRequest, protocol string)
 			Message: message,
 			Status:  http.StatusInternalServerError,
 		}
-		r.results <- bravoStreamBootstrapResult{failure: &failure, accepted: true}
+		// The allocator reservation remains committed above because the host
+		// callback may have crossed the provider boundary before panicking. A
+		// panic is not, however, evidence of a provider response: keep adaptive
+		// breaker acceptance false so a protected probe cannot reopen the route.
+		r.results <- bravoStreamBootstrapResult{failure: &failure, accepted: false}
 	}()
 
 	rawResponse, errCall := callHost(pluginabi.MethodHostModelExecuteStream, hostModelExecutionRequest{

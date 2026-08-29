@@ -87,7 +87,9 @@ func execute(raw []byte) ([]byte, error) {
 	blockedModels := make(map[string]bool)
 	contextRouting := newContextRoutingState(req.HostCallbackID)
 	providerCalls := 0
-	for _, attempt := range plan {
+	adaptiveLastChanceAdded := false
+	for attemptIndex := 0; attemptIndex < len(plan); attemptIndex++ {
+		attempt := plan[attemptIndex]
 		if blockedModels[executionFailureModelKey(attempt)] {
 			continue
 		}
@@ -130,6 +132,13 @@ func execute(raw []byte) ([]byte, error) {
 		}
 		releaseLease, acquired, leaseFailure := acquireExecutionAttemptLease(attempt)
 		if leaseFailure != nil {
+			if !adaptiveLastChanceAdded && adaptiveBreakerLastChanceEligible(attempt, *leaseFailure) {
+				// Keep the exact, already validated attempt at the tail of the
+				// request plan. This is a synchronous fail-open: it spends no
+				// provider-call budget unless every ordinary neighbor failed.
+				plan = append(plan, adaptiveBreakerLastChanceAttempt(attempt))
+				adaptiveLastChanceAdded = true
+			}
 			lastFailure = *leaseFailure
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, *leaseFailure)
 			routeTrace.failure(attempt, time.Now(), leaseFailure.Status, *leaseFailure)
@@ -433,6 +442,9 @@ func classifyExecutionError(err error) executionFailure {
 
 func classifyProviderFailureDetail(failure executionFailure, detail providererror.Detail) executionFailure {
 	detail = providererror.Sanitize(detail)
+	if detail.TaxonomyVersion == providererror.FailureTaxonomyV1 {
+		return classifyTaxonomyV1ProviderFailure(failure, detail)
+	}
 	if strings.EqualFold(strings.TrimSpace(detail.Class), "context_window") ||
 		strings.EqualFold(strings.TrimSpace(detail.Code), "context_window_exceeded") ||
 		providerContextWindowSignal(detail.Type, detail.Code, detail.Message, detail.Reason) {
@@ -451,7 +463,6 @@ func classifyProviderFailureDetail(failure executionFailure, detail providererro
 		failure.Provider = &detail
 		return sanitizeExecutionFailure(failure)
 	}
-
 	values := []string{
 		detail.Type,
 		detail.Code,
@@ -495,6 +506,101 @@ func classifyProviderFailureDetail(failure executionFailure, detail providererro
 		detail.DisabledReason,
 		detail.Reason,
 	)
+}
+
+func classifyTaxonomyV1ProviderFailure(failure executionFailure, detail providererror.Detail) executionFailure {
+	failure.Provider = &detail
+	failure.AccountWide = detail.Scope == providererror.ScopeAccount
+	failure.Message = firstNonEmpty(detail.Summary(), failure.Message)
+	switch detail.Class {
+	case providererror.ClassContextWindow:
+		classified := contextExecutionFailure(detail)
+		classified.Headers = cloneHeader(failure.Headers)
+		classified.RetryAfter = failure.RetryAfter
+		return classified
+	case providererror.ClassQuota, providererror.ClassRateLimit:
+		if detail.Class == providererror.ClassQuota && detail.Scope == providererror.ScopeModel &&
+			strings.EqualFold(strings.TrimSpace(detail.Code), "credits_required") {
+			failure.Code = "bravo_subscription_model_credits_exhausted"
+		} else {
+			failure.Code = "bravo_subscription_quota_exhausted"
+		}
+		failure.Status = http.StatusTooManyRequests
+		failure.Retryable = true
+		failure.RouteFallback = true
+	case providererror.ClassInvalidRequest:
+		failure.Code = "bravo_provider_invalid_request"
+		failure.Status = http.StatusBadRequest
+		failure.Retryable = false
+		failure.RouteFallback = ambiguousTaxonomyV1InvalidRequest(detail)
+		if failure.RouteFallback {
+			failure.Code = "bravo_provider_ambiguous_invalid_request"
+		} else if strings.HasPrefix(strings.ToLower(strings.TrimSpace(detail.Code)), "invalid_") ||
+			preciseProviderRequestSignal(detail.Code) {
+			// Keep reviewed, safe parameter diagnostics such as
+			// invalid_parameter/invalid_tool_parameters without allowing a
+			// contradictory legacy class signal to steer classification.
+			failure.Code = detail.Code
+		}
+		failure.AccountWide = false
+		failure.RetryAfter = ""
+	case providererror.ClassPayloadTooLarge:
+		failure.Code, failure.Status = "bravo_provider_payload_too_large", http.StatusRequestEntityTooLarge
+		failure.Retryable, failure.RouteFallback = false, false
+	case providererror.ClassAuthentication:
+		failure.Code, failure.Status = "bravo_provider_authentication_failed", http.StatusUnauthorized
+		failure.Retryable, failure.RouteFallback = true, true
+	case providererror.ClassPermission:
+		failure.Code, failure.Status = "bravo_provider_permission_denied", http.StatusForbidden
+		failure.Retryable, failure.RouteFallback = true, true
+	case providererror.ClassBilling:
+		failure.Code, failure.Status = "bravo_provider_billing_failed", http.StatusPaymentRequired
+		failure.Retryable, failure.RouteFallback = true, true
+	case providererror.ClassNotFound:
+		failure.Code, failure.Status = "bravo_provider_not_found", http.StatusNotFound
+		failure.Retryable, failure.RouteFallback = false, false
+	case providererror.ClassConflict:
+		failure.Code, failure.Status = "bravo_provider_conflict", http.StatusConflict
+		failure.Retryable, failure.RouteFallback = false, false
+	case providererror.ClassTimeout:
+		failure.Code, failure.Status = "bravo_provider_timeout", http.StatusGatewayTimeout
+		failure.Retryable, failure.RouteFallback = true, true
+	case providererror.ClassOverloaded:
+		failure.Code, failure.Status = "bravo_provider_overloaded", http.StatusServiceUnavailable
+		failure.Retryable, failure.RouteFallback = true, true
+	case providererror.ClassProviderInternal:
+		failure.Code, failure.Status = "bravo_provider_internal", http.StatusBadGateway
+		failure.Retryable, failure.RouteFallback = true, true
+	case providererror.ClassTransport:
+		failure.Code, failure.Status = "bravo_provider_transport", http.StatusBadGateway
+		failure.Retryable, failure.RouteFallback = true, true
+	case providererror.ClassCanceled:
+		failure.Code, failure.Status = "request_canceled", 499
+		failure.Retryable, failure.RouteFallback = false, false
+		failure.AccountWide, failure.RetryAfter = false, ""
+	}
+	return sanitizeExecutionFailure(failure)
+}
+
+// TaxonomyV1 already established the failure class, so contradictory legacy
+// Type text cannot decide whether an invalid request is candidate-local. Only
+// a genuinely generic rejection may fall through to a neighboring provider;
+// a stable code, reviewed reason, parameter, or precise safe message is a
+// terminal client-contract failure.
+func ambiguousTaxonomyV1InvalidRequest(detail providererror.Detail) bool {
+	if detail.TaxonomyVersion != providererror.FailureTaxonomyV1 ||
+		detail.Class != providererror.ClassInvalidRequest ||
+		strings.TrimSpace(detail.Parameter) != "" ||
+		strings.TrimSpace(detail.Reason) != "" ||
+		preciseProviderRequestSignal(detail.Message) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(detail.Code)) {
+	case "", "invalid_request", "invalid_request_error", "bad_request_error":
+		return true
+	default:
+		return false
+	}
 }
 
 func classifyReviewedProviderFailureDetail(

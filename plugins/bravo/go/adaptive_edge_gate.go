@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/providererror"
 )
 
 // The edge gate is deliberately simpler than the quota-cost estimator. It
@@ -42,19 +44,30 @@ type adaptiveEdgeGateAttemptState struct {
 	decision     string
 	reason       string
 
-	quotaConfirmed         bool
-	sessionHeadroomPercent float64
-	weeklyHeadroomPercent  float64
-	tripRemainingSeconds   int64
-	outcomeTransition      string
-	started                bool
-	outcomeObserved        bool
-	guardHeld              bool
-	guardLeaseAt           time.Time
-	probeBreakerKey        string
-	enforce                bool
-	quotaFresh             bool
-	compactBypass          bool
+	quotaConfirmed             bool
+	sessionHeadroomPercent     float64
+	weeklyHeadroomPercent      float64
+	tripRemainingSeconds       int64
+	outcomeTransition          string
+	started                    bool
+	outcomeObserved            bool
+	guardHeld                  bool
+	guardLeaseAt               time.Time
+	probeBreakerKey            string
+	probeBreakerGeneration     uint64
+	probeEvidenceRevision      uint64
+	probeLeaseID               uint64
+	breakerCandidateKey        string
+	breakerCandidateGeneration uint64
+	breakerCandidateRevision   uint64
+	recoveryBreakerKey         string
+	recoveryBreakerGeneration  uint64
+	recoveryEvidenceRevision   uint64
+	recoveryLeaseID            uint64
+	enforce                    bool
+	quotaFresh                 bool
+	compactBypass              bool
+	breakerOnly                bool
 }
 
 type adaptiveEdgeGateSnapshot struct {
@@ -70,12 +83,19 @@ type adaptiveEdgeGateSnapshot struct {
 }
 
 type adaptiveEdgeGateBreaker struct {
-	AuthIndex      string
-	Provider       string
-	Model          string
-	Until          time.Time
-	ProbeInFlight  bool
-	ProbeStartedAt time.Time
+	AuthIndex         string
+	Provider          string
+	Model             string
+	Until             time.Time
+	Generation        uint64
+	EvidenceRevision  uint64
+	ProbeInFlight     bool
+	ProbeStartedAt    time.Time
+	ProbeLeaseID      uint64
+	RecoveryInFlight  bool
+	RecoveryStartedAt time.Time
+	RecoveryLeaseID   uint64
+	RecoveryUsed      bool
 }
 
 type adaptiveEdgeGateLease struct {
@@ -84,11 +104,14 @@ type adaptiveEdgeGateLease struct {
 
 var adaptiveEdgeGateRuntime = struct {
 	sync.Mutex
-	InFlight        map[string]adaptiveEdgeGateLease
-	Breakers        map[string]adaptiveEdgeGateBreaker
-	Saturated       bool
-	DroppedLeases   uint64
-	DroppedBreakers uint64
+	InFlight             map[string]adaptiveEdgeGateLease
+	Breakers             map[string]adaptiveEdgeGateBreaker
+	Saturated            bool
+	DroppedLeases        uint64
+	DroppedBreakers      uint64
+	NextGeneration       uint64
+	NextLeaseID          uint64
+	NextEvidenceRevision uint64
 }{
 	InFlight: make(map[string]adaptiveEdgeGateLease),
 	Breakers: make(map[string]adaptiveEdgeGateBreaker),
@@ -156,10 +179,164 @@ func newAdaptiveEdgeGateAttemptState(
 		quotaConfirmed:         confirmed,
 		sessionHeadroomPercent: adaptiveShadowRound(sessionHeadroom),
 		weeklyHeadroomPercent:  adaptiveShadowRound(weeklyHeadroom),
-		enforce:                cfg.AdaptiveAllocatorMode == "enforce",
+		enforce:                adaptiveEdgeRoutingEnforced(cfg),
 		quotaFresh:             quotaFreshnessAt(quota, attempt.Candidate.Model, cfg, now) == quotaFreshnessFresh,
 		compactBypass:          attempt.CompactBypass,
+		breakerOnly:            cfg.AdaptiveAllocatorMode == "breaker",
 	}
+}
+
+// acquireAdaptiveBreakerEnforcementLease applies only an evidence-backed
+// breaker. Forecast headroom remains shadow-only and cannot withhold an
+// attempt in this mode.
+func acquireAdaptiveBreakerEnforcementLease(
+	attempt executionAttempt,
+	now time.Time,
+) (func(bool), bool, *executionFailure) {
+	cfg := loadedConfig()
+	cfg = adaptiveAttemptConfig(attempt, cfg)
+	if cfg.AdaptiveAllocatorMode != "breaker" || !attempt.AdaptiveShadow || attempt.CompactBypass {
+		return wrapAdaptiveShadowLease(attempt, func(bool) {}), true, nil
+	}
+	now = now.UTC()
+	authIndex := strings.TrimSpace(attempt.Auth.AuthIndex)
+	quota := normalizedQuotaState(quotaSnapshot(authIndex))
+	subscription := subscriptionPolicy(cfg, authIndex)
+	tariff := effectiveTariff(cfg, subscription, firstNonEmpty(attempt.Auth.Provider, attempt.Auth.Type), quota)
+	refreshAdaptiveEdgeGateAttemptState(attempt, cfg, quota, tariff, now)
+	if attempt.AdaptiveBreakerLastChance {
+		return acquireAdaptiveBreakerRecoveryLease(attempt, now)
+	}
+	beginAdaptiveEdgeGateShadow(attempt, now)
+	switch attempt.AdaptiveEdgeGate.snapshot().Decision {
+	case adaptiveEdgeGateDecisionSkipBusy:
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_busy",
+			"Адаптивный edge-турникет уже проверяет эту подписку у подтверждённой границы лимита; Bravo сразу продолжил соседний маршрут.",
+		)
+	case adaptiveEdgeGateDecisionSkipTripped:
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_tripped",
+			"Подтверждённая ошибка квоты временно закрыла этот маршрут; Bravo сразу продолжил соседний маршрут.",
+		)
+	default:
+		return adaptiveEnforcementFailOpenLease(attempt), true, nil
+	}
+}
+
+func acquireAdaptiveBreakerRecoveryLease(
+	attempt executionAttempt,
+	now time.Time,
+) (func(bool), bool, *executionFailure) {
+	state := attempt.AdaptiveEdgeGate
+	if state == nil {
+		return adaptiveEnforcementFailOpenLease(attempt), true, nil
+	}
+	key := strings.TrimSpace(attempt.AdaptiveBreakerRecoveryKey)
+	generation := attempt.AdaptiveBreakerRecoveryGeneration
+	revision := attempt.AdaptiveBreakerRecoveryRevision
+	state.mu.Lock()
+	state.started = true
+	state.state = adaptiveEdgeGateStateHalfOpen
+	state.enforce = true
+	state.breakerOnly = true
+	if key == "" || generation == 0 || revision == 0 {
+		state.decision = adaptiveEdgeGateDecisionDispatch
+		state.reason = "breaker_disappeared_last_chance"
+		state.mu.Unlock()
+		return adaptiveEnforcementFailOpenLease(attempt), true, nil
+	}
+
+	adaptiveEdgeGateRuntime.Lock()
+	currentKey, breaker, relevant := adaptiveEdgeGateActiveBreakerLocked(state, now)
+	if !relevant {
+		adaptiveEdgeGateRuntime.Unlock()
+		state.decision = adaptiveEdgeGateDecisionDispatch
+		state.reason = "breaker_disappeared_last_chance"
+		state.mu.Unlock()
+		return adaptiveEnforcementFailOpenLease(attempt), true, nil
+	}
+	if currentKey != key || breaker.Generation != generation || breaker.EvidenceRevision != revision {
+		adaptiveEdgeGateRuntime.Unlock()
+		state.decision = adaptiveEdgeGateDecisionSkipTripped
+		state.reason = "breaker_generation_changed"
+		state.mu.Unlock()
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_tripped",
+			"Маршрут уже закрыт новым поколением breaker; устаревшая recovery-проверка отменена без ожидания.",
+		)
+	}
+	if breaker.ProbeInFlight {
+		adaptiveEdgeGateRuntime.Unlock()
+		state.decision = adaptiveEdgeGateDecisionSkipBusy
+		state.reason = "scheduled_probe_busy"
+		state.mu.Unlock()
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_busy",
+			"Scheduled half-open уже проверяет этот breaker; сохранённая recovery-попытка не запускается параллельно.",
+		)
+	}
+	if breaker.RecoveryInFlight && !breaker.RecoveryStartedAt.IsZero() &&
+		now.Sub(breaker.RecoveryStartedAt) >= adaptiveEdgeGateMaximumLeaseAge {
+		breaker.RecoveryInFlight = false
+		breaker.RecoveryStartedAt = time.Time{}
+		breaker.RecoveryLeaseID = 0
+		adaptiveEdgeGateRuntime.Breakers[key] = breaker
+	}
+	if breaker.RecoveryInFlight {
+		adaptiveEdgeGateRuntime.Unlock()
+		state.decision = adaptiveEdgeGateDecisionSkipBusy
+		state.reason = "recovery_probe_busy"
+		state.mu.Unlock()
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_busy",
+			"Другой запрос уже выполняет единственную recovery-проверку закрытого маршрута; Bravo не ждёт и завершает локальный fallback.",
+		)
+	}
+	if breaker.RecoveryUsed {
+		adaptiveEdgeGateRuntime.Unlock()
+		state.decision = adaptiveEdgeGateDecisionSkipTripped
+		state.reason = "recovery_already_used"
+		state.mu.Unlock()
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_tripped",
+			"Recovery-проверка этого поколения breaker уже использована; Bravo не повторяет обращение к закрытому маршруту.",
+		)
+	}
+	if adaptiveEdgeGateLeaseBusyLocked(state.authIndex, now) {
+		adaptiveEdgeGateRuntime.Unlock()
+		state.decision = adaptiveEdgeGateDecisionSkipBusy
+		state.reason = "proof_auth_busy"
+		state.mu.Unlock()
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_busy",
+			"Другая proof-попытка уже использует эту подписку; recovery не запускается параллельно.",
+		)
+	}
+	if !adaptiveEdgeGateAcquireLeaseLocked(state, now) {
+		adaptiveEdgeGateRuntime.Unlock()
+		state.decision = adaptiveEdgeGateDecisionSkipBusy
+		state.reason = "proof_coordination_saturated"
+		state.mu.Unlock()
+		return func(bool) {}, false, adaptiveEnforcementFailure(
+			"bravo_adaptive_edge_busy",
+			"Координация recovery временно насыщена; защищённая попытка не отправлена повторно.",
+		)
+	}
+	breaker.RecoveryInFlight = true
+	breaker.RecoveryStartedAt = now
+	breaker.RecoveryLeaseID = adaptiveEdgeGateNextLeaseIDLocked()
+	breaker.RecoveryUsed = true
+	adaptiveEdgeGateRuntime.Breakers[key] = breaker
+	adaptiveEdgeGateRuntime.Unlock()
+	state.decision = adaptiveEdgeGateDecisionProbe
+	state.reason = "breaker_recovery_probe"
+	state.recoveryBreakerKey = key
+	state.recoveryBreakerGeneration = generation
+	state.recoveryEvidenceRevision = revision
+	state.recoveryLeaseID = breaker.RecoveryLeaseID
+	state.mu.Unlock()
+	return adaptiveEnforcementFailOpenLease(attempt), true, nil
 }
 
 func (state *adaptiveEdgeGateAttemptState) snapshot() adaptiveEdgeGateSnapshot {
@@ -220,6 +397,7 @@ func refreshAdaptiveEdgeGateAttemptState(
 	state.enforce = refreshed.enforce
 	state.quotaFresh = refreshed.quotaFresh
 	state.compactBypass = refreshed.compactBypass
+	state.breakerOnly = refreshed.breakerOnly
 }
 
 func beginAdaptiveEdgeGateShadow(attempt executionAttempt, now time.Time) {
@@ -250,6 +428,17 @@ func beginAdaptiveEdgeGateShadow(attempt executionAttempt, now time.Time) {
 
 	breakerKey, breaker, found := adaptiveEdgeGateActiveBreakerLocked(state, now)
 	if found {
+		if breaker.Generation == 0 {
+			breaker.Generation = adaptiveEdgeGateNextGenerationLocked()
+			adaptiveEdgeGateRuntime.Breakers[breakerKey] = breaker
+		}
+		if breaker.EvidenceRevision == 0 {
+			breaker.EvidenceRevision = adaptiveEdgeGateNextEvidenceRevisionLocked()
+			adaptiveEdgeGateRuntime.Breakers[breakerKey] = breaker
+		}
+		state.breakerCandidateKey = breakerKey
+		state.breakerCandidateGeneration = breaker.Generation
+		state.breakerCandidateRevision = breaker.EvidenceRevision
 		if breaker.Until.After(now) {
 			state.state = adaptiveEdgeGateStateTripped
 			state.decision = adaptiveEdgeGateDecisionSkipTripped
@@ -257,7 +446,8 @@ func beginAdaptiveEdgeGateShadow(attempt executionAttempt, now time.Time) {
 			state.tripRemainingSeconds = adaptiveEdgeGateRemainingSeconds(breaker.Until, now)
 			return
 		}
-		if adaptiveEdgeGateLeaseBusyLocked(state.authIndex, now) || breaker.ProbeInFlight {
+		if adaptiveEdgeGateLeaseBusyLocked(state.authIndex, now) || breaker.ProbeInFlight ||
+			breaker.RecoveryInFlight {
 			state.state = adaptiveEdgeGateStateHalfOpen
 			state.decision = adaptiveEdgeGateDecisionSkipBusy
 			state.reason = "half_open_probe_busy"
@@ -265,17 +455,39 @@ func beginAdaptiveEdgeGateShadow(attempt executionAttempt, now time.Time) {
 		}
 		if !adaptiveEdgeGateAcquireLeaseLocked(state, now) {
 			state.state = adaptiveEdgeGateStateHalfOpen
-			state.decision = adaptiveEdgeGateDecisionDispatch
-			state.reason = "runtime_saturated_fail_open"
+			if state.breakerOnly {
+				state.decision = adaptiveEdgeGateDecisionSkipBusy
+				state.reason = "proof_coordination_saturated"
+			} else {
+				state.decision = adaptiveEdgeGateDecisionDispatch
+				state.reason = "runtime_saturated_fail_open"
+			}
 			return
 		}
 		breaker.ProbeInFlight = true
 		breaker.ProbeStartedAt = now
+		breaker.ProbeLeaseID = adaptiveEdgeGateNextLeaseIDLocked()
 		adaptiveEdgeGateRuntime.Breakers[breakerKey] = breaker
 		state.state = adaptiveEdgeGateStateHalfOpen
 		state.decision = adaptiveEdgeGateDecisionProbe
 		state.reason = adaptiveEdgeGateBreakerReason(breaker)
 		state.probeBreakerKey = breakerKey
+		state.probeBreakerGeneration = breaker.Generation
+		state.probeEvidenceRevision = breaker.EvidenceRevision
+		state.probeLeaseID = breaker.ProbeLeaseID
+		return
+	}
+	if state.breakerOnly {
+		state.state = state.staticState
+		state.decision = adaptiveEdgeGateDecisionDispatch
+		switch {
+		case !state.quotaConfirmed:
+			state.reason = "quota_unconfirmed_fail_open"
+		case !state.quotaFresh:
+			state.reason = "quota_stale_fail_open"
+		default:
+			state.reason = "breaker_clear"
+		}
 		return
 	}
 
@@ -356,12 +568,29 @@ func releaseAdaptiveEdgeGateStateLocked(state *adaptiveEdgeGateAttemptState) {
 		state.guardHeld = false
 	}
 	if state.probeBreakerKey != "" {
-		if breaker, ok := adaptiveEdgeGateRuntime.Breakers[state.probeBreakerKey]; ok {
+		if breaker, ok := adaptiveEdgeGateRuntime.Breakers[state.probeBreakerKey]; ok &&
+			breaker.Generation == state.probeBreakerGeneration && breaker.ProbeInFlight &&
+			breaker.ProbeLeaseID == state.probeLeaseID {
 			breaker.ProbeInFlight = false
 			breaker.ProbeStartedAt = time.Time{}
+			breaker.ProbeLeaseID = 0
 			adaptiveEdgeGateRuntime.Breakers[state.probeBreakerKey] = breaker
 		}
 		state.probeBreakerKey = ""
+	}
+	if state.recoveryBreakerKey != "" {
+		if breaker, ok := adaptiveEdgeGateRuntime.Breakers[state.recoveryBreakerKey]; ok &&
+			breaker.Generation == state.recoveryBreakerGeneration && breaker.RecoveryInFlight &&
+			breaker.RecoveryLeaseID == state.recoveryLeaseID {
+			breaker.RecoveryInFlight = false
+			breaker.RecoveryStartedAt = time.Time{}
+			breaker.RecoveryLeaseID = 0
+			if breaker.EvidenceRevision == state.recoveryEvidenceRevision {
+				breaker.RecoveryUsed = false
+			}
+			adaptiveEdgeGateRuntime.Breakers[state.recoveryBreakerKey] = breaker
+		}
+		state.recoveryBreakerKey = ""
 	}
 }
 
@@ -369,10 +598,20 @@ func adaptiveEdgeGateActiveBreakerLocked(
 	state *adaptiveEdgeGateAttemptState,
 	now time.Time,
 ) (string, adaptiveEdgeGateBreaker, bool) {
+	type candidateBreaker struct {
+		key     string
+		breaker adaptiveEdgeGateBreaker
+	}
+	candidates := make([]candidateBreaker, 0, 2)
+	seen := make(map[string]struct{}, 2)
 	for _, key := range []string{
 		adaptiveEdgeGateBreakerKey(state.provider, state.authIndex, ""),
 		adaptiveEdgeGateBreakerKey(state.provider, state.authIndex, state.model),
 	} {
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
 		breaker, ok := adaptiveEdgeGateRuntime.Breakers[key]
 		if !ok {
 			continue
@@ -381,9 +620,30 @@ func adaptiveEdgeGateActiveBreakerLocked(
 			now.Sub(breaker.ProbeStartedAt) >= adaptiveEdgeGateMaximumLeaseAge {
 			breaker.ProbeInFlight = false
 			breaker.ProbeStartedAt = time.Time{}
+			breaker.ProbeLeaseID = 0
 			adaptiveEdgeGateRuntime.Breakers[key] = breaker
 		}
-		return key, breaker, true
+		if breaker.RecoveryInFlight && !breaker.RecoveryStartedAt.IsZero() &&
+			now.Sub(breaker.RecoveryStartedAt) >= adaptiveEdgeGateMaximumLeaseAge {
+			breaker.RecoveryInFlight = false
+			breaker.RecoveryStartedAt = time.Time{}
+			breaker.RecoveryLeaseID = 0
+			adaptiveEdgeGateRuntime.Breakers[key] = breaker
+		}
+		candidates = append(candidates, candidateBreaker{key: key, breaker: breaker})
+	}
+	// Candidate order is account then current model. Prefer an actually active
+	// proof in that order; an expired account breaker must never hide a live
+	// model breaker. Only when neither is active do we choose the deterministic
+	// expired proof candidate for half-open.
+	for _, candidate := range candidates {
+		breaker := candidate.breaker
+		if breaker.Until.After(now) || breaker.ProbeInFlight || breaker.RecoveryInFlight {
+			return candidate.key, breaker, true
+		}
+	}
+	if len(candidates) > 0 {
+		return candidates[0].key, candidates[0].breaker, true
 	}
 	return "", adaptiveEdgeGateBreaker{}, false
 }
@@ -455,12 +715,111 @@ func observeAdaptiveEdgeGateOutcome(
 	}
 
 	quotaFailure := !success && adaptiveEdgeGateQuotaFailure(failure)
+	_, reviewedProviderOutcome := adaptiveEdgeGateReviewedProviderDetail(failure)
+	conclusive := success || attempt.AdaptiveProviderAccepted || reviewedProviderOutcome
+	if state.recoveryBreakerKey != "" {
+		breaker, exists := adaptiveEdgeGateRuntime.Breakers[state.recoveryBreakerKey]
+		if exists && breaker.Generation == state.recoveryBreakerGeneration && breaker.EvidenceRevision == state.recoveryEvidenceRevision &&
+			breaker.RecoveryInFlight && breaker.RecoveryLeaseID == state.recoveryLeaseID {
+			breaker.RecoveryInFlight = false
+			breaker.RecoveryStartedAt = time.Time{}
+			breaker.RecoveryLeaseID = 0
+			if !quotaFailure && !conclusive {
+				breaker.RecoveryUsed = true
+				adaptiveEdgeGateExtendBreakerUntil(&breaker, failure, now)
+				adaptiveEdgeGateRuntime.Breakers[state.recoveryBreakerKey] = breaker
+				state.outcomeTransition = "recovery_inconclusive_retripped"
+				return
+			}
+			if !quotaFailure {
+				delete(adaptiveEdgeGateRuntime.Breakers, state.recoveryBreakerKey)
+				state.outcomeTransition = "reopened_recovery"
+				return
+			}
+			breaker.RecoveryUsed = true
+			breaker.EvidenceRevision = adaptiveEdgeGateNextEvidenceRevisionLocked()
+			adaptiveEdgeGateExtendBreakerUntil(&breaker, failure, now)
+			targetKey := state.recoveryBreakerKey
+			if adaptiveEdgeGateAccountWideQuotaFailure(failure) && breaker.Model != "" {
+				delete(adaptiveEdgeGateRuntime.Breakers, state.recoveryBreakerKey)
+				breaker.Model = ""
+				targetKey = adaptiveEdgeGateBreakerKey(breaker.Provider, breaker.AuthIndex, "")
+				if existing, ok := adaptiveEdgeGateRuntime.Breakers[targetKey]; ok {
+					newRevision := breaker.EvidenceRevision
+					if breaker.Until.After(existing.Until) {
+						existing.Until = breaker.Until
+					}
+					existing.RecoveryUsed = existing.RecoveryUsed || breaker.RecoveryUsed ||
+						existing.ProbeInFlight || existing.RecoveryInFlight
+					existing.EvidenceRevision = newRevision
+					breaker = existing
+				}
+			}
+			adaptiveEdgeGateRuntime.Breakers[targetKey] = breaker
+			if targetKey == state.recoveryBreakerKey {
+				state.outcomeTransition = "retripped_recovery"
+			} else {
+				state.outcomeTransition = "retripped_recovery_account"
+			}
+			return
+		}
+		if exists && breaker.Generation == state.recoveryBreakerGeneration &&
+			breaker.RecoveryInFlight && breaker.RecoveryLeaseID == state.recoveryLeaseID {
+			breaker.RecoveryInFlight = false
+			breaker.RecoveryStartedAt = time.Time{}
+			breaker.RecoveryLeaseID = 0
+			if quotaFailure {
+				breaker.RecoveryUsed = true
+				breaker.EvidenceRevision = adaptiveEdgeGateNextEvidenceRevisionLocked()
+				adaptiveEdgeGateExtendBreakerUntil(&breaker, failure, now)
+			}
+			adaptiveEdgeGateStoreStaleQuotaEvidenceLocked(state.recoveryBreakerKey, breaker, failure)
+			state.outcomeTransition = "stale_newer_evidence"
+			return
+		}
+		state.outcomeTransition = "stale_recovery_outcome"
+		return
+	}
+	probeRetrip := false
+	probeGeneration := uint64(0)
 	if state.probeBreakerKey != "" {
+		probeGeneration = state.probeBreakerGeneration
+		breaker, exists := adaptiveEdgeGateRuntime.Breakers[state.probeBreakerKey]
+		if !exists || breaker.Generation != state.probeBreakerGeneration || breaker.EvidenceRevision != state.probeEvidenceRevision ||
+			!breaker.ProbeInFlight || breaker.ProbeLeaseID != state.probeLeaseID {
+			if exists && breaker.Generation == state.probeBreakerGeneration &&
+				breaker.ProbeInFlight && breaker.ProbeLeaseID == state.probeLeaseID {
+				breaker.ProbeInFlight = false
+				breaker.ProbeStartedAt = time.Time{}
+				breaker.ProbeLeaseID = 0
+				if quotaFailure {
+					breaker.RecoveryUsed = true
+					breaker.EvidenceRevision = adaptiveEdgeGateNextEvidenceRevisionLocked()
+					adaptiveEdgeGateExtendBreakerUntil(&breaker, failure, now)
+				}
+				adaptiveEdgeGateStoreStaleQuotaEvidenceLocked(state.probeBreakerKey, breaker, failure)
+				state.outcomeTransition = "stale_newer_evidence"
+				return
+			}
+			state.outcomeTransition = "stale_probe_outcome"
+			return
+		}
+		if !quotaFailure && !conclusive {
+			breaker.ProbeInFlight = false
+			breaker.ProbeStartedAt = time.Time{}
+			breaker.ProbeLeaseID = 0
+			breaker.RecoveryUsed = true
+			adaptiveEdgeGateExtendBreakerUntil(&breaker, failure, now)
+			adaptiveEdgeGateRuntime.Breakers[state.probeBreakerKey] = breaker
+			state.outcomeTransition = "probe_inconclusive_retripped"
+			return
+		}
 		delete(adaptiveEdgeGateRuntime.Breakers, state.probeBreakerKey)
 		if !quotaFailure {
 			state.outcomeTransition = "reopened"
 			return
 		}
+		probeRetrip = true
 	}
 	if !quotaFailure {
 		state.outcomeTransition = "unchanged"
@@ -469,18 +828,44 @@ func observeAdaptiveEdgeGateOutcome(
 
 	until := failureCooldownUntil(failure, now)
 	model := state.model
-	explicitModelScope := failure.Provider != nil &&
-		strings.EqualFold(strings.TrimSpace(failure.Provider.Scope), "model")
-	if !explicitModelScope && (failure.AccountWide || accountWideCooldownStatus(failure.Status)) {
+	if adaptiveEdgeGateAccountWideQuotaFailure(failure) {
 		model = ""
 	}
 	breaker := adaptiveEdgeGateBreaker{
-		AuthIndex: state.authIndex,
-		Provider:  state.provider,
-		Model:     model,
-		Until:     until.UTC(),
+		AuthIndex:        state.authIndex,
+		Provider:         state.provider,
+		Model:            model,
+		Until:            until.UTC(),
+		Generation:       adaptiveEdgeGateNextGenerationLocked(),
+		EvidenceRevision: adaptiveEdgeGateNextEvidenceRevisionLocked(),
+	}
+	if probeRetrip {
+		breaker.Generation = probeGeneration
+		if breaker.Generation == 0 {
+			breaker.Generation = adaptiveEdgeGateNextGenerationLocked()
+		}
+		breaker.RecoveryUsed = true
 	}
 	key := adaptiveEdgeGateBreakerKey(state.provider, state.authIndex, model)
+	if existing, exists := adaptiveEdgeGateRuntime.Breakers[key]; exists {
+		// Concurrent real failures belong to the same breaker lifecycle. Never
+		// erase an active/used recovery token by replacing the struct.
+		breaker.Generation = existing.Generation
+		// New evidence advances the revision but cannot pretend an older
+		// physical provider call stopped. Preserve its lease so peers remain
+		// busy; the late owner may clear only its matching lease ID.
+		breaker.ProbeInFlight = existing.ProbeInFlight
+		breaker.ProbeStartedAt = existing.ProbeStartedAt
+		breaker.ProbeLeaseID = existing.ProbeLeaseID
+		breaker.RecoveryInFlight = existing.RecoveryInFlight
+		breaker.RecoveryStartedAt = existing.RecoveryStartedAt
+		breaker.RecoveryLeaseID = existing.RecoveryLeaseID
+		breaker.RecoveryUsed = existing.RecoveryUsed || breaker.RecoveryUsed ||
+			existing.ProbeInFlight || existing.RecoveryInFlight
+		if existing.Until.After(breaker.Until) {
+			breaker.Until = existing.Until
+		}
+	}
 	if _, exists := adaptiveEdgeGateRuntime.Breakers[key]; !exists &&
 		len(adaptiveEdgeGateRuntime.Breakers) >= adaptiveEdgeGateMaximumBreakers {
 		adaptiveEdgeGateRuntime.Saturated = true
@@ -498,29 +883,88 @@ func observeAdaptiveEdgeGateOutcome(
 }
 
 func adaptiveEdgeGateQuotaFailure(failure executionFailure) bool {
-	if failure.Status == 429 || adaptiveShadowAuditQuotaFailure(failure.Code) {
-		return true
+	if detail, reviewed := adaptiveEdgeGateReviewedProviderDetail(failure); reviewed {
+		return (detail.Class == providererror.ClassQuota || detail.Class == providererror.ClassRateLimit) &&
+			(detail.Scope == providererror.ScopeModel || detail.Scope == providererror.ScopeAccount)
 	}
+	return failure.Status == 429
+}
+
+func adaptiveEdgeGateAccountWideQuotaFailure(failure executionFailure) bool {
+	detail, reviewed := adaptiveEdgeGateReviewedProviderDetail(failure)
+	return reviewed &&
+		(detail.Class == providererror.ClassQuota || detail.Class == providererror.ClassRateLimit) &&
+		detail.Scope == providererror.ScopeAccount
+}
+
+func adaptiveEdgeGateReviewedProviderDetail(failure executionFailure) (providererror.Detail, bool) {
 	if failure.Provider == nil {
-		return false
+		return providererror.Detail{}, false
 	}
-	for _, value := range []string{
-		failure.Provider.Code,
-		failure.Provider.Type,
-		failure.Provider.Reason,
-		failure.Provider.Class,
-	} {
-		value = strings.ToLower(strings.TrimSpace(value))
-		if strings.Contains(value, "quota") || strings.Contains(value, "rate_limit") ||
-			strings.Contains(value, "usage_limit") || strings.Contains(value, "credits_exhausted") {
-			return true
-		}
-	}
-	return false
+	detail := providererror.Sanitize(*failure.Provider)
+	return detail, detail.TaxonomyVersion == providererror.FailureTaxonomyV1
 }
 
 func adaptiveEdgeGateBreakerKey(provider, authIndex, model string) string {
 	return normalizeProvider(provider) + "\x00" + strings.TrimSpace(authIndex) + "\x00" + baseModelKey(strings.TrimSpace(model))
+}
+
+func adaptiveEdgeGateNextGenerationLocked() uint64 {
+	adaptiveEdgeGateRuntime.NextGeneration++
+	if adaptiveEdgeGateRuntime.NextGeneration == 0 {
+		adaptiveEdgeGateRuntime.NextGeneration++
+	}
+	return adaptiveEdgeGateRuntime.NextGeneration
+}
+
+func adaptiveEdgeGateNextLeaseIDLocked() uint64 {
+	adaptiveEdgeGateRuntime.NextLeaseID++
+	if adaptiveEdgeGateRuntime.NextLeaseID == 0 {
+		adaptiveEdgeGateRuntime.NextLeaseID++
+	}
+	return adaptiveEdgeGateRuntime.NextLeaseID
+}
+
+func adaptiveEdgeGateNextEvidenceRevisionLocked() uint64 {
+	adaptiveEdgeGateRuntime.NextEvidenceRevision++
+	if adaptiveEdgeGateRuntime.NextEvidenceRevision == 0 {
+		adaptiveEdgeGateRuntime.NextEvidenceRevision++
+	}
+	return adaptiveEdgeGateRuntime.NextEvidenceRevision
+}
+
+func adaptiveEdgeGateExtendBreakerUntil(breaker *adaptiveEdgeGateBreaker, failure executionFailure, now time.Time) {
+	if breaker == nil {
+		return
+	}
+	until := failureCooldownUntil(failure, now).UTC()
+	if !until.After(now) {
+		until = now.Add(time.Second)
+	}
+	if until.After(breaker.Until) {
+		breaker.Until = until
+	}
+}
+
+func adaptiveEdgeGateStoreStaleQuotaEvidenceLocked(oldKey string, breaker adaptiveEdgeGateBreaker, failure executionFailure) {
+	if !adaptiveEdgeGateAccountWideQuotaFailure(failure) || breaker.Model == "" {
+		adaptiveEdgeGateRuntime.Breakers[oldKey] = breaker
+		return
+	}
+	delete(adaptiveEdgeGateRuntime.Breakers, oldKey)
+	breaker.Model = ""
+	breaker.RecoveryUsed = true
+	targetKey := adaptiveEdgeGateBreakerKey(breaker.Provider, breaker.AuthIndex, "")
+	if existing, ok := adaptiveEdgeGateRuntime.Breakers[targetKey]; ok {
+		newRevision := breaker.EvidenceRevision
+		if breaker.Until.After(existing.Until) {
+			existing.Until = breaker.Until
+		}
+		existing.EvidenceRevision = newRevision
+		existing.RecoveryUsed = true
+		breaker = existing
+	}
+	adaptiveEdgeGateRuntime.Breakers[targetKey] = breaker
 }
 
 func adaptiveEdgeGateBreakerReason(breaker adaptiveEdgeGateBreaker) string {
@@ -548,7 +992,7 @@ func adaptiveEdgeGateSummary(cfg pluginConfig, authIndexes []string, now time.Ti
 	view := adaptiveEdgeGatePublicView{
 		Mode:                       cfg.AdaptiveAllocatorMode,
 		Effect:                     adaptiveShadowEffect(cfg),
-		RoutingEnforced:            cfg.AdaptiveAllocatorMode == "enforce",
+		RoutingEnforced:            adaptiveEdgeRoutingEnforced(cfg),
 		QueuesRequests:             false,
 		AdditionalProviderRequests: false,
 		SessionGuardPercent:        adaptiveEdgeGateSessionGuardPercent,
@@ -557,6 +1001,8 @@ func adaptiveEdgeGateSummary(cfg pluginConfig, authIndexes []string, now time.Ti
 	}
 	if cfg.AdaptiveAllocatorMode == "off" {
 		view.Note = "Shadow-турникет отключён вместе с адаптивным наблюдением."
+	} else if cfg.AdaptiveAllocatorMode == "breaker" {
+		view.Note = "Боевой breaker закрывает маршрут только после фактической доверенной ошибки квоты/rate-limit; прогноз headroom остаётся теневым, очередей нет."
 	} else if cfg.AdaptiveAllocatorMode == "enforce" {
 		view.Note = "Турникет мгновенно пропускает подтверждённо опасную попытку и продолжает соседний маршрут; неизвестные и устаревшие квоты fail-open, очередей нет."
 	}
@@ -582,7 +1028,7 @@ func adaptiveEdgeGateSummary(cfg pluginConfig, authIndexes []string, now time.Ti
 			}
 		}
 		view.TrackedBreakers++
-		if breaker.ProbeInFlight {
+		if breaker.ProbeInFlight || breaker.RecoveryInFlight {
 			view.HalfOpenProbes++
 		}
 	}
@@ -599,5 +1045,8 @@ func resetAdaptiveEdgeGateForTest() {
 	adaptiveEdgeGateRuntime.Saturated = false
 	adaptiveEdgeGateRuntime.DroppedLeases = 0
 	adaptiveEdgeGateRuntime.DroppedBreakers = 0
+	adaptiveEdgeGateRuntime.NextGeneration = 0
+	adaptiveEdgeGateRuntime.NextLeaseID = 0
+	adaptiveEdgeGateRuntime.NextEvidenceRevision = 0
 	adaptiveEdgeGateRuntime.Unlock()
 }

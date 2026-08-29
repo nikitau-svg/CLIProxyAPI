@@ -52,11 +52,12 @@ plugins:
       fallback_hedge_delay_seconds: 40
       state_path: bravo-data/bravo-state.json
       allocator_mode: enforce
-      # preview.11: enforce skips only a confirmed unsafe local attempt and
-      # immediately continues the configured neighboring route. It never waits,
-      # queues, or performs an extra provider/quota request. Use observe for a
-      # behavior-preserving canary, or off to disable adaptive telemetry.
-      adaptive_allocator_mode: enforce
+      # preview.12: breaker reacts only to a real, reviewed quota/rate-limit
+      # failure and immediately continues the configured neighboring route.
+      # Forecasts remain shadow-only; there are no queues or background calls,
+      # and at most one global single-flight recovery probe per breaker
+      # generation prevents subscription retry stampedes.
+      adaptive_allocator_mode: breaker
       quota_refresh_seconds: 60
       unknown_secondary_policy: block
       smart_keys: []

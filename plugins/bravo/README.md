@@ -153,27 +153,42 @@ additional provider requests.
 
 ## Adaptive allocator 0.9 preview
 
-Preview.11 promotes the reviewed adaptive gate to an explicit, reversible
-runtime mode. The default remains `observe`; production routing changes happen
-only when the operator sets `adaptive_allocator_mode: enforce`.
+Preview.12 adds a narrow, reversible production breaker while keeping the
+forecast experimental. The default remains `observe`; the recommended
+production routing change is explicit `adaptive_allocator_mode: breaker`.
 
 The modes have deliberately small contracts:
 
 - `off` disables adaptive telemetry and routing decisions;
 - `observe` records the counterfactual decision while preserving the ordinary
   allocator's attempt order, provider-call count, fallback and responses;
+- `breaker` never applies token/headroom forecasts. It skips an auth/model only
+  behind a breaker created by a real reviewed quota/rate-limit failure, then
+  immediately continues the configured neighboring route. If no neighbor
+  answers and the configured provider-call budget remains, one original
+  attempt may run as a global single-flight recovery probe. At most one such
+  call is dispatched per breaker generation; scheduled and recovery proofs
+  share one per-subscription turnstile across model/account scope, and
+  competing requests never wait. A late proof cannot erase newer quota
+  evidence. Local cancellation or bootstrap failure is inconclusive and keeps
+  the breaker closed. A local `bravo_adaptive_*` decision can never become the final client error; an
+  exhausted operator `max_attempts` may still return the ordinary aggregate
+  route failure produced by real neighboring attempts;
 - `enforce` atomically reserves the predicted session and weekly/model-weekly
   cost against a fresh, provider-confirmed quota. If the current attempt is
   confirmed unsafe, busy at the guarded edge, or behind a provider-confirmed
-  breaker, it is not dispatched and Bravo immediately continues the already
-  configured neighboring account/model route.
+  breaker, it is not dispatched. This full forecast mode remains experimental
+  and is not the production default.
 
-`enforce` never waits, creates a cross-project queue, wakes quota polling or
-adds a provider request. Unknown or stale quota, an unavailable estimate, and
-bounded-runtime saturation all fail open to the ordinary allocator. The
-ordinary allocator remains authoritative for project allowlists, ownership,
-disabled credentials, cooldowns and tariff floors. A primary has a zero
-owner floor but confirmed zero quota is still exhausted.
+Neither `breaker` nor `enforce` waits, creates a cross-project queue, wakes
+quota polling or adds background provider requests. Unknown state and
+forecast-runtime saturation fail open to the ordinary allocator. Once a real
+breaker exists, coordination saturation is intentionally fail-closed for that
+single protected proof: it is skipped locally rather than risking a provider
+stampede. The ordinary allocator remains
+authoritative for project allowlists, ownership, disabled credentials,
+cooldowns and tariff floors. A primary has a zero owner floor but confirmed
+zero quota is still exhausted.
 
 The ordinary allocator's narrow scheduled-reset bypass is stampede-safe too.
 When a confirmed zero belongs to an already elapsed reset but the background
@@ -207,7 +222,9 @@ default and become exactly inert after thirty minutes. Runtime state is bounded
 to 4096 tracked identities, 256 cooled commitments per identity and 512 live
 forecast reservations per identity; stale live leases recover after two hours.
 Edge leases and breakers are separately bounded. Saturation is visible and
-fail-open. Runtime state is intentionally discarded on restart. The standard
+fail-open for shadow/forecast work; protected scheduled and recovery proofs
+are the narrow fail-closed local-skip exception. Runtime state is intentionally
+discarded on restart. The standard
 Management Center, `/v1/bravo/limits`, and `/v1/bravo/routes` show the current
 mode and aggregate cooling state without credential identities.
 
@@ -331,7 +348,7 @@ plugins:
       max_attempts: 0
       cooldown_seconds: 30
       compact_bypass_cooldown_seconds: 900
-      adaptive_allocator_mode: observe # off, observe, or explicit enforce
+      adaptive_allocator_mode: observe # off, observe, breaker, or experimental enforce
       smart_keys:
         - id: prj_example
           name: default-project
@@ -628,12 +645,12 @@ Chrome/Playwright desktop/mobile QA. A backend-only release may reuse the exact
 previously verified UI artifact when its pinned commit and SHA-256 are recorded
 and the served bytes are verified after cutover.
 
-Preview.11 has no one-shot migration. Preserve the mounted auth directory,
+Preview.12 has no one-shot migration. Preserve the mounted auth directory,
 configuration and `bravo-data` volume; retain the previous image plus a
 pre-cutover state copy. For a conservative canary, start with
 `adaptive_allocator_mode: observe`, run the protocol/management smokes and
 inspect `/v0/management/bravo/adaptive-audit`. Then hot-reload explicit
-`enforce`. Returning to `observe` is the first rollback; restoring the retained
+`breaker`. Returning to `observe` is the first rollback; restoring the retained
 0.8.11 image and its state copy is the stable rollback. Never delete auth or
 usage state to perform a rollback.
 

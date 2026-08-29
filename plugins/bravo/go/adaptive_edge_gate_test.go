@@ -183,7 +183,11 @@ func TestAdaptiveEdgeGateUsesModelAndAccountBreakerScopes(t *testing.T) {
 	beginAdaptiveEdgeGateShadow(accountFailure, now.Add(2*time.Second))
 	observeAdaptiveEdgeGateOutcome(accountFailure, false, executionFailure{
 		Code: "bravo_subscription_quota_exhausted", Status: http.StatusForbidden,
-		AccountWide: true, RetryAfter: "60",
+		AccountWide: true, RetryAfter: "60", Provider: &providererror.Detail{
+			TaxonomyVersion: providererror.FailureTaxonomyV1,
+			Class:           providererror.ClassQuota,
+			Scope:           providererror.ScopeAccount,
+		},
 	}, now.Add(2*time.Second))
 	allModels := adaptiveEdgeGateTestAttempt("scoped-auth", "claude-sonnet-5", 50, 50, now)
 	beginAdaptiveEdgeGateShadow(allModels, now.Add(3*time.Second))
@@ -225,6 +229,39 @@ func TestAdaptiveEdgeGateUnknownQuotaIsGuardedAndRuntimeSaturationFailsOpen(t *t
 	view := adaptiveEdgeGateSummary(defaultPluginConfig(), nil, now)
 	if !view.Saturated || view.DroppedLeases != 1 || view.RoutingEnforced || view.QueuesRequests {
 		t.Fatalf("saturated view=%#v", view)
+	}
+}
+
+func TestAdaptiveEdgeGateSummaryCountsEveryProtectedHalfOpenCallOnce(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		probeInFlight    bool
+		recoveryInFlight bool
+	}{
+		{name: "scheduled probe", probeInFlight: true},
+		{name: "retained-tail recovery", recoveryInFlight: true},
+		{name: "defensive overlap", probeInFlight: true, recoveryInFlight: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetAdaptiveEdgeGateForTest()
+			t.Cleanup(resetAdaptiveEdgeGateForTest)
+			now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+			adaptiveEdgeGateRuntime.Lock()
+			adaptiveEdgeGateRuntime.Breakers[adaptiveEdgeGateBreakerKey("claude", "summary-auth", "claude-opus-5")] = adaptiveEdgeGateBreaker{
+				AuthIndex:        "summary-auth",
+				Provider:         "claude",
+				Model:            "claude-opus-5",
+				Until:            now.Add(time.Minute),
+				ProbeInFlight:    test.probeInFlight,
+				RecoveryInFlight: test.recoveryInFlight,
+			}
+			adaptiveEdgeGateRuntime.Unlock()
+
+			view := adaptiveEdgeGateSummary(defaultPluginConfig(), []string{"summary-auth"}, now)
+			if view.HalfOpenProbes != 1 {
+				t.Fatalf("half-open calls=%d, want 1 (view=%#v)", view.HalfOpenProbes, view)
+			}
+		})
 	}
 }
 

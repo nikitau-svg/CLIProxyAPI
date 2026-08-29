@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.9.0-preview.11"
+	pluginVersion    = "0.9.0-preview.12"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -196,14 +196,18 @@ type executionAttempt struct {
 	// AllocatorBypassProbe is shared by copies of a bypass attempt so the
 	// execution path can atomically move a scheduled-reset probe from reserved
 	// to consumed at the exact point where provider dispatch begins.
-	AllocatorBypassProbe                  *allocatorBypassProbeAttemptState
-	ReservationPercent                    float64
-	TariffID                              string
-	CompactBypass                         bool
-	CompactBypassKey                      string
-	CompactBypassCooldownSeconds          int
-	PreflightRejections                   []candidateRejection
-	AdaptiveShadow                        bool
+	AllocatorBypassProbe         *allocatorBypassProbeAttemptState
+	ReservationPercent           float64
+	TariffID                     string
+	CompactBypass                bool
+	CompactBypassKey             string
+	CompactBypassCooldownSeconds int
+	PreflightRejections          []candidateRejection
+	AdaptiveShadow               bool
+	// AdaptiveAllocatorMode is the immutable routing authority captured when
+	// this request plan is built. Hot reload may update tuning inputs for later
+	// requests, but must not change observe/breaker/enforce within this one.
+	AdaptiveAllocatorMode                 string
 	AdaptiveReservationPercent            float64
 	AdaptiveSessionReservationPercent     float64
 	AdaptiveWeeklyReservationPercent      float64
@@ -220,6 +224,10 @@ type executionAttempt struct {
 	AdaptiveShadowHeadroomAfter           float64
 	AdaptiveProviderDispatched            bool
 	AdaptiveProviderAccepted              bool
+	AdaptiveBreakerLastChance             bool
+	AdaptiveBreakerRecoveryKey            string
+	AdaptiveBreakerRecoveryGeneration     uint64
+	AdaptiveBreakerRecoveryRevision       uint64
 	// AdaptiveEdgeGate is runtime-only shadow state. Copies of an execution
 	// attempt intentionally share this pointer so streaming and non-streaming
 	// completion paths settle the same simulated lease exactly once.

@@ -45,6 +45,7 @@ type projectRoutePolicyView struct {
 	AdaptiveAllocatorMode              string `json:"adaptive_allocator_mode"`
 	AdaptiveAllocatorEffect            string `json:"adaptive_allocator_effect"`
 	AdaptiveRoutingEnforced            bool   `json:"adaptive_routing_enforced"`
+	AdaptiveForecastRoutingEnforced    bool   `json:"adaptive_forecast_routing_enforced"`
 	AdaptiveAdditionalProviderRequests bool   `json:"adaptive_additional_provider_requests"`
 }
 
@@ -119,7 +120,8 @@ func handleProjectRoutes(req rpcManagementRequest) ([]byte, error) {
 			FallbackUntil:                      "first_response_payload",
 			AdaptiveAllocatorMode:              cfg.AdaptiveAllocatorMode,
 			AdaptiveAllocatorEffect:            adaptiveShadowEffect(cfg),
-			AdaptiveRoutingEnforced:            cfg.AdaptiveAllocatorMode == "enforce",
+			AdaptiveRoutingEnforced:            adaptiveRoutingEnforced(cfg),
+			AdaptiveForecastRoutingEnforced:    adaptiveForecastRoutingEnforced(cfg),
 			AdaptiveAdditionalProviderRequests: false,
 		},
 		Routes: routes,

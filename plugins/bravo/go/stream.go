@@ -178,6 +178,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 	attempted := make(map[int]bool, len(plan))
 	blockedModels := make(map[string]bool)
 	hedgeUsed := false
+	adaptiveLastChanceIndex := -1
 
 	rememberFailure := func(run *bravoStreamAttemptRun, failure executionFailure) {
 		lastFailure = failure
@@ -201,7 +202,9 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 	}
 
 	canHedgeFrom := func(index int) bool {
-		if hedgeUsed ||
+		if index == adaptiveLastChanceIndex ||
+			streamAttemptIsProtectedBreakerProof(plan[index]) ||
+			hedgeUsed ||
 			hedgeDelay <= 0 ||
 			strings.TrimSpace(req.HostCallbackID) == "" ||
 			providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls+1) {
@@ -209,7 +212,9 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		}
 		provider := normalizeProvider(plan[index].Candidate.Provider)
 		for next := index + 1; next < len(plan); next++ {
-			if attempted[next] ||
+			if next == adaptiveLastChanceIndex ||
+				streamAttemptIsProtectedBreakerProof(plan[next]) ||
+				attempted[next] ||
 				blockedModels[executionFailureModelKey(plan[next])] ||
 				normalizeProvider(plan[next].Candidate.Provider) == provider ||
 				verifyCandidateContract(plan[next].Candidate, contract) != nil {
@@ -220,19 +225,19 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		return false
 	}
 
-	startAttempt := func(index int, childScope bool) (*bravoStreamAttemptRun, *executionFailure, bool) {
+	startAttempt := func(index int, childScope, deferProtectedProof bool) (*bravoStreamAttemptRun, *executionFailure, bool, bool) {
 		attempt := plan[index]
 		if blockedModels[executionFailureModelKey(attempt)] {
-			return nil, nil, false
+			return nil, nil, false, false
 		}
 		if skipCoolingExecutionAttempt(attempt, &lastFailure) {
-			return nil, nil, false
+			return nil, nil, false, false
 		}
 		if errPreflight := verifyCandidateContract(attempt.Candidate, contract); errPreflight != nil {
 			failure := contractFailure(errPreflight)
 			lastFailure = failure
 			routeRecorder.failure(attempt, time.Now(), failure.Status, failure)
-			return nil, &failure, false
+			return nil, &failure, false, false
 		}
 		physicalModel := candidateModelName(attempt.Candidate)
 		candidateBody, errRewrite := rewriteCandidateRequest(candidateSourceBody, protocol, physicalModel, true, req.Headers.Get("Content-Type"))
@@ -243,7 +248,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 				Status:  http.StatusBadRequest,
 			}
 			routeRecorder.failure(attempt, time.Now(), failure.Status, failure)
-			return nil, &failure, false
+			return nil, &failure, false, false
 		}
 		if contextRouting.active() && !contextRouting.proveCandidate(
 			req,
@@ -257,10 +262,10 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 				Message: "Целевая модель не прошла доказательную проверку вместимости контекста.",
 				Status:  http.StatusUnprocessableEntity,
 			})
-			return nil, nil, false
+			return nil, nil, false, false
 		}
 		if providerCallBudgetExhausted(cfg.MaxAttempts, providerCalls) {
-			return nil, nil, false
+			return nil, nil, false, false
 		}
 		callbackID := req.HostCallbackID
 		ownsScope := false
@@ -269,7 +274,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			if errFork != nil {
 				failure := classifyExecutionError(errFork)
 				routeRecorder.failure(attempt, time.Now(), failure.Status, failure)
-				return nil, &failure, false
+				return nil, &failure, false, false
 			}
 			callbackID = childID
 			ownsScope = true
@@ -281,13 +286,33 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			}
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, *leaseFailure)
 			routeRecorder.failure(attempt, time.Now(), leaseFailure.Status, *leaseFailure)
-			return nil, leaseFailure, false
+			if adaptiveLastChanceIndex < 0 && adaptiveBreakerLastChanceEligible(attempt, *leaseFailure) {
+				// Append, rather than launch, the fail-open copy. The outer
+				// coordinator reaches it only after every ordinary attempt has
+				// settled, so it cannot become a hedge or a background call.
+				plan = append(plan, adaptiveBreakerLastChanceAttempt(attempt))
+				adaptiveLastChanceIndex = len(plan) - 1
+			}
+			return nil, leaseFailure, false, false
 		}
 		if !acquired {
 			if ownsScope {
 				_ = closeHostCallbackScope(callbackID)
 			}
-			return nil, nil, false
+			return nil, nil, false, false
+		}
+		protectedProof := streamAttemptIsProtectedBreakerProof(attempt)
+		if deferProtectedProof && protectedProof {
+			// Acquiring the lease is the atomic point where an expired breaker
+			// becomes a protected proof. A hedge must give that lease back and
+			// leave the plan entry unattempted for the sequential outer loop.
+			releaseLease(false)
+			cancelAdaptiveEdgeGateAttempt(attempt)
+			plan[index] = freshStreamDeferredBreakerProofAttempt(attempt, time.Now())
+			if ownsScope {
+				_ = closeHostCallbackScope(callbackID)
+			}
+			return nil, nil, false, true
 		}
 		attempt.AdaptiveProviderDispatched = true
 		markAllocatorBypassProbeDispatched(attempt, time.Now())
@@ -304,16 +329,21 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			routeRecorder,
 		)
 		launchedRuns = append(launchedRuns, run)
-		return run, nil, true
+		return run, nil, true, protectedProof
 	}
 
 	findHedge := func(primaryIndex int) (*bravoStreamAttemptRun, *executionFailure, bool) {
 		primaryProvider := normalizeProvider(plan[primaryIndex].Candidate.Provider)
 		for index := primaryIndex + 1; index < len(plan); index++ {
-			if attempted[index] || normalizeProvider(plan[index].Candidate.Provider) == primaryProvider {
+			if index == adaptiveLastChanceIndex || attempted[index] ||
+				streamAttemptIsProtectedBreakerProof(plan[index]) ||
+				normalizeProvider(plan[index].Candidate.Provider) == primaryProvider {
 				continue
 			}
-			run, failure, launched := startAttempt(index, true)
+			run, failure, launched, deferredProof := startAttempt(index, true, true)
+			if deferredProof {
+				continue
+			}
 			if launched {
 				attempted[index] = true
 				return run, nil, true
@@ -339,7 +369,10 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		}
 		attempted[index] = true
 		primaryCanHedge := canHedgeFrom(index)
-		primary, preflightFailure, launched := startAttempt(index, primaryCanHedge)
+		primary, preflightFailure, launched, protectedProof := startAttempt(index, primaryCanHedge, false)
+		if protectedProof {
+			primaryCanHedge = false
+		}
 		if preflightFailure != nil {
 			lastFailure = *preflightFailure
 			if preflightFailure.Status == http.StatusUnprocessableEntity {
@@ -599,6 +632,35 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		}
 	}
 	closeTerminalFailure(lastFailure)
+}
+
+func streamAttemptIsProtectedBreakerProof(attempt executionAttempt) bool {
+	if attempt.AdaptiveEdgeGate == nil {
+		return false
+	}
+	snapshot := attempt.AdaptiveEdgeGate.snapshot()
+	return snapshot.Enforce && snapshot.Decision == adaptiveEdgeGateDecisionProbe
+}
+
+func freshStreamDeferredBreakerProofAttempt(attempt executionAttempt, now time.Time) executionAttempt {
+	cfg := adaptiveAttemptConfig(attempt, loadedConfig())
+	authIndex := strings.TrimSpace(attempt.Auth.AuthIndex)
+	quota := normalizedQuotaState(quotaSnapshot(authIndex))
+	subscription := subscriptionPolicy(cfg, authIndex)
+	tariff := effectiveTariff(
+		cfg,
+		subscription,
+		firstNonEmpty(attempt.Auth.Provider, attempt.Auth.Type),
+		quota,
+	)
+	attempt.AdaptiveEdgeGate = newAdaptiveEdgeGateAttemptState(cfg, attempt, quota, tariff, now.UTC())
+	if attempt.AllocatorBypass && attempt.AllocatorBypassProbe != nil {
+		// The hedge acquisition settled its shared reset-probe state while
+		// returning the lease. Sequential retry needs a private zero state so it
+		// can acquire the same still-unconsumed generation exactly once.
+		attempt.AllocatorBypassProbe = &allocatorBypassProbeAttemptState{}
+	}
+	return attempt
 }
 
 func forwardBravoStreamWinner(
