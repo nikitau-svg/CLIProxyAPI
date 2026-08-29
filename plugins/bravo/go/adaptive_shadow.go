@@ -103,6 +103,7 @@ type adaptiveShadowPublicView struct {
 	Effect                     string                             `json:"effect"`
 	RoutingEnforced            bool                               `json:"routing_enforced"`
 	ForecastRoutingEnforced    bool                               `json:"forecast_routing_enforced"`
+	SoftAssistEnabled          bool                               `json:"soft_assist_enabled"`
 	AdditionalProviderRequests bool                               `json:"additional_provider_requests"`
 	QuotaSnapshotSource        string                             `json:"quota_snapshot_source"`
 	CoolingHalfLifeSeconds     int                                `json:"cooling_half_life_seconds"`
@@ -128,6 +129,8 @@ func adaptiveShadowEffect(cfg pluginConfig) string {
 		return "disabled"
 	case "breaker":
 		return "breaker_routing_enforced"
+	case "assist":
+		return "soft_assist_routing_enforced"
 	case "enforce":
 		return "routing_enforced"
 	default:
@@ -136,11 +139,15 @@ func adaptiveShadowEffect(cfg pluginConfig) string {
 }
 
 func adaptiveEdgeRoutingEnforced(cfg pluginConfig) bool {
-	return cfg.AdaptiveAllocatorMode == "breaker" || cfg.AdaptiveAllocatorMode == "enforce"
+	return cfg.AdaptiveAllocatorMode == "breaker" || cfg.AdaptiveAllocatorMode == "assist" || cfg.AdaptiveAllocatorMode == "enforce"
 }
 
 func adaptiveForecastRoutingEnforced(cfg pluginConfig) bool {
 	return cfg.AdaptiveAllocatorMode == "enforce"
+}
+
+func adaptiveForecastAdmissionActive(cfg pluginConfig) bool {
+	return cfg.AdaptiveAllocatorMode == "assist" || cfg.AdaptiveAllocatorMode == "enforce"
 }
 
 func adaptiveRoutingEnforced(cfg pluginConfig) bool {
@@ -150,6 +157,23 @@ func adaptiveRoutingEnforced(cfg pluginConfig) bool {
 func adaptiveAttemptConfig(attempt executionAttempt, cfg pluginConfig) pluginConfig {
 	if mode := strings.ToLower(strings.TrimSpace(attempt.AdaptiveAllocatorMode)); mode != "" {
 		cfg.AdaptiveAllocatorMode = mode
+	}
+	if attempt.AdaptiveRoutingSnapshot {
+		cfg.MaxAttempts = attempt.AdaptiveMaxAttempts
+	}
+	return cfg
+}
+
+func adaptiveConfigForProject(cfg pluginConfig, project smartKeyConfig) pluginConfig {
+	if cfg.AdaptiveAllocatorMode == "assist" && !project.AdaptiveAssist {
+		cfg.AdaptiveAllocatorMode = "breaker"
+	}
+	return cfg
+}
+
+func adaptiveConfigForExecution(cfg pluginConfig, project smartKeyConfig, authenticated bool) pluginConfig {
+	if cfg.AdaptiveAllocatorMode == "assist" && (!authenticated || !project.AdaptiveAssist) {
+		cfg.AdaptiveAllocatorMode = "breaker"
 	}
 	return cfg
 }
@@ -253,6 +277,7 @@ func annotateAdaptiveShadowPlan(
 	features adaptiveShadowRequestFeatures,
 	now time.Time,
 ) []executionAttempt {
+	cfg = adaptiveConfigForProject(cfg, project)
 	if cfg.AdaptiveAllocatorMode == "off" || strings.TrimSpace(project.ID) == "" {
 		return attempts
 	}
@@ -272,6 +297,8 @@ func annotateAdaptiveShadowPlan(
 		estimate := adaptiveShadowEstimateFor(cfg, attempts[index].Auth, item, tariff, quota, features, now)
 		attempts[index].AdaptiveShadow = true
 		attempts[index].AdaptiveAllocatorMode = cfg.AdaptiveAllocatorMode
+		attempts[index].AdaptiveMaxAttempts = cfg.MaxAttempts
+		attempts[index].AdaptiveRoutingSnapshot = true
 		attempts[index].AdaptiveReservationPercent = estimate.ReservationPercent
 		attempts[index].AdaptiveSessionReservationPercent = estimate.SessionReservationPercent
 		attempts[index].AdaptiveWeeklyReservationPercent = estimate.WeeklyReservationPercent
@@ -471,7 +498,7 @@ func acquireAdaptiveEnforcementLease(
 ) (func(bool), bool, *executionFailure) {
 	cfg := loadedConfig()
 	cfg = adaptiveAttemptConfig(attempt, cfg)
-	if !adaptiveForecastRoutingEnforced(cfg) || !attempt.AdaptiveShadow || attempt.CompactBypass {
+	if !adaptiveForecastAdmissionActive(cfg) || !attempt.AdaptiveShadow || attempt.CompactBypass {
 		return wrapAdaptiveShadowLease(attempt, func(bool) {}), true, nil
 	}
 	now = now.UTC()
@@ -480,6 +507,9 @@ func acquireAdaptiveEnforcementLease(
 	subscription := subscriptionPolicy(cfg, authIndex)
 	tariff := effectiveTariff(cfg, subscription, firstNonEmpty(attempt.Auth.Provider, attempt.Auth.Type), quota)
 	refreshAdaptiveEdgeGateAttemptState(attempt, cfg, quota, tariff, now)
+	if cfg.AdaptiveAllocatorMode == "assist" && attempt.AdaptiveBreakerLastChance {
+		return acquireAdaptiveBreakerRecoveryLease(attempt, now)
+	}
 	beginAdaptiveEdgeGateShadow(attempt, now)
 	switch attempt.AdaptiveEdgeGate.snapshot().Decision {
 	case adaptiveEdgeGateDecisionSkipBusy:
@@ -492,6 +522,26 @@ func acquireAdaptiveEnforcementLease(
 			"bravo_adaptive_edge_tripped",
 			"Подтверждённая ошибка квоты временно закрыла этот маршрут; Bravo сразу продолжил соседний маршрут.",
 		)
+	}
+	if cfg.AdaptiveAllocatorMode == "assist" {
+		switch {
+		case attempt.AdaptiveAssistTail:
+			failOpenAdaptiveForecastGate(attempt, "assist_tail_fail_open")
+			return adaptiveEnforcementFailOpenLease(attempt), true, nil
+		case attempt.Primary:
+			failOpenAdaptiveForecastGate(attempt, "assist_primary_fail_open")
+			return adaptiveEnforcementFailOpenLease(attempt), true, nil
+		case cfg.MaxAttempts > 0:
+			failOpenAdaptiveForecastGate(attempt, "assist_bounded_attempts_fail_open")
+			return adaptiveEnforcementFailOpenLease(attempt), true, nil
+		case attempt.AllocatorBypass || attempt.AdaptiveBreakerLastChance ||
+			attempt.AdaptiveEdgeGate.snapshot().Decision == adaptiveEdgeGateDecisionProbe:
+			failOpenAdaptiveForecastGate(attempt, "assist_protected_attempt_fail_open")
+			return adaptiveEnforcementFailOpenLease(attempt), true, nil
+		case !adaptiveAssistFullyCalibrated(attempt, quota):
+			failOpenAdaptiveForecastGate(attempt, "assist_calibration_incomplete_fail_open")
+			return adaptiveEnforcementFailOpenLease(attempt), true, nil
+		}
 	}
 
 	if authIndex == "" ||
@@ -601,6 +651,19 @@ func acquireAdaptiveEnforcementLease(
 			adaptiveShadowRuntime.Unlock()
 		})
 	}, true, nil
+}
+
+func adaptiveAssistFullyCalibrated(attempt executionAttempt, quota credentialQuotaState) bool {
+	if attempt.AdaptiveEstimateConfidence != "token_calibrated_complete" || !attempt.AdaptiveSessionTokenCalibrated {
+		return false
+	}
+	weeklyKind, quotaModel := adaptiveShadowWeeklyWindow(quota, attempt.Candidate.Model)
+	if weeklyKind != pluginapi.HostAuthQuotaWindowKindModelWeekly {
+		return attempt.AdaptiveWeeklyTokenCalibrated
+	}
+	return attempt.AdaptiveModelWeeklyTokenCalibrated &&
+		(strings.EqualFold(strings.TrimSpace(attempt.AdaptiveModelWeeklyName), strings.TrimSpace(quotaModel)) ||
+			(attempt.AdaptiveModelWeeklyName == "" && quotaModelMatches(attempt.Candidate.Model, quotaModel)))
 }
 
 func failOpenAdaptiveForecastGate(attempt executionAttempt, reason string) {
@@ -967,6 +1030,7 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 		Effect:                     adaptiveShadowEffect(cfg),
 		RoutingEnforced:            adaptiveRoutingEnforced(cfg),
 		ForecastRoutingEnforced:    adaptiveForecastRoutingEnforced(cfg),
+		SoftAssistEnabled:          cfg.AdaptiveAllocatorMode == "assist",
 		AdditionalProviderRequests: false,
 		QuotaSnapshotSource:        "existing_background_cache",
 		CoolingHalfLifeSeconds:     cfg.AdaptiveCoolingHalfLifeSeconds,
@@ -977,7 +1041,9 @@ func adaptiveShadowSummary(cfg pluginConfig, authIndexes []string, now time.Time
 		EdgeGate:                   adaptiveEdgeGateSummary(cfg, authIndexes, now),
 		Note:                       "Теневой расчёт не блокирует запросы и не меняет маршруты; он не выполняет дополнительных обращений к подпискам.",
 	}
-	if adaptiveForecastRoutingEnforced(cfg) {
+	if cfg.AdaptiveAllocatorMode == "assist" {
+		view.Note = "Soft assist может только перенести fully-calibrated secondary-попытку в хвост текущего плана; primary и неопределённые прогнозы fail-open, очередей и дополнительных обращений нет."
+	} else if adaptiveForecastRoutingEnforced(cfg) {
 		view.Note = "Адаптивный расчёт атомарно резервирует подтверждённый прогноз и пропускает только текущую опасную попытку; неизвестные или устаревшие квоты fail-open, очередей и дополнительных обращений нет."
 	} else if cfg.AdaptiveAllocatorMode == "breaker" {
 		view.Note = "Только breaker после фактической подтверждённой ошибки квоты влияет на маршрут; прогнозные token/reservation решения остаются теневыми, очередей и дополнительных обращений нет."

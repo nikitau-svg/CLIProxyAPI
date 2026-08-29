@@ -7,7 +7,7 @@ import "strings"
 // retry semantics, and older allocator modes must remain behaviorally stable.
 func adaptiveBreakerLastChanceEligible(attempt executionAttempt, failure executionFailure) bool {
 	cfg := adaptiveAttemptConfig(attempt, loadedConfig())
-	if cfg.AdaptiveAllocatorMode != "breaker" {
+	if cfg.AdaptiveAllocatorMode != "breaker" && cfg.AdaptiveAllocatorMode != "assist" {
 		return false
 	}
 	switch failure.Code {
@@ -46,6 +46,46 @@ func adaptiveBreakerOutwardFailures(
 
 func isAdaptiveBreakerLocalFailure(failure executionFailure) bool {
 	return strings.HasPrefix(strings.TrimSpace(failure.Code), "bravo_adaptive_")
+}
+
+func adaptiveAssistDeferredEligible(attempt executionAttempt, failure executionFailure) bool {
+	return attempt.AdaptiveAllocatorMode == "assist" && !attempt.Primary && !attempt.AdaptiveAssistTail &&
+		!attempt.CompactBypass && !attempt.AllocatorBypass && !attempt.AdaptiveBreakerLastChance &&
+		failure.Code == "bravo_adaptive_quota_withheld"
+}
+
+func adaptiveAssistTailAttempt(attempt executionAttempt) executionAttempt {
+	attempt.AdaptiveAssistTail = true
+	if attempt.AdaptiveEdgeGate != nil {
+		attempt.AdaptiveEdgeGate = &adaptiveEdgeGateAttemptState{}
+	}
+	return attempt
+}
+
+func insertExecutionAttemptBefore(plan []executionAttempt, index int, attempt executionAttempt) []executionAttempt {
+	if index < 0 || index >= len(plan) {
+		return append(plan, attempt)
+	}
+	plan = append(plan, executionAttempt{})
+	copy(plan[index+1:], plan[index:])
+	plan[index] = attempt
+	return plan
+}
+
+func nextAdaptiveAssistTailIndex(plan []executionAttempt, start int, attempted map[int]bool) int {
+	if start < 0 {
+		start = 0
+	}
+	for index := start; index < len(plan); index++ {
+		if plan[index].AdaptiveAssistTail && (attempted == nil || !attempted[index]) {
+			return index
+		}
+	}
+	return -1
+}
+
+func adaptiveAssistCanReachTailAfter(failure executionFailure) bool {
+	return strings.TrimSpace(failure.Code) != "request_canceled"
 }
 
 func adaptiveBreakerLastChanceAttempt(attempt executionAttempt) executionAttempt {

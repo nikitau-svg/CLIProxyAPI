@@ -1,9 +1,11 @@
-# Adaptive edge gate v4 test plan
+# Adaptive edge gate v5 test plan
 
-Status: Bravo 0.9.0-preview.12. `observe` is shadow-only; production `breaker`
+Status: Bravo 0.9.0-preview.13 beta candidate. `observe` is shadow-only;
+production `breaker`
 may skip only a route closed by a real reviewed quota/rate-limit failure and
-immediately continue the configured neighboring route. Full forecast
-`enforce` remains experimental.
+immediately continue the configured neighboring route. Opt-in beta `assist`
+may only reorder one fully calibrated secondary attempt without deleting it.
+Full forecast `enforce` remains experimental.
 
 ## Contract
 
@@ -50,6 +52,28 @@ immediately continue the configured neighboring route. Full forecast
 12. Audit JSON contains state and numeric outcomes but no project ID,
     subscription/auth identity, key, prompt, headers, raw provider body or
     response.
+13. `assist` may defer only a non-primary attempt with fresh confirmed quota,
+    complete token calibration for the effective session and weekly/model-
+    weekly windows, and unlimited `max_attempts`. Every partial, stale,
+    saturated, bypass, protected-proof, primary, or finite-budget case keeps
+    baseline ordering.
+14. Deferral preserves the exact provider/model/auth attempt once in a
+    sequential tail. The tail bypasses forecast admission, rechecks the
+    evidence breaker and ordinary route rules, and runs before any retained
+    breaker-recovery proof. It is never rebuilt from the shared pool.
+15. A streaming request whose immutable mode snapshot is `assist` and whose
+    `max_attempts` is unlimited launches no latency hedge. With finite
+    `max_attempts`, forecast assist is fully inert and the baseline stream hedge
+    remains enabled. Concurrent forecast reservations are atomic, and neither
+    the original attempt nor its tail copy can be dispatched twice.
+16. Global `assist` affects only a project with explicit
+    `adaptive_assist: true`; unmarked projects execute as `breaker`. Hot reload
+    of this flag, mode, or `max_attempts` changes only later requests.
+17. Audit conservation is checked per exact request-local deferred identity.
+    Deferred/tail lifecycle does not contaminate legacy forecast counters; lost
+    or duplicate tails, primary deferral, and any actual assist stream hedge
+    force `needs_review`. Hourly crash recovery uses writer sequence/checkpoint,
+    never an event-time watermark.
 
 ## Required checks
 
@@ -63,7 +87,7 @@ go vet ./...
 git diff --check
 ```
 
-## Observe and breaker review
+## Observe, breaker, and assist review
 
 Collect at least 100 edge-gate attempts spanning six hours, preferably a full
 day. Review independently:
@@ -81,8 +105,14 @@ day. Review independently:
   last-chance baseline attempt;
 - switching the config during an in-flight request does not relabel the
   immutable attempt or its audit record.
+- in an isolated project with `adaptive_assist: true`, every deferral has
+  exactly one retained tail, no primary is deferred, no streaming hedge starts,
+  and its separately counted assist success rate does not regress against
+  `breaker`.
 
 `ready_for_review` remains evidence, not an automatic mode switch. Roll out in
 `observe`, then set explicit `breaker`; returning to `observe` is the immediate
-rollback and 0.8.11 remains the stable binary rollback. Full `enforce` needs a
-separate forecast gate and is not covered by breaker readiness.
+rollback and 0.8.11 remains the stable binary rollback. `assist` needs a
+separate isolated beta canary with `max_attempts: 0`; its kill switch is
+`breaker`. Full `enforce` needs a separate forecast gate and is not covered by
+breaker readiness.

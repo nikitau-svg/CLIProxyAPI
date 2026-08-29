@@ -361,11 +361,9 @@ func normalizeConfig(cfg *pluginConfig) error {
 	switch cfg.AdaptiveAllocatorMode {
 	case "":
 		cfg.AdaptiveAllocatorMode = "observe"
-	case "off", "observe", "breaker", "enforce":
-	case "assist":
-		return fmt.Errorf("adaptive_allocator_mode %q is not supported; use off, observe, breaker, or enforce", cfg.AdaptiveAllocatorMode)
+	case "off", "observe", "breaker", "assist", "enforce":
 	default:
-		return fmt.Errorf("adaptive_allocator_mode must be off, observe, breaker, or enforce")
+		return fmt.Errorf("adaptive_allocator_mode must be off, observe, breaker, assist, or enforce")
 	}
 	if cfg.AdaptiveCoolingHalfLifeSeconds <= 0 {
 		cfg.AdaptiveCoolingHalfLifeSeconds = defaultAdaptiveCoolingHalfLifeSeconds
@@ -681,6 +679,59 @@ func loadedConfig() pluginConfig {
 	cfg := defaultPluginConfig()
 	_ = normalizeConfig(&cfg)
 	return cfg
+}
+
+// immutableRoutingConfigSnapshot detaches every persisted slice, map, and
+// project policy from the atomically loaded config. A later management reload
+// may be built from a shallow copy, so retaining its backing arrays across an
+// async stream ACK would otherwise mutate an already accepted request.
+func immutableRoutingConfigSnapshot(cfg pluginConfig) pluginConfig {
+	snapshot := cfg
+	snapshot.Tariffs = append([]tariffConfig(nil), cfg.Tariffs...)
+	snapshot.Subscriptions = append([]subscriptionConfig(nil), cfg.Subscriptions...)
+	for index := range snapshot.Subscriptions {
+		if cfg.Subscriptions[index].Enabled != nil {
+			enabled := *cfg.Subscriptions[index].Enabled
+			snapshot.Subscriptions[index].Enabled = &enabled
+		}
+	}
+	snapshot.SmartKeys = make([]smartKeyConfig, len(cfg.SmartKeys))
+	for index, project := range cfg.SmartKeys {
+		snapshot.SmartKeys[index] = cloneSmartKeyConfig(project)
+	}
+	snapshot.RouteOverrides = make([]routeOverrideConfig, len(cfg.RouteOverrides))
+	for index, override := range cfg.RouteOverrides {
+		snapshot.RouteOverrides[index] = override
+		snapshot.RouteOverrides[index].Candidates = cloneRoutingCandidates(override.Candidates)
+	}
+	snapshot.Models = cloneRoutingModels(cfg.Models)
+	snapshot.BaseModels = cloneRoutingModels(cfg.BaseModels)
+	snapshot.PersistedTariffIDs = make(map[string]bool, len(cfg.PersistedTariffIDs))
+	for id, persisted := range cfg.PersistedTariffIDs {
+		snapshot.PersistedTariffIDs[id] = persisted
+	}
+	return snapshot
+}
+
+func cloneRoutingModels(models map[string]logicalModel) map[string]logicalModel {
+	if models == nil {
+		return nil
+	}
+	cloned := make(map[string]logicalModel, len(models))
+	for id, model := range models {
+		model.Candidates = cloneRoutingCandidates(model.Candidates)
+		cloned[id] = model
+	}
+	return cloned
+}
+
+func cloneRoutingCandidates(candidates []candidate) []candidate {
+	cloned := append([]candidate(nil), candidates...)
+	for index := range cloned {
+		cloned[index].Capabilities = append([]string(nil), candidates[index].Capabilities...)
+		cloned[index].AuthIDs = append([]string(nil), candidates[index].AuthIDs...)
+	}
+	return cloned
 }
 
 func normalizeEffort(value string) string {

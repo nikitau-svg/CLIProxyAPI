@@ -89,6 +89,12 @@ func renderAdaptiveShadowAuditText(report adaptiveShadowAuditReport, hours int) 
 		influence = "да"
 	}
 	fmt.Fprintf(&out, "Режим: %s; влияние на маршрутизацию: %s\n", report.Mode, influence)
+	fmt.Fprintf(&out, "Сохранённая история: с %s, %d сек.; детали усечены: %t; высокая скорость усечения: %t\n",
+		report.OldestRetainedAt.Format(time.RFC3339), report.RetainedHistorySpanSeconds,
+		report.HistoryTruncated, report.HighRateTruncation)
+	if len(report.ReadinessBlockers) > 0 {
+		fmt.Fprintf(&out, "Что мешает readiness: %s\n", strings.Join(report.ReadinessBlockers, ", "))
+	}
 	fmt.Fprintf(&out, "Запросы: %d; фактические попытки выполнения: %d; fallback: %d\n",
 		report.RequestsObserved, report.ActualExecutionAttempts, report.RequestsWithFallback)
 	fmt.Fprintf(&out, "Shadow-решения: пропустить %d; удержать %d; неизвестно %d\n",
@@ -115,6 +121,11 @@ func renderAdaptiveShadowAuditText(report adaptiveShadowAuditReport, hours int) 
 		report.EdgeGateReopensObserved)
 	fmt.Fprintf(&out, "Дополнительные обращения к подпискам/провайдерам: %d; применённых изменений маршрута: %d\n",
 		report.AdditionalProviderRequests, report.RoutingChangesApplied)
+	fmt.Fprintf(&out, "Assist: deferred %d; tail reached/dispatched/success %d/%d/%d; neighbor success %d; invariant lost/duplicate/primary/stream-hedge %d/%d/%d/%d\n",
+		report.AssistActuallyDeferred, report.AssistTailReached, report.AssistTailDispatched, report.AssistTailSuccess,
+		report.AssistNeighborSuccess, report.AssistLostTail, report.AssistDuplicateTail, report.AssistPrimaryDeferred, report.AssistStreamHedge)
+	fmt.Fprintf(&out, "Assist requests: всего %d; success/failure %d/%d\n", report.AssistRequests, report.AssistSuccessfulRequests, report.AssistFailedRequests)
+	fmt.Fprintf(&out, "Assist saved tail not reached: %d; terminal/cancel before tail: %d\n", report.AssistTailNotReached, report.AssistTerminalBeforeTail)
 	fmt.Fprintf(&out, "Телеметрия: очередь %d/%d; потеряно %d; ошибок записи %d; диск %d/%d байт\n",
 		report.QueueDepth, report.QueueCapacity, report.DroppedRecords, report.WriteFailures,
 		report.DiskBytes, report.DiskLimitBytes)

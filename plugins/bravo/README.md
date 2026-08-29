@@ -153,9 +153,10 @@ additional provider requests.
 
 ## Adaptive allocator 0.9 preview
 
-Preview.12 adds a narrow, reversible production breaker while keeping the
-forecast experimental. The default remains `observe`; the recommended
-production routing change is explicit `adaptive_allocator_mode: breaker`.
+Preview.13 keeps the narrow, reversible production breaker and adds a separate
+opt-in soft assist while the hard forecast remains experimental. The default
+remains `observe`; the recommended production routing change is explicit
+`adaptive_allocator_mode: breaker`.
 
 The modes have deliberately small contracts:
 
@@ -174,6 +175,20 @@ The modes have deliberately small contracts:
   the breaker closed. A local `bravo_adaptive_*` decision can never become the final client error; an
   exhausted operator `max_attempts` may still return the ordinary aggregate
   route failure produced by real neighboring attempts;
+- `assist` keeps the evidence breaker and may atomically defer only a
+  non-primary attempt with fresh confirmed quota and complete token calibration
+  for both effective quota windows. Deferral preserves the exact already
+  authorized provider/model/auth attempt in the sequential request tail; it is
+  not a rejection. Primary, partial/unknown/stale calibration, compact and
+  allocator bypasses, protected breaker proofs, runtime saturation, and every
+  finite `max_attempts` fail open to baseline behavior. Streaming assist
+  disables hedging only for an immutable request snapshot with unlimited
+  `max_attempts`; finite budgets keep the baseline hedge because forecast
+  assist is fully inert. The global mode alone
+  is insufficient: a project must also opt in with `adaptive_assist: true`;
+  every other project remains breaker-only. Use this mode only for an isolated
+  beta canary; setting the project flag to false is its narrow kill switch and
+  returning the global mode to `breaker` disables all canaries;
 - `enforce` atomically reserves the predicted session and weekly/model-weekly
   cost against a fresh, provider-confirmed quota. If the current attempt is
   confirmed unsafe, busy at the guarded edge, or behind a provider-confirmed
@@ -348,7 +363,7 @@ plugins:
       max_attempts: 0
       cooldown_seconds: 30
       compact_bypass_cooldown_seconds: 900
-      adaptive_allocator_mode: observe # off, observe, breaker, or experimental enforce
+      adaptive_allocator_mode: observe # off, observe, breaker, beta assist, or experimental enforce
       smart_keys:
         - id: prj_example
           name: default-project
@@ -358,6 +373,7 @@ plugins:
           models: ["*"]
           allowed_auth_ids: []
           primary_auth_ids: []
+          adaptive_assist: false # explicit per-project beta opt-in
           policy:
             prompt_cache:
               anthropic_ttl: 5m
@@ -645,14 +661,22 @@ Chrome/Playwright desktop/mobile QA. A backend-only release may reuse the exact
 previously verified UI artifact when its pinned commit and SHA-256 are recorded
 and the served bytes are verified after cutover.
 
-Preview.12 has no one-shot migration. Preserve the mounted auth directory,
+Preview.13 has no one-shot migration. Preserve the mounted auth directory,
 configuration and `bravo-data` volume; retain the previous image plus a
 pre-cutover state copy. For a conservative canary, start with
 `adaptive_allocator_mode: observe`, run the protocol/management smokes and
 inspect `/v0/management/bravo/adaptive-audit`. Then hot-reload explicit
-`breaker`. Returning to `observe` is the first rollback; restoring the retained
-0.8.11 image and its state copy is the stable rollback. Never delete auth or
-usage state to perform a rollback.
+`breaker`. The optional `assist` needs `max_attempts: 0`, global mode `assist`,
+and `adaptive_assist: true` on one isolated noncritical project; all unmarked
+projects remain breaker-only. Clear the project flag for the narrow kill
+switch, or return the global mode to `breaker` before considering an image
+rollback. The bounded `*.hours.json` audit sidecar is created automatically,
+contains aggregate counters only, and uses a writer sequence/checkpoint so a
+late concurrent completion cannot disappear after a crash. Its assist counters
+separately expose defer, tail dispatch/success, neighbor success and every
+lifecycle invariant. Returning to `observe` is the broader routing rollback;
+restoring the retained 0.8.11 image and its state copy is the stable rollback.
+Never delete auth or usage state to perform a rollback.
 
 The current clean-install guide is
 [`AWS_INSTALL_RU.md`](../../AWS_INSTALL_RU.md). The operator guide for project

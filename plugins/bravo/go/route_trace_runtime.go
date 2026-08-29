@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,14 +11,42 @@ import (
 const bravoTraceIDHeader = "X-Bravo-Trace-Id"
 
 type routeTraceRecorder struct {
-	trace                          routeTrace
-	finished                       bool
-	adaptiveAuditDisabled          bool
-	adaptiveAuditAttempts          []adaptiveShadowAuditAttempt
-	adaptiveAuditExecutionAttempts int
-	adaptiveAuditRoutingChanges    int
-	adaptiveAuditOmittedAttempts   int
-	adaptiveAuditRoutingEnforced   bool
+	trace                              routeTrace
+	finished                           bool
+	adaptiveAuditDisabled              bool
+	adaptiveAuditAttempts              []adaptiveShadowAuditAttempt
+	adaptiveAuditExecutionAttempts     int
+	adaptiveAuditRoutingChanges        int
+	adaptiveAuditOmittedAttempts       int
+	adaptiveAuditRoutingEnforced       bool
+	adaptiveAuditAssistDeferred        int
+	adaptiveAuditAssistTailReached     int
+	adaptiveAuditAssistTailDispatched  int
+	adaptiveAuditAssistTailSuccess     int
+	adaptiveAuditAssistPrimaryDeferred int
+	adaptiveAuditAssistStreamHedge     int
+	adaptiveAuditAssistDuplicateTail   int
+	adaptiveAuditAssistPending         map[[32]byte]int
+	adaptiveAuditAssistSavedTail       map[[32]byte]int
+}
+
+func adaptiveAuditAssistIdentity(attempt executionAttempt) [32]byte {
+	return sha256.Sum256([]byte(strings.Join([]string{
+		attempt.Auth.AuthIndex, attempt.Auth.ID, normalizeProvider(attempt.Candidate.Provider),
+		strings.TrimSpace(attempt.Candidate.Model), normalizeEffort(attempt.Candidate.Effort),
+		normalizeEffort(attempt.RequestedEffort), normalizeEffort(attempt.EffectiveEffort), strings.TrimSpace(attempt.TariffID),
+	}, "\x1f")))
+}
+
+func (recorder *routeTraceRecorder) registerAdaptiveAssistTail(attempt executionAttempt) {
+	if recorder == nil || recorder.finished || recorder.adaptiveAuditDisabled ||
+		attempt.AdaptiveAllocatorMode != "assist" || !attempt.AdaptiveAssistTail {
+		return
+	}
+	if recorder.adaptiveAuditAssistSavedTail == nil {
+		recorder.adaptiveAuditAssistSavedTail = make(map[[32]byte]int)
+	}
+	recorder.adaptiveAuditAssistSavedTail[adaptiveAuditAssistIdentity(attempt)]++
 }
 
 func (recorder *routeTraceRecorder) disableAdaptiveAudit() {
@@ -46,6 +75,54 @@ func (recorder *routeTraceRecorder) captureAdaptiveAuditAttempt(
 		// Config may hot-reload before the asynchronous audit record is written;
 		// a never-dispatched local adaptive error independently proves enforce.
 		recorder.adaptiveAuditRoutingEnforced = true
+	}
+	rawAssistWithhold := attempt.AdaptiveAllocatorMode == "assist" && !attempt.AdaptiveAssistTail && errorCode == "bravo_adaptive_quota_withheld"
+	assistDeferred := adaptiveAssistDeferredEligible(attempt, executionFailure{Code: errorCode})
+	assistTail := attempt.AdaptiveAllocatorMode == "assist" && attempt.AdaptiveAssistTail
+	assistTailContinuation := assistTail && attempt.AdaptiveBreakerLastChance
+	assistLifecycle := ""
+	if assistDeferred {
+		assistLifecycle = "actually_deferred"
+		recorder.adaptiveAuditAssistDeferred++
+		if recorder.adaptiveAuditAssistPending == nil {
+			recorder.adaptiveAuditAssistPending = make(map[[32]byte]int)
+		}
+		recorder.adaptiveAuditAssistPending[adaptiveAuditAssistIdentity(attempt)]++
+	}
+	if rawAssistWithhold && attempt.Primary {
+		recorder.adaptiveAuditAssistPrimaryDeferred++
+		assistLifecycle = "primary_deferred_violation"
+	}
+	if assistTail {
+		assistLifecycle = "tail_reached"
+		if assistTailContinuation {
+			assistLifecycle = "tail_recovery"
+		} else {
+			recorder.adaptiveAuditAssistTailReached++
+			key := adaptiveAuditAssistIdentity(attempt)
+			if recorder.adaptiveAuditAssistSavedTail[key] > 0 {
+				recorder.adaptiveAuditAssistSavedTail[key]--
+			} else {
+				recorder.adaptiveAuditAssistDuplicateTail++
+			}
+			if recorder.adaptiveAuditAssistPending[key] > 0 {
+				recorder.adaptiveAuditAssistPending[key]--
+			}
+		}
+		if attempt.AdaptiveProviderDispatched {
+			recorder.adaptiveAuditAssistTailDispatched++
+		}
+		if success {
+			recorder.adaptiveAuditAssistTailSuccess++
+		}
+	}
+	assistStreamHedge := attempt.AdaptiveAllocatorMode == "assist" && recorder.trace.Stream &&
+		attempt.AdaptiveAuditStreamHedge && attempt.AdaptiveProviderDispatched
+	if assistStreamHedge {
+		recorder.adaptiveAuditAssistStreamHedge++
+		if assistLifecycle == "" {
+			assistLifecycle = "stream_hedge_violation"
+		}
 	}
 	if !attempt.AdaptiveProviderDispatched && !localEnforcedSkip {
 		return
@@ -97,6 +174,7 @@ func (recorder *routeTraceRecorder) captureAdaptiveAuditAttempt(
 		EdgeGateWeeklyHeadroom:        edgeGate.WeeklyHeadroomPercent,
 		EdgeGateTripRemainingSeconds:  edgeGate.TripRemainingSeconds,
 		EdgeGateOutcomeTransition:     edgeGate.OutcomeTransition,
+		AssistLifecycle:               assistLifecycle,
 	})
 }
 
@@ -350,6 +428,44 @@ func (recorder *routeTraceRecorder) finish(success bool, status int, failure exe
 		recorder.trace.FinalMessage = localized.Message
 	}
 	if !recorder.adaptiveAuditDisabled && len(recorder.adaptiveAuditAttempts) > 0 {
+		lost, notReached, duplicate := 0, 0, recorder.adaptiveAuditAssistDuplicateTail
+		keys := make(map[[32]byte]struct{}, len(recorder.adaptiveAuditAssistPending)+len(recorder.adaptiveAuditAssistSavedTail))
+		for key := range recorder.adaptiveAuditAssistPending {
+			keys[key] = struct{}{}
+		}
+		for key := range recorder.adaptiveAuditAssistSavedTail {
+			keys[key] = struct{}{}
+		}
+		for key := range keys {
+			deferred, saved := recorder.adaptiveAuditAssistPending[key], recorder.adaptiveAuditAssistSavedTail[key]
+			if deferred > saved {
+				lost += deferred - saved
+			}
+			if saved > deferred {
+				duplicate += saved - deferred
+			}
+			if deferred < saved {
+				notReached += deferred
+			} else {
+				notReached += saved
+			}
+		}
+		neighborSuccess, terminalBeforeTail := 0, 0
+		if success {
+			neighborSuccess = notReached
+		} else {
+			terminalBeforeTail = notReached
+		}
+		assistRequest, assistSuccess, assistFailure := 0, 0, 0
+		if recorder.adaptiveAuditAssistDeferred > 0 || recorder.adaptiveAuditAssistTailReached > 0 ||
+			recorder.adaptiveAuditAssistPrimaryDeferred > 0 || recorder.adaptiveAuditAssistStreamHedge > 0 {
+			assistRequest = 1
+			if success {
+				assistSuccess = 1
+			} else {
+				assistFailure = 1
+			}
+		}
 		enqueueAdaptiveShadowAudit(adaptiveShadowAuditRecord{
 			SchemaVersion:              adaptiveShadowAuditSchemaVersion,
 			At:                         recorder.trace.CompletedAt,
@@ -365,6 +481,20 @@ func (recorder *routeTraceRecorder) finish(success bool, status int, failure exe
 			RoutingChangesApplied:      recorder.adaptiveAuditRoutingChanges,
 			AdditionalProviderRequests: 0,
 			Attempts:                   recorder.adaptiveAuditAttempts,
+			AssistActuallyDeferred:     recorder.adaptiveAuditAssistDeferred,
+			AssistTailReached:          recorder.adaptiveAuditAssistTailReached,
+			AssistTailDispatched:       recorder.adaptiveAuditAssistTailDispatched,
+			AssistTailSuccess:          recorder.adaptiveAuditAssistTailSuccess,
+			AssistNeighborSuccess:      neighborSuccess,
+			AssistLostTail:             lost,
+			AssistDuplicateTail:        duplicate,
+			AssistTailNotReached:       notReached,
+			AssistTerminalBeforeTail:   terminalBeforeTail,
+			AssistPrimaryDeferred:      recorder.adaptiveAuditAssistPrimaryDeferred,
+			AssistStreamHedge:          recorder.adaptiveAuditAssistStreamHedge,
+			AssistRequests:             assistRequest,
+			AssistSuccessfulRequests:   assistSuccess,
+			AssistFailedRequests:       assistFailure,
 		})
 	}
 	if success {

@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginIdentifier = "bravo"
-	pluginVersion    = "0.9.0-preview.12"
+	pluginVersion    = "0.9.0-preview.13"
 	defaultPrefix    = "bravo/"
 	// Keep Bravo's own state outside CLIProxyAPI's auth directory. Files placed
 	// in /root/.cli-proxy-api are discovered as credentials by the host.
@@ -145,6 +145,7 @@ type smartKeyConfig struct {
 	Models          []string       `yaml:"models" json:"models"`
 	PrimaryAuthIDs  []string       `yaml:"primary_auth_ids,omitempty" json:"primary_auth_ids,omitempty"`
 	AllowedAuthIDs  []string       `yaml:"allowed_auth_ids,omitempty" json:"allowed_auth_ids,omitempty"`
+	AdaptiveAssist  bool           `yaml:"adaptive_assist,omitempty" json:"adaptive_assist,omitempty"`
 	Policy          map[string]any `yaml:"policy,omitempty" json:"policy,omitempty"`
 	CreatedAt       string         `yaml:"created_at,omitempty" json:"created_at,omitempty"`
 	UpdatedAt       string         `yaml:"updated_at,omitempty" json:"updated_at,omitempty"`
@@ -208,6 +209,8 @@ type executionAttempt struct {
 	// this request plan is built. Hot reload may update tuning inputs for later
 	// requests, but must not change observe/breaker/enforce within this one.
 	AdaptiveAllocatorMode                 string
+	AdaptiveMaxAttempts                   int
+	AdaptiveRoutingSnapshot               bool
 	AdaptiveReservationPercent            float64
 	AdaptiveSessionReservationPercent     float64
 	AdaptiveWeeklyReservationPercent      float64
@@ -225,9 +228,13 @@ type executionAttempt struct {
 	AdaptiveProviderDispatched            bool
 	AdaptiveProviderAccepted              bool
 	AdaptiveBreakerLastChance             bool
-	AdaptiveBreakerRecoveryKey            string
-	AdaptiveBreakerRecoveryGeneration     uint64
-	AdaptiveBreakerRecoveryRevision       uint64
+	AdaptiveAssistTail                    bool
+	// AdaptiveAuditStreamHedge is observation-only. The stream coordinator sets
+	// it on the private attempt copy at the exact hedge dispatch site.
+	AdaptiveAuditStreamHedge          bool
+	AdaptiveBreakerRecoveryKey        string
+	AdaptiveBreakerRecoveryGeneration uint64
+	AdaptiveBreakerRecoveryRevision   uint64
 	// AdaptiveEdgeGate is runtime-only shadow state. Copies of an execution
 	// attempt intentionally share this pointer so streaming and non-streaming
 	// completion paths settle the same simulated lease exactly once.

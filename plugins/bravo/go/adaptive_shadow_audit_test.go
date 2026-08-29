@@ -100,6 +100,52 @@ func TestAdaptiveShadowAuditRecorderCapturesOnlyPrivacySafeActualAttempts(t *tes
 	}
 }
 
+func TestAdaptiveShadowAuditClosesUntrustedHostErrorTaxonomy(t *testing.T) {
+	for _, marker := range []string{"bravo_QZ9OpaqueCredential774411", "QZ9OpaqueCredential774411LongAlphaNumericSecret998877"} {
+		t.Run(marker[:8], func(t *testing.T) {
+			temp := t.TempDir()
+			statePath := filepath.Join(temp, "state.json")
+			store := installAdaptiveShadowAuditTestStore(t, statePath, 8)
+			classified := classifyExecutionError(&hostCallError{Code: marker, Message: "opaque provider failure", HTTPStatus: http.StatusBadGateway})
+			if classified.Code != marker {
+				t.Fatalf("classifier no longer preserves adversarial code; test needs a new real ingress: %#v", classified)
+			}
+			recorder := &routeTraceRecorder{trace: routeTrace{TraceID: "privacy-error", StartedAt: time.Now().Add(-time.Second)}}
+			attempt := executionAttempt{Candidate: candidate{Provider: "claude", Model: "claude-fable-5"}, AdaptiveShadow: true,
+				AdaptiveShadowDecision: adaptiveShadowDecisionAdmit, AdaptiveProviderDispatched: true}
+			recorder.failure(attempt, time.Now(), classified.Status, classified)
+			recorder.finish(false, classified.Status, classified)
+			store.close()
+			jsonl, err := os.ReadFile(store.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sidecar, err := os.ReadFile(store.aggregatePath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, raw := range map[string][]byte{"jsonl": jsonl, "sidecar": sidecar} {
+				if strings.Contains(string(raw), marker) {
+					t.Fatalf("%s persisted opaque host error %q: %s", name, marker, raw)
+				}
+			}
+			if !strings.Contains(string(jsonl), "unclassified_provider_error") {
+				t.Fatalf("generic closed category missing: %s", jsonl)
+			}
+			reloaded := newAdaptiveShadowAuditStore(statePath, 8)
+			reloaded.loadBoundedHistory()
+			report := reloaded.report(defaultPluginConfig(), 24*time.Hour, 10, time.Now().Add(time.Second))
+			rawReport, err := json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(rawReport), marker) || !strings.Contains(string(rawReport), "unclassified_provider_error") {
+				t.Fatalf("reloaded report taxonomy leak/missing category: %s", rawReport)
+			}
+		})
+	}
+}
+
 func TestAdaptiveShadowAuditAggregatesEdgeGateCounterfactuals(t *testing.T) {
 	now := time.Date(2026, 8, 27, 18, 0, 0, 0, time.UTC)
 	store := newAdaptiveShadowAuditStore(filepath.Join(t.TempDir(), "state.json"), 4)
@@ -172,6 +218,366 @@ func TestAdaptiveShadowAuditKeepsPartialCalibrationOutOfV2Cohort(t *testing.T) {
 		report.TokenCalibrationVerdict != "collecting" {
 		t.Fatalf("partial calibration contaminated v2 cohort: %#v", report)
 	}
+}
+
+func TestAdaptiveShadowAuditHighVolumeRetainsReviewableTimeCohort(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	store := newAdaptiveShadowAuditStore(filepath.Join(t.TempDir(), "state.json"), 8)
+	const requests = adaptiveShadowAuditMemoryRecords + 1000
+	for index := 0; index < requests; index++ {
+		at := now.Add(-7 * time.Hour).Add(time.Duration(index) * 7 * time.Hour / time.Duration(requests-1))
+		record := adaptiveShadowAuditTestRecord(at, adaptiveShadowDecisionAdmit, true, "")
+		record.Attempts[0].EstimateConfidence = "token_calibrated_complete"
+		store.appendMemory(sanitizeAdaptiveShadowAuditRecord(record))
+	}
+	report := store.report(defaultPluginConfig(), 24*time.Hour, 0, now)
+	if report.Verdict != "ready_for_review" || report.TokenCalibrationVerdict != "ready_for_review" {
+		t.Fatalf("high-volume clean cohort never became reviewable: %#v", report)
+	}
+	if report.RequestsObserved != requests || report.CoverageSeconds < int64(6*time.Hour/time.Second) ||
+		!report.HistoryTruncated || !report.HighRateTruncation || report.OldestRetainedAt.IsZero() {
+		t.Fatalf("high-volume retention metadata=%#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditHighVolumeBurstDoesNotFakeCoverage(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	store := newAdaptiveShadowAuditStore(filepath.Join(t.TempDir(), "state.json"), 8)
+	const requests = adaptiveShadowAuditMemoryRecords + 1000
+	for index := 0; index < requests; index++ {
+		at := now.Add(-time.Hour).Add(time.Duration(index) * time.Hour / time.Duration(requests-1))
+		record := adaptiveShadowAuditTestRecord(at, adaptiveShadowDecisionAdmit, true, "")
+		record.Attempts[0].EstimateConfidence = "token_calibrated_complete"
+		store.appendMemory(sanitizeAdaptiveShadowAuditRecord(record))
+	}
+	report := store.report(defaultPluginConfig(), 24*time.Hour, 0, now)
+	if report.Verdict == "ready_for_review" || report.TokenCalibrationVerdict == "ready_for_review" {
+		t.Fatalf("one-hour burst falsely became reviewable: %#v", report)
+	}
+	if report.CoverageSeconds >= int64(6*time.Hour/time.Second) || !adaptiveAuditContains(report.ReadinessBlockers, "minimum_coverage") {
+		t.Fatalf("burst coverage/blockers=%#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditHourlyCohortSurvivesReloadWithoutMigration(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	store := newAdaptiveShadowAuditStore(statePath, 8)
+	const requests = adaptiveShadowAuditMemoryRecords + 1000
+	for index := 0; index < requests; index++ {
+		at := now.Add(-7 * time.Hour).Add(time.Duration(index) * 7 * time.Hour / time.Duration(requests-1))
+		record := adaptiveShadowAuditTestRecord(at, adaptiveShadowDecisionAdmit, true, "")
+		record.ActualExecutionAttempts = 2
+		record.FallbackUsed = true
+		record.RoutingEnforced = true
+		record.RoutingChangesApplied = 1
+		record.Attempts[0].EdgeGateState = adaptiveEdgeGateStateGreen
+		record.Attempts[0].EdgeGateDecision = adaptiveEdgeGateDecisionDispatch
+		store.appendMemory(sanitizeAdaptiveShadowAuditRecord(record))
+	}
+	store.saveHours()
+	reloaded := newAdaptiveShadowAuditStore(statePath, 8)
+	reloaded.loadBoundedHistory()
+	report := reloaded.report(defaultPluginConfig(), 24*time.Hour, 0, now)
+	if report.Verdict != "ready_for_review" || report.RequestsObserved != requests ||
+		report.SuccessfulRequests != requests || report.ActualExecutionAttempts != 2*requests ||
+		report.RequestsWithFallback != requests || report.WouldAdmitAttempts != requests ||
+		report.EdgeGateAttempts != requests || report.EdgeGateWouldDispatch != requests ||
+		report.RoutingChangesApplied != requests || !report.RoutingEnforced || report.OldestRetainedAt.IsZero() {
+		t.Fatalf("persisted hourly cohort was not restored: %#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditReloadAddsJSONLTailNewerThanSidecar(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	store := newAdaptiveShadowAuditStore(statePath, 8)
+	old := adaptiveShadowAuditTestRecord(now.Add(-2*time.Hour), adaptiveShadowDecisionAdmit, true, "")
+	store.appendMemory(sanitizeAdaptiveShadowAuditRecord(old))
+	store.saveHours()
+	newer := sanitizeAdaptiveShadowAuditRecord(adaptiveShadowAuditTestRecord(now.Add(-time.Hour), adaptiveShadowDecisionWithhold, true, ""))
+	newer.Sequence = store.aggregateCheckpoint + 1
+	raw, err := json.Marshal(newer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(store.path, append(raw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := newAdaptiveShadowAuditStore(statePath, 8)
+	reloaded.loadBoundedHistory()
+	report := reloaded.report(defaultPluginConfig(), 24*time.Hour, 0, now)
+	if report.RequestsObserved != 2 || report.WouldAdmitAttempts != 1 || report.WouldWithholdAttempts != 1 || report.SuccessfulWouldWithhold != 1 {
+		t.Fatalf("jsonl crash tail was lost or double-counted: %#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditSequenceRecoversDelayedOlderTimestamp(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	store := newAdaptiveShadowAuditStore(statePath, 8)
+	t2 := store.appendMemory(sanitizeAdaptiveShadowAuditRecord(adaptiveShadowAuditTestRecord(now.Add(-time.Hour), adaptiveShadowDecisionAdmit, true, "")))
+	store.saveHours()
+	t1 := sanitizeAdaptiveShadowAuditRecord(adaptiveShadowAuditTestRecord(now.Add(-2*time.Hour), adaptiveShadowDecisionWithhold, true, ""))
+	t1.Sequence = t2.Sequence + 1 // processed later even though its event timestamp is older
+	raw, err := json.Marshal(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(store.path, append(raw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := newAdaptiveShadowAuditStore(statePath, 8)
+	reloaded.loadBoundedHistory()
+	report := reloaded.report(defaultPluginConfig(), 24*time.Hour, 0, now)
+	if report.RequestsObserved != 2 || report.WouldAdmitAttempts != 1 || report.WouldWithholdAttempts != 1 {
+		t.Fatalf("delayed older-timestamp record was lost: %#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditTwoRotationsDurablyCheckpointCrashTail(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	store := newAdaptiveShadowAuditStore(statePath, 8)
+	// Processing order deliberately disagrees with event time.
+	store.appendMemory(sanitizeAdaptiveShadowAuditRecord(adaptiveShadowAuditTestRecord(now.Add(-time.Hour), adaptiveShadowDecisionAdmit, true, "")))
+	store.appendMemory(sanitizeAdaptiveShadowAuditRecord(adaptiveShadowAuditTestRecord(now.Add(-3*time.Hour), adaptiveShadowDecisionWithhold, true, "")))
+	if err := os.WriteFile(store.path, []byte("generation-one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store.currentBytes.Store(15)
+	if err := store.rotate(); err != nil {
+		t.Fatal(err)
+	}
+	store.appendMemory(sanitizeAdaptiveShadowAuditRecord(adaptiveShadowAuditTestRecord(now.Add(-2*time.Hour), adaptiveShadowDecisionAdmit, true, "")))
+	store.appendMemory(sanitizeAdaptiveShadowAuditRecord(adaptiveShadowAuditTestRecord(now.Add(-4*time.Hour), adaptiveShadowDecisionWithhold, true, "")))
+	if err := os.WriteFile(store.path, []byte("generation-two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store.currentBytes.Store(15)
+	if err := store.rotate(); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an immediate crash: no ticker and no clean close/save follows.
+	reloaded := newAdaptiveShadowAuditStore(statePath, 8)
+	reloaded.loadBoundedHistory()
+	report := reloaded.report(defaultPluginConfig(), 24*time.Hour, 0, now)
+	if report.RequestsObserved != 4 || report.WouldAdmitAttempts != 2 || report.WouldWithholdAttempts != 2 || reloaded.aggregateCheckpoint != 4 {
+		t.Fatalf("two rotations lost acknowledged crash-tail records: %#v checkpoint=%d", report, reloaded.aggregateCheckpoint)
+	}
+}
+
+func TestAdaptiveShadowAuditAssistLifecycleDoesNotContaminateLegacyWithhold(t *testing.T) {
+	store := installAdaptiveShadowAuditTestStore(t, filepath.Join(t.TempDir(), "state.json"), 8)
+	recorder := &routeTraceRecorder{trace: routeTrace{TraceID: "assist-audit", StartedAt: time.Now().Add(-time.Second)}}
+	deferred := executionAttempt{Candidate: candidate{Provider: "claude", Model: "claude-fable-5"}, AdaptiveShadow: true,
+		AdaptiveAllocatorMode: "assist", AdaptiveShadowDecision: adaptiveShadowDecisionWithhold}
+	recorder.failure(deferred, time.Now(), http.StatusTooManyRequests, executionFailure{Code: "bravo_adaptive_quota_withheld", Status: http.StatusTooManyRequests})
+	tail := deferred
+	tail.AdaptiveAssistTail = true
+	recorder.registerAdaptiveAssistTail(tail)
+	tail.AdaptiveProviderDispatched = true
+	tail.AdaptiveProviderAccepted = true
+	recorder.success(tail, time.Now(), http.StatusOK)
+	recorder.finish(true, http.StatusOK, executionFailure{})
+	store.close()
+	report := store.report(defaultPluginConfig(), 24*time.Hour, 0, time.Now().Add(time.Second))
+	if report.AssistActuallyDeferred != 1 || report.AssistTailReached != 1 || report.AssistTailDispatched != 1 || report.AssistTailSuccess != 1 ||
+		report.AssistNeighborSuccess != 0 || report.AssistLostTail != 0 || report.AssistDuplicateTail != 0 || report.AssistPrimaryDeferred != 0 ||
+		report.WouldWithholdAttempts != 0 || report.SuccessfulWouldWithhold != 0 {
+		t.Fatalf("assist lifecycle audit=%#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditDetectsActuallyDispatchedAssistStreamHedgeMarker(t *testing.T) {
+	store := installAdaptiveShadowAuditTestStore(t, filepath.Join(t.TempDir(), "state.json"), 8)
+	recorder := &routeTraceRecorder{trace: routeTrace{TraceID: "assist-hedge-detector", Stream: true, StartedAt: time.Now().Add(-time.Second)}}
+	attempt := executionAttempt{Candidate: candidate{Provider: "claude", Model: "claude-fable-5"}, AdaptiveShadow: true,
+		AdaptiveAllocatorMode: "assist", AdaptiveShadowDecision: adaptiveShadowDecisionAdmit, AdaptiveAuditStreamHedge: true,
+		AdaptiveProviderDispatched: true, AdaptiveProviderAccepted: true}
+	recorder.success(attempt, time.Now(), http.StatusOK)
+	recorder.finish(true, http.StatusOK, executionFailure{})
+	store.close()
+	report := store.report(defaultPluginConfig(), 24*time.Hour, 0, time.Now().Add(time.Second))
+	if report.AssistStreamHedge != 1 || report.AssistTailReached != 0 || report.WouldAdmitAttempts != 0 ||
+		!adaptiveAuditContains(report.ReadinessBlockers, "assist_lifecycle_invariant") {
+		t.Fatalf("dispatched assist stream hedge marker was not detected: %#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditAssistConservesMultipleDeferredCopies(t *testing.T) {
+	store := installAdaptiveShadowAuditTestStore(t, filepath.Join(t.TempDir(), "state.json"), 8)
+	recorder := &routeTraceRecorder{trace: routeTrace{TraceID: "assist-multiple", StartedAt: time.Now().Add(-time.Second)}}
+	base := executionAttempt{Candidate: candidate{Provider: "claude", Model: "claude-fable-5"}, AdaptiveShadow: true,
+		AdaptiveAllocatorMode: "assist", AdaptiveShadowDecision: adaptiveShadowDecisionWithhold}
+	a := base
+	a.Auth.AuthIndex = "same-auth"
+	a.EffectiveEffort = "max"
+	a.TariffID = "x5"
+	b := base
+	b.Auth.AuthIndex = "b"
+	failure := executionFailure{Code: "bravo_adaptive_quota_withheld", Status: http.StatusTooManyRequests}
+	recorder.failure(a, time.Now(), failure.Status, failure)
+	recorder.failure(b, time.Now(), failure.Status, failure)
+	tailA := a
+	tailA.AdaptiveAssistTail = true
+	tailB := b
+	tailB.AdaptiveAssistTail = true
+	recorder.registerAdaptiveAssistTail(tailA)
+	recorder.registerAdaptiveAssistTail(tailB)
+	tailA.AdaptiveProviderDispatched = true
+	tailA.AdaptiveProviderAccepted = true
+	recorder.success(tailA, time.Now(), http.StatusOK)
+	recorder.finish(true, http.StatusOK, executionFailure{})
+	store.close()
+	report := store.report(defaultPluginConfig(), 24*time.Hour, 0, time.Now().Add(time.Second))
+	if report.AssistActuallyDeferred != 2 || report.AssistTailReached != 1 || report.AssistNeighborSuccess != 1 ||
+		report.AssistLostTail != 0 || report.AssistDuplicateTail != 0 || report.AssistRequests != 1 || report.AssistSuccessfulRequests != 1 {
+		t.Fatalf("multiple deferred conservation=%#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditAssistLostAndDuplicateCannotCancel(t *testing.T) {
+	store := installAdaptiveShadowAuditTestStore(t, filepath.Join(t.TempDir(), "state.json"), 8)
+	recorder := &routeTraceRecorder{trace: routeTrace{TraceID: "assist-conservation", StartedAt: time.Now().Add(-time.Second)}}
+	base := executionAttempt{Candidate: candidate{Provider: "claude", Model: "claude-fable-5"}, AdaptiveShadow: true,
+		AdaptiveAllocatorMode: "assist", AdaptiveShadowDecision: adaptiveShadowDecisionWithhold}
+	a := base
+	a.Auth.AuthIndex = "same-auth"
+	a.EffectiveEffort = "max"
+	a.TariffID = "x5"
+	failure := executionFailure{Code: "bravo_adaptive_quota_withheld", Status: http.StatusTooManyRequests}
+	recorder.failure(a, time.Now(), failure.Status, failure)
+	tailB := base
+	tailB.Auth.AuthIndex = "same-auth"
+	tailB.EffectiveEffort = "low"
+	tailB.TariffID = "x1"
+	tailB.AdaptiveAssistTail = true
+	tailB.AdaptiveProviderDispatched = true
+	recorder.failure(tailB, time.Now(), http.StatusBadGateway, executionFailure{Code: "provider_failed", Status: http.StatusBadGateway})
+	recorder.finish(false, http.StatusBadGateway, executionFailure{Code: "provider_failed", Status: http.StatusBadGateway})
+	store.close()
+	report := store.report(defaultPluginConfig(), 24*time.Hour, 0, time.Now().Add(time.Second))
+	if report.AssistLostTail != 1 || report.AssistDuplicateTail != 1 || report.Verdict != "needs_review" || report.AssistFailedRequests != 1 {
+		t.Fatalf("lost+duplicate cancellation escaped audit=%#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditPrimaryAssistWithholdIsInvariant(t *testing.T) {
+	store := installAdaptiveShadowAuditTestStore(t, filepath.Join(t.TempDir(), "state.json"), 8)
+	recorder := &routeTraceRecorder{trace: routeTrace{TraceID: "assist-primary", StartedAt: time.Now().Add(-time.Second)}}
+	attempt := executionAttempt{Candidate: candidate{Provider: "claude", Model: "claude-fable-5"}, Primary: true,
+		AdaptiveShadow: true, AdaptiveAllocatorMode: "assist", AdaptiveShadowDecision: adaptiveShadowDecisionWithhold}
+	failure := executionFailure{Code: "bravo_adaptive_quota_withheld", Status: http.StatusTooManyRequests}
+	recorder.failure(attempt, time.Now(), failure.Status, failure)
+	recorder.finish(false, failure.Status, failure)
+	store.close()
+	report := store.report(defaultPluginConfig(), 24*time.Hour, 0, time.Now().Add(time.Second))
+	if report.AssistPrimaryDeferred != 1 || report.Verdict != "needs_review" || report.WouldWithholdAttempts != 0 {
+		t.Fatalf("primary assist invariant not detected=%#v", report)
+	}
+}
+
+func TestAdaptiveShadowAuditSavedTailNotReachedIsNotInvariant(t *testing.T) {
+	for _, testCase := range []struct {
+		name, code string
+		status     int
+	}{
+		{name: "terminal", code: "provider_invalid_request", status: http.StatusBadRequest},
+		{name: "cancellation", code: "context_canceled", status: 499},
+		{name: "ordinary_cooldown_or_blocked_model", code: "bravo_route_temporarily_unavailable", status: http.StatusServiceUnavailable},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := installAdaptiveShadowAuditTestStore(t, filepath.Join(t.TempDir(), "state.json"), 8)
+			recorder := &routeTraceRecorder{trace: routeTrace{TraceID: "assist-not-reached-" + testCase.name, StartedAt: time.Now().Add(-time.Second)}}
+			attempt := executionAttempt{Candidate: candidate{Provider: "claude", Model: "claude-fable-5"}, AdaptiveShadow: true,
+				AdaptiveAllocatorMode: "assist", AdaptiveShadowDecision: adaptiveShadowDecisionWithhold}
+			tail := adaptiveAssistTailAttempt(attempt)
+			recorder.registerAdaptiveAssistTail(tail)
+			deferFailure := executionFailure{Code: "bravo_adaptive_quota_withheld", Status: http.StatusTooManyRequests}
+			recorder.failure(attempt, time.Now(), deferFailure.Status, deferFailure)
+			terminal := executionFailure{Code: testCase.code, Status: testCase.status}
+			recorder.finish(false, terminal.Status, terminal)
+			store.close()
+			report := store.report(defaultPluginConfig(), 24*time.Hour, 0, time.Now().Add(time.Second))
+			if report.AssistTailNotReached != 1 || report.AssistTerminalBeforeTail != 1 || report.AssistLostTail != 0 ||
+				report.AssistDuplicateTail != 0 || adaptiveAuditContains(report.ReadinessBlockers, "assist_lifecycle_invariant") {
+				t.Fatalf("saved tail not reached became invariant: %#v", report)
+			}
+		})
+	}
+}
+
+func TestAdaptiveShadowAuditAssistTailBreakerRecoveryIsOneLifecycle(t *testing.T) {
+	for _, testCase := range []struct {
+		name                                string
+		recoveryDispatched, recoverySuccess bool
+	}{
+		{name: "success", recoveryDispatched: true, recoverySuccess: true},
+		{name: "recovery_denied", recoveryDispatched: false, recoverySuccess: false},
+		{name: "recovery_provider_failure", recoveryDispatched: true, recoverySuccess: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := installAdaptiveShadowAuditTestStore(t, filepath.Join(t.TempDir(), "state.json"), 8)
+			recorder := &routeTraceRecorder{trace: routeTrace{TraceID: "assist-tail-recovery-" + testCase.name, StartedAt: time.Now().Add(-time.Second)}}
+			base := executionAttempt{Candidate: candidate{Provider: "claude", Model: "claude-fable-5"}, AdaptiveShadow: true,
+				AdaptiveAllocatorMode: "assist", AdaptiveShadowDecision: adaptiveShadowDecisionWithhold}
+			tail := adaptiveAssistTailAttempt(base)
+			recorder.registerAdaptiveAssistTail(tail)
+			deferFailure := executionFailure{Code: "bravo_adaptive_quota_withheld", Status: http.StatusTooManyRequests}
+			recorder.failure(base, time.Now(), deferFailure.Status, deferFailure)
+			trip := executionFailure{Code: "bravo_adaptive_edge_tripped", Status: http.StatusServiceUnavailable}
+			recorder.failure(tail, time.Now(), trip.Status, trip)
+			recovery := adaptiveBreakerLastChanceAttempt(tail)
+			recovery.AdaptiveProviderDispatched = testCase.recoveryDispatched
+			recovery.AdaptiveProviderAccepted = testCase.recoverySuccess
+			if testCase.recoverySuccess {
+				recorder.success(recovery, time.Now(), http.StatusOK)
+				recorder.finish(true, http.StatusOK, executionFailure{})
+			} else {
+				failure := executionFailure{Code: "bravo_adaptive_edge_busy", Status: http.StatusServiceUnavailable}
+				if testCase.recoveryDispatched {
+					failure.Code = "provider_failed"
+					failure.Status = http.StatusBadGateway
+				}
+				recorder.failure(recovery, time.Now(), failure.Status, failure)
+				recorder.finish(false, failure.Status, failure)
+			}
+			store.close()
+			report := store.report(defaultPluginConfig(), 24*time.Hour, 10, time.Now().Add(time.Second))
+			wantDispatched, wantSuccess := 0, 0
+			if testCase.recoveryDispatched {
+				wantDispatched = 1
+			}
+			if testCase.recoverySuccess {
+				wantSuccess = 1
+			}
+			if report.AssistTailReached != 1 || report.AssistTailDispatched != wantDispatched || report.AssistTailSuccess != wantSuccess ||
+				report.AssistDuplicateTail != 0 || report.AssistLostTail != 0 || adaptiveAuditContains(report.ReadinessBlockers, "assist_lifecycle_invariant") {
+				t.Fatalf("tail recovery split one lifecycle: %#v", report)
+			}
+		})
+	}
+}
+
+func TestAdaptiveShadowAuditExcludesPartialBoundaryHour(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 30, 0, 0, time.UTC)
+	store := newAdaptiveShadowAuditStore(filepath.Join(t.TempDir(), "state.json"), 8)
+	store.appendMemory(sanitizeAdaptiveShadowAuditRecord(adaptiveShadowAuditTestRecord(now.Add(-90*time.Minute), adaptiveShadowDecisionAdmit, true, "")))
+	store.appendMemory(sanitizeAdaptiveShadowAuditRecord(adaptiveShadowAuditTestRecord(now.Add(-30*time.Minute), adaptiveShadowDecisionWithhold, true, "")))
+	report := store.report(defaultPluginConfig(), time.Hour, 0, now)
+	if report.RequestsObserved != 1 || report.WouldAdmitAttempts != 0 || report.WouldWithholdAttempts != 1 || report.CoverageSeconds != 0 {
+		t.Fatalf("partial leading hour overstated cohort: %#v", report)
+	}
+}
+
+func adaptiveAuditContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAdaptiveShadowAuditQueueIsNonBlockingAndBounded(t *testing.T) {

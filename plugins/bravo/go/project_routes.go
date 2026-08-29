@@ -46,6 +46,7 @@ type projectRoutePolicyView struct {
 	AdaptiveAllocatorEffect            string `json:"adaptive_allocator_effect"`
 	AdaptiveRoutingEnforced            bool   `json:"adaptive_routing_enforced"`
 	AdaptiveForecastRoutingEnforced    bool   `json:"adaptive_forecast_routing_enforced"`
+	AdaptiveSoftAssistEnabled          bool   `json:"adaptive_soft_assist_enabled"`
 	AdaptiveAdditionalProviderRequests bool   `json:"adaptive_additional_provider_requests"`
 }
 
@@ -81,6 +82,7 @@ func handleProjectRoutes(req rpcManagementRequest) ([]byte, error) {
 	if !authenticated {
 		return projectLimitsError(http.StatusUnauthorized, "bravo_smart_key_required", "Для получения маршрутов нужен действующий ключ проекта Bravo.", time.Time{})
 	}
+	projectAdaptiveCfg := adaptiveConfigForProject(cfg, project)
 	overridden := make(map[string]struct{}, len(cfg.RouteOverrides))
 	for _, item := range cfg.RouteOverrides {
 		overridden[item.ID] = struct{}{}
@@ -118,10 +120,11 @@ func handleProjectRoutes(req rpcManagementRequest) ([]byte, error) {
 			CandidateOrder:                     "listed_order",
 			AccountScope:                       "project_allowed_pool",
 			FallbackUntil:                      "first_response_payload",
-			AdaptiveAllocatorMode:              cfg.AdaptiveAllocatorMode,
-			AdaptiveAllocatorEffect:            adaptiveShadowEffect(cfg),
-			AdaptiveRoutingEnforced:            adaptiveRoutingEnforced(cfg),
-			AdaptiveForecastRoutingEnforced:    adaptiveForecastRoutingEnforced(cfg),
+			AdaptiveAllocatorMode:              projectAdaptiveCfg.AdaptiveAllocatorMode,
+			AdaptiveAllocatorEffect:            adaptiveShadowEffect(projectAdaptiveCfg),
+			AdaptiveRoutingEnforced:            adaptiveRoutingEnforced(projectAdaptiveCfg),
+			AdaptiveForecastRoutingEnforced:    adaptiveForecastRoutingEnforced(projectAdaptiveCfg),
+			AdaptiveSoftAssistEnabled:          projectAdaptiveCfg.AdaptiveAllocatorMode == "assist",
 			AdaptiveAdditionalProviderRequests: false,
 		},
 		Routes: routes,

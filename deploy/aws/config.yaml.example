@@ -52,12 +52,20 @@ plugins:
       fallback_hedge_delay_seconds: 40
       state_path: bravo-data/bravo-state.json
       allocator_mode: enforce
-      # preview.12: breaker reacts only to a real, reviewed quota/rate-limit
+      # preview.13: breaker reacts only to a real, reviewed quota/rate-limit
       # failure and immediately continues the configured neighboring route.
       # Forecasts remain shadow-only; there are no queues or background calls,
       # and at most one global single-flight recovery probe per breaker
-      # generation prevents subscription retry stampedes.
+      # generation prevents subscription retry stampedes. The opt-in assist
+      # mode may only move a fully calibrated secondary attempt to the request
+      # tail. Even when this global mode is set to assist, every project stays
+      # breaker-only unless its smart_keys[] entry explicitly has
+      # adaptive_assist: true. Keep breaker as the production default until an
+      # isolated project canary proves assist non-inferiority. Full enforce
+      # remains experimental.
       adaptive_allocator_mode: breaker
       quota_refresh_seconds: 60
       unknown_secondary_policy: block
+      # Project records are normally created in the existing Management API.
+      # `adaptive_assist` is false when absent and is the per-project kill switch.
       smart_keys: []

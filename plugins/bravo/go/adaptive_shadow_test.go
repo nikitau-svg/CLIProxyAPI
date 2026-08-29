@@ -8,7 +8,6 @@ import (
 	"math"
 	"net/http"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-func TestAdaptiveAllocatorConfigAllowsEnforceAndRejectsAssist(t *testing.T) {
+func TestAdaptiveAllocatorConfigAllowsAssistAndEnforce(t *testing.T) {
 	cfg := defaultPluginConfig()
 	if cfg.AdaptiveAllocatorMode != "observe" ||
 		cfg.AdaptiveCoolingHalfLifeSeconds != 5*60 ||
@@ -28,10 +27,10 @@ func TestAdaptiveAllocatorConfigAllowsEnforceAndRejectsAssist(t *testing.T) {
 	if errNormalize := normalizeConfig(&enforce); errNormalize != nil || enforce.AdaptiveAllocatorMode != "enforce" {
 		t.Fatalf("enforce mode rejected: %v (%q)", errNormalize, enforce.AdaptiveAllocatorMode)
 	}
-	invalidMode := cfg
-	invalidMode.AdaptiveAllocatorMode = "assist"
-	if errNormalize := normalizeConfig(&invalidMode); errNormalize == nil || !strings.Contains(errNormalize.Error(), "not supported") {
-		t.Fatalf("assist mode error = %v, want unsupported rejection", errNormalize)
+	assist := cfg
+	assist.AdaptiveAllocatorMode = "assist"
+	if errNormalize := normalizeConfig(&assist); errNormalize != nil || assist.AdaptiveAllocatorMode != "assist" {
+		t.Fatalf("assist mode rejected: %v (%q)", errNormalize, assist.AdaptiveAllocatorMode)
 	}
 	invalid := cfg
 	invalid.AdaptiveCoolingHalfLifeSeconds = 30

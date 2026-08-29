@@ -31,6 +31,16 @@ type rpcStreamCloseRequest struct {
 	RetryAfter  string `json:"retry_after,omitempty"`
 }
 
+type bravoStreamExecutionSnapshot struct {
+	logicalName string
+	model       logicalModel
+	cfg         pluginConfig
+	contract    requestCapabilityContract
+	protocol    string
+}
+
+var runBravoStreamAsync = runBravoStreamPrepared
+
 func executeStream(raw []byte) ([]byte, error) {
 	var req rpcExecutorRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -54,6 +64,8 @@ func executeStream(raw []byte) ([]byte, error) {
 		routeRecorder.preflightFailure("routing_preflight", *failure, nil)
 		return failureEnvelopeWithRouteTrace(routeRecorder, *failure), nil
 	}
+	project, authenticated := authenticatedExecutionProject(req, cfg)
+	cfg = adaptiveConfigForExecution(cfg, project, authenticated)
 	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
 	routeRecorder.setLogicalModel(logicalModelID)
 	contract, errDetect := detectRequestContract(protocol, body, true)
@@ -74,7 +86,9 @@ func executeStream(raw []byte) ([]byte, error) {
 	}
 	go func() {
 		defer lease.release()
-		runBravoStreamWithTrace(req, streamID, routeRecorder)
+		runBravoStreamAsync(req, streamID, routeRecorder, bravoStreamExecutionSnapshot{
+			logicalName: logicalName, model: model, cfg: cfg, contract: contract, protocol: protocol,
+		})
 	}()
 	responseHeaders := http.Header{
 		"Content-Type":     []string{"text/event-stream"},
@@ -94,6 +108,32 @@ func runBravoStream(req rpcExecutorRequest, pluginStreamID string) {
 }
 
 func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, initialRecorder *routeTraceRecorder) {
+	logicalName, model, cfg, failure := prepareBravoExecution(req)
+	if failure != nil {
+		if initialRecorder != nil {
+			initialRecorder.finish(false, failure.Status, *failure)
+		}
+		closePluginStreamFailure(pluginStreamID, *failure)
+		return
+	}
+	project, authenticated := authenticatedExecutionProject(req, cfg)
+	cfg = adaptiveConfigForExecution(cfg, project, authenticated)
+	protocol := requestProtocol(req.ExecutorRequest)
+	contract, errDetect := detectRequestContract(protocol, executionBody(req), true)
+	if errDetect != nil {
+		failure := contractFailure(errDetect)
+		if initialRecorder != nil {
+			initialRecorder.finish(false, failure.Status, failure)
+		}
+		closePluginStreamFailure(pluginStreamID, failure)
+		return
+	}
+	runBravoStreamPrepared(req, pluginStreamID, initialRecorder, bravoStreamExecutionSnapshot{
+		logicalName: logicalName, model: model, cfg: cfg, contract: contract, protocol: protocol,
+	})
+}
+
+func runBravoStreamPrepared(req rpcExecutorRequest, pluginStreamID string, initialRecorder *routeTraceRecorder, snapshot bravoStreamExecutionSnapshot) {
 	launchedRuns := make([]*bravoStreamAttemptRun, 0, 2)
 	routeRecorder := initialRecorder
 	defer func() {
@@ -113,25 +153,9 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		}
 	}()
 
-	logicalName, model, cfg, failure := prepareBravoExecution(req)
-	if failure != nil {
-		if routeRecorder != nil {
-			routeRecorder.finish(false, failure.Status, *failure)
-		}
-		closePluginStreamFailure(pluginStreamID, *failure)
-		return
-	}
+	logicalName, model, cfg := snapshot.logicalName, snapshot.model, snapshot.cfg
 	body := executionBody(req)
-	protocol := requestProtocol(req.ExecutorRequest)
-	contract, errDetect := detectRequestContract(protocol, body, true)
-	if errDetect != nil {
-		failure := contractFailure(errDetect)
-		if routeRecorder != nil {
-			routeRecorder.finish(false, failure.Status, failure)
-		}
-		closePluginStreamFailure(pluginStreamID, failure)
-		return
-	}
+	protocol, contract := snapshot.protocol, snapshot.contract
 	candidateSourceBody, errStrip := stripRequestEffort(body, protocol, contract.Effort)
 	if errStrip != nil {
 		failure := executionFailure{
@@ -146,6 +170,9 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		return
 	}
 	hedgeDelay := time.Duration(cfg.FallbackHedgeDelaySeconds) * time.Second
+	if cfg.AdaptiveAllocatorMode == "assist" && cfg.MaxAttempts == 0 {
+		hedgeDelay = 0
+	}
 	if project, authenticated := authenticatedExecutionProject(req, cfg); authenticated {
 		if _, compact := claudeCLICompactBypassKey(req, project); compact {
 			hedgeDelay = 0
@@ -156,7 +183,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 	if routeRecorder == nil {
 		routeRecorder = newRouteTraceRecorder(req, logicalModelID, protocol, true)
 	}
-	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
+	plan, errPlan := buildExecutionPlanWithConfig(req, logicalName, model, contract, cfg)
 	if errPlan != nil {
 		failure := executionFailure{
 			Code:      "bravo_no_eligible_account",
@@ -202,7 +229,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 	}
 
 	canHedgeFrom := func(index int) bool {
-		if index == adaptiveLastChanceIndex ||
+		if index == adaptiveLastChanceIndex || plan[index].AdaptiveAssistTail ||
 			streamAttemptIsProtectedBreakerProof(plan[index]) ||
 			hedgeUsed ||
 			hedgeDelay <= 0 ||
@@ -212,7 +239,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		}
 		provider := normalizeProvider(plan[index].Candidate.Provider)
 		for next := index + 1; next < len(plan); next++ {
-			if next == adaptiveLastChanceIndex ||
+			if next == adaptiveLastChanceIndex || plan[next].AdaptiveAssistTail ||
 				streamAttemptIsProtectedBreakerProof(plan[next]) ||
 				attempted[next] ||
 				blockedModels[executionFailureModelKey(plan[next])] ||
@@ -225,7 +252,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		return false
 	}
 
-	startAttempt := func(index int, childScope, deferProtectedProof bool) (*bravoStreamAttemptRun, *executionFailure, bool, bool) {
+	startAttempt := func(index int, childScope, deferProtectedProof, actualHedge bool) (*bravoStreamAttemptRun, *executionFailure, bool, bool) {
 		attempt := plan[index]
 		if blockedModels[executionFailureModelKey(attempt)] {
 			return nil, nil, false, false
@@ -286,6 +313,14 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			}
 			failureTraces = appendExecutionFailureTrace(failureTraces, attempt, *leaseFailure)
 			routeRecorder.failure(attempt, time.Now(), leaseFailure.Status, *leaseFailure)
+			if adaptiveAssistDeferredEligible(attempt, *leaseFailure) {
+				assistTail := adaptiveAssistTailAttempt(attempt)
+				routeRecorder.registerAdaptiveAssistTail(assistTail)
+				plan = insertExecutionAttemptBefore(plan, adaptiveLastChanceIndex, assistTail)
+				if adaptiveLastChanceIndex >= 0 {
+					adaptiveLastChanceIndex++
+				}
+			}
 			if adaptiveLastChanceIndex < 0 && adaptiveBreakerLastChanceEligible(attempt, *leaseFailure) {
 				// Append, rather than launch, the fail-open copy. The outer
 				// coordinator reaches it only after every ordinary attempt has
@@ -315,6 +350,7 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 			return nil, nil, false, true
 		}
 		attempt.AdaptiveProviderDispatched = true
+		attempt.AdaptiveAuditStreamHedge = actualHedge
 		markAllocatorBypassProbeDispatched(attempt, time.Now())
 		providerCalls++
 		run := launchBravoStreamAttempt(
@@ -335,12 +371,12 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 	findHedge := func(primaryIndex int) (*bravoStreamAttemptRun, *executionFailure, bool) {
 		primaryProvider := normalizeProvider(plan[primaryIndex].Candidate.Provider)
 		for index := primaryIndex + 1; index < len(plan); index++ {
-			if index == adaptiveLastChanceIndex || attempted[index] ||
+			if index == adaptiveLastChanceIndex || plan[index].AdaptiveAssistTail || attempted[index] ||
 				streamAttemptIsProtectedBreakerProof(plan[index]) ||
 				normalizeProvider(plan[index].Candidate.Provider) == primaryProvider {
 				continue
 			}
-			run, failure, launched, deferredProof := startAttempt(index, true, true)
+			run, failure, launched, deferredProof := startAttempt(index, true, true, true)
 			if deferredProof {
 				continue
 			}
@@ -363,13 +399,14 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		return nil, nil, false
 	}
 
+attemptLoop:
 	for index := 0; index < len(plan); index++ {
 		if attempted[index] {
 			continue
 		}
 		attempted[index] = true
 		primaryCanHedge := canHedgeFrom(index)
-		primary, preflightFailure, launched, protectedProof := startAttempt(index, primaryCanHedge, false)
+		primary, preflightFailure, launched, protectedProof := startAttempt(index, primaryCanHedge, false, false)
 		if protectedProof {
 			primaryCanHedge = false
 		}
@@ -379,6 +416,10 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 				continue
 			}
 			if !canContinueStreamingRoute(*preflightFailure) {
+				if nextTail := nextAdaptiveAssistTailIndex(plan, index+1, attempted); nextTail >= 0 && adaptiveAssistCanReachTailAfter(*preflightFailure) {
+					index = nextTail - 1
+					continue
+				}
 				closeTerminalFailure(*preflightFailure)
 				return
 			}
@@ -470,11 +511,19 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 								settleBravoCompetingAttempt(hedge, hedgeResults, winnerFailure)
 								hedgeResults = nil
 							}
+							if nextTail := nextAdaptiveAssistTailIndex(plan, index+1, attempted); nextTail >= 0 && adaptiveAssistCanReachTailAfter(*winnerFailure) {
+								index = nextTail - 1
+								continue attemptLoop
+							}
 							closeTerminalFailure(*winnerFailure)
 							return
 						}
 					}
 					if hedgeResults == nil && deferredHedgeTerminal != nil {
+						if nextTail := nextAdaptiveAssistTailIndex(plan, index+1, attempted); nextTail >= 0 && adaptiveAssistCanReachTailAfter(*deferredHedgeTerminal) {
+							index = nextTail - 1
+							continue attemptLoop
+						}
 						closeTerminalFailure(*deferredHedgeTerminal)
 						return
 					}
@@ -496,10 +545,18 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 						settleBravoCompetingAttempt(hedge, hedgeResults, result.failure)
 						hedgeResults = nil
 					}
+					if nextTail := nextAdaptiveAssistTailIndex(plan, index+1, attempted); nextTail >= 0 && adaptiveAssistCanReachTailAfter(*result.failure) {
+						index = nextTail - 1
+						continue attemptLoop
+					}
 					closeTerminalFailure(*result.failure)
 					return
 				}
 				if hedgeResults == nil && deferredHedgeTerminal != nil {
+					if nextTail := nextAdaptiveAssistTailIndex(plan, index+1, attempted); nextTail >= 0 && adaptiveAssistCanReachTailAfter(*deferredHedgeTerminal) {
+						index = nextTail - 1
+						continue attemptLoop
+					}
 					closeTerminalFailure(*deferredHedgeTerminal)
 					return
 				}
@@ -553,6 +610,10 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 								failureCopy := *winnerFailure
 								deferredHedgeTerminal = &failureCopy
 							} else {
+								if nextTail := nextAdaptiveAssistTailIndex(plan, index+1, attempted); nextTail >= 0 && adaptiveAssistCanReachTailAfter(*winnerFailure) {
+									index = nextTail - 1
+									continue attemptLoop
+								}
 								closeTerminalFailure(*winnerFailure)
 								return
 							}
@@ -619,6 +680,10 @@ func runBravoStreamWithTrace(req rpcExecutorRequest, pluginStreamID string, init
 		}
 		stopHedgeTimer()
 		if deferredHedgeTerminal != nil {
+			if nextTail := nextAdaptiveAssistTailIndex(plan, index+1, attempted); nextTail >= 0 && adaptiveAssistCanReachTailAfter(*deferredHedgeTerminal) {
+				index = nextTail - 1
+				continue attemptLoop
+			}
 			closeTerminalFailure(*deferredHedgeTerminal)
 			return
 		}

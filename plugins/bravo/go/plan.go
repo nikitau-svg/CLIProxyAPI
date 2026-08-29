@@ -36,6 +36,10 @@ var runtimeState = struct {
 }
 
 func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logicalModel, contract requestCapabilityContract) ([]executionAttempt, error) {
+	return buildExecutionPlanWithConfig(req, logicalName, model, contract, loadedConfig())
+}
+
+func buildExecutionPlanWithConfig(req rpcExecutorRequest, logicalName string, model logicalModel, contract requestCapabilityContract, cfg pluginConfig) ([]executionAttempt, error) {
 	raw, errCall := callHost(pluginabi.MethodHostAuthList, map[string]any{
 		"host_callback_id": req.HostCallbackID,
 	})
@@ -50,7 +54,6 @@ func buildExecutionPlan(req rpcExecutorRequest, logicalName string, model logica
 
 	sticky := executionStickyKey(req.ExecutorRequest)
 	now := time.Now()
-	cfg := loadedConfig()
 	project, authenticatedProject := authenticatedExecutionProject(req, cfg)
 	if authenticatedProject {
 		// allowed_auth_ids is an authorization boundary, not an allocator hint.

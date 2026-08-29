@@ -45,6 +45,8 @@ func execute(raw []byte) ([]byte, error) {
 		routeTrace.preflightFailure("routing_preflight", *failure, nil)
 		return failureEnvelopeWithRouteTrace(routeTrace, *failure), nil
 	}
+	project, authenticated := authenticatedExecutionProject(req, cfg)
+	cfg = adaptiveConfigForExecution(cfg, project, authenticated)
 	logicalModelID := clientLogicalModelID(req.Model, cfg.Prefix+logicalName)
 	routeTrace.setLogicalModel(logicalModelID)
 	contract, errDetect := detectRequestContract(protocol, body, false)
@@ -68,7 +70,7 @@ func execute(raw []byte) ([]byte, error) {
 		routeTrace.preflightFailure("request_rewrite", failure, errStrip)
 		return failureEnvelopeWithRouteTrace(routeTrace, failure), nil
 	}
-	plan, errPlan := buildExecutionPlan(req, logicalName, model, contract)
+	plan, errPlan := buildExecutionPlanWithConfig(req, logicalName, model, contract, cfg)
 	if errPlan != nil {
 		failure := executionFailure{
 			Code:      "bravo_no_eligible_account",
@@ -132,6 +134,15 @@ func execute(raw []byte) ([]byte, error) {
 		}
 		releaseLease, acquired, leaseFailure := acquireExecutionAttemptLease(attempt)
 		if leaseFailure != nil {
+			if adaptiveAssistDeferredEligible(attempt, *leaseFailure) {
+				assistTail := adaptiveAssistTailAttempt(attempt)
+				routeTrace.registerAdaptiveAssistTail(assistTail)
+				if adaptiveLastChanceAdded {
+					plan = insertExecutionAttemptBefore(plan, len(plan)-1, assistTail)
+				} else {
+					plan = append(plan, assistTail)
+				}
+			}
 			if !adaptiveLastChanceAdded && adaptiveBreakerLastChanceEligible(attempt, *leaseFailure) {
 				// Keep the exact, already validated attempt at the tail of the
 				// request plan. This is a synchronous fail-open: it spends no
@@ -170,6 +181,10 @@ func execute(raw []byte) ([]byte, error) {
 			if executionFailureCanContinueRoute(failure) {
 				continue
 			}
+			if nextTail := nextAdaptiveAssistTailIndex(plan, attemptIndex+1, nil); nextTail >= 0 && adaptiveAssistCanReachTailAfter(failure) {
+				attemptIndex = nextTail - 1
+				continue
+			}
 			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailureForRequest(req, failureTraces, failure)), nil
 		}
 		// A host response means the provider accepted the attempt. Keep the
@@ -204,6 +219,10 @@ func execute(raw []byte) ([]byte, error) {
 				blockedModels[executionFailureModelKey(attempt)] = true
 			}
 			if executionFailureCanContinueRoute(failure) {
+				continue
+			}
+			if nextTail := nextAdaptiveAssistTailIndex(plan, attemptIndex+1, nil); nextTail >= 0 && adaptiveAssistCanReachTailAfter(failure) {
+				attemptIndex = nextTail - 1
 				continue
 			}
 			return failureEnvelopeWithRouteTrace(routeTrace, finalExecutionFailureForRequest(req, failureTraces, failure)), nil
@@ -281,7 +300,7 @@ func nestedUsageAlias(req rpcExecutorRequest, attempt executionAttempt) string {
 }
 
 func prepareBravoExecution(req rpcExecutorRequest) (string, logicalModel, pluginConfig, *executionFailure) {
-	cfg := loadedConfig()
+	cfg := immutableRoutingConfigSnapshot(loadedConfig())
 	if !cfg.Enabled {
 		return "", logicalModel{}, cfg, &executionFailure{
 			Code:    "bravo_disabled",

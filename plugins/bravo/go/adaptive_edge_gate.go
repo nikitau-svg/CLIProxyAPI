@@ -182,7 +182,7 @@ func newAdaptiveEdgeGateAttemptState(
 		enforce:                adaptiveEdgeRoutingEnforced(cfg),
 		quotaFresh:             quotaFreshnessAt(quota, attempt.Candidate.Model, cfg, now) == quotaFreshnessFresh,
 		compactBypass:          attempt.CompactBypass,
-		breakerOnly:            cfg.AdaptiveAllocatorMode == "breaker",
+		breakerOnly:            cfg.AdaptiveAllocatorMode == "breaker" || cfg.AdaptiveAllocatorMode == "assist",
 	}
 }
 
@@ -195,7 +195,7 @@ func acquireAdaptiveBreakerEnforcementLease(
 ) (func(bool), bool, *executionFailure) {
 	cfg := loadedConfig()
 	cfg = adaptiveAttemptConfig(attempt, cfg)
-	if cfg.AdaptiveAllocatorMode != "breaker" || !attempt.AdaptiveShadow || attempt.CompactBypass {
+	if (cfg.AdaptiveAllocatorMode != "breaker" && cfg.AdaptiveAllocatorMode != "assist") || !attempt.AdaptiveShadow || attempt.CompactBypass {
 		return wrapAdaptiveShadowLease(attempt, func(bool) {}), true, nil
 	}
 	now = now.UTC()
@@ -1003,6 +1003,8 @@ func adaptiveEdgeGateSummary(cfg pluginConfig, authIndexes []string, now time.Ti
 		view.Note = "Shadow-турникет отключён вместе с адаптивным наблюдением."
 	} else if cfg.AdaptiveAllocatorMode == "breaker" {
 		view.Note = "Боевой breaker закрывает маршрут только после фактической доверенной ошибки квоты/rate-limit; прогноз headroom остаётся теневым, очередей нет."
+	} else if cfg.AdaptiveAllocatorMode == "assist" {
+		view.Note = "Evidence breaker активен; soft forecast может только перенести fully-calibrated secondary-попытку в хвост текущего запроса, очередей нет."
 	} else if cfg.AdaptiveAllocatorMode == "enforce" {
 		view.Note = "Турникет мгновенно пропускает подтверждённо опасную попытку и продолжает соседний маршрут; неизвестные и устаревшие квоты fail-open, очередей нет."
 	}

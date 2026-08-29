@@ -175,7 +175,7 @@ func pluginRegistration() registration {
 				{Name: "fallback_hedge_delay_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Delay before one cross-provider streaming-bootstrap hedge. Zero disables hedging."},
 				{Name: "state_path", Type: pluginapi.ConfigFieldTypeString, Description: "Private persistent Bravo usage and quota snapshot."},
 				{Name: "allocator_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Allocator mode: off, observe, or enforce."},
-				{Name: "adaptive_allocator_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Adaptive allocator: off, observe, breaker, or enforce. breaker skips only routes closed by a trusted real quota/rate-limit failure while forecasts remain shadow; no mode queues or adds provider requests."},
+				{Name: "adaptive_allocator_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Adaptive allocator: off, observe, breaker, assist, or experimental enforce. assist may only defer a fully calibrated secondary attempt to the request tail; no mode queues or starts background provider work."},
 				{Name: "adaptive_cooling_half_life_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Half-life for shadow commitments and learned uncertainty."},
 				{Name: "adaptive_cooling_max_age_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Hard maximum age after which shadow state has fully cooled."},
 				{Name: "quota_refresh_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Confirmed quota cache lifetime."},

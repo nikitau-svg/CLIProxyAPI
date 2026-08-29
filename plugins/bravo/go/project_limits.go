@@ -264,6 +264,7 @@ func buildProjectLimitsResponse(
 	now time.Time,
 	nextAllowed time.Time,
 ) projectLimitsResponse {
+	projectAdaptiveCfg := adaptiveConfigForProject(cfg, project)
 	providers := buildProjectLimitProviders(cfg, project, auths, now)
 	freshness := ""
 	for _, provider := range providers {
@@ -297,7 +298,7 @@ func buildProjectLimitsResponse(
 		RefreshSeconds:    int64(projectLimitsRefreshInterval / time.Second),
 		SnapshotFreshness: freshness,
 		Providers:         providers,
-		AdaptiveAllocator: adaptiveShadowSummary(cfg, adaptiveShadowAuthIndexes(auths), now),
+		AdaptiveAllocator: adaptiveShadowSummary(projectAdaptiveCfg, adaptiveShadowAuthIndexes(auths), now),
 		QuotaConsumption:  quotaConsumption,
 		Usage: projectLimitsUsageView{
 			PeriodDays: int(projectLimitsUsageWindow / (24 * time.Hour)),

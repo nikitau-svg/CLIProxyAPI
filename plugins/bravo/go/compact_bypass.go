@@ -172,7 +172,7 @@ func acquireExecutionAttemptLease(attempt executionAttempt) (func(bool), bool, *
 		var release func(bool)
 		cfg := loadedConfig()
 		cfg = adaptiveAttemptConfig(attempt, cfg)
-		if attempt.AdaptiveShadow && adaptiveForecastRoutingEnforced(cfg) {
+		if attempt.AdaptiveShadow && adaptiveForecastAdmissionActive(cfg) {
 			adaptiveRelease, adaptiveAcquired, adaptiveFailure := acquireAdaptiveEnforcementLease(attempt, adaptiveShadowNow())
 			if adaptiveFailure != nil || !adaptiveAcquired {
 				return func(bool) {}, false, adaptiveFailure

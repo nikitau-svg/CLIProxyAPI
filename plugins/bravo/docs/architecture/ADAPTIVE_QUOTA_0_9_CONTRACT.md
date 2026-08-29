@@ -1,9 +1,10 @@
 # Bravo Adaptive Quota 0.9 Preview Contract
 
-Status: Bravo 0.9.0-preview.12, phase 3 with explicit `observe`, evidence-only
-`breaker`, and experimental full `enforce` modes, token calibration v2,
-forecast backtest v3 and edge-gate state machine v5. Base and stable rollback:
-published Bravo 0.8.11.
+Status: Bravo 0.9.0-preview.13, phase 4 with explicit `observe`, evidence-only
+`breaker`, beta soft `assist`, and experimental full `enforce` modes, token
+calibration v2, forecast backtest v3, edge-gate state machine v5, and a bounded
+seven-day hourly readiness cohort. Base and stable rollback: published Bravo
+0.8.11.
 
 ## Purpose
 
@@ -13,12 +14,18 @@ analytics and capacity planning and, only in experimental full `enforce`, may
 reserve a fresh provider-confirmed quota before dispatch. Production `breaker`
 does not predict request cost or act on cached low headroom: only a real reviewed
 quota/rate-limit outcome may close a route.
+`assist` is a separate fail-open authority: it may move one fully calibrated
+secondary attempt to the sequential tail of the same request, but cannot remove
+the attempt, touch a primary, wait, hedge, or create background work. Hard
+forecast withholding remains exclusive to experimental `enforce`.
 
 ## Non-negotiable invariants
 
-1. `adaptive_allocator_mode` accepts `off`, `observe`, `breaker`, and `enforce`;
-   an empty value normalizes to `observe`. `assist` and unknown values fail
-   configuration with an explicit error.
+1. `adaptive_allocator_mode` accepts `off`, `observe`, `breaker`, `assist`, and
+   `enforce`; an empty value normalizes to `observe`. Unknown values fail
+   configuration with an explicit error. Global `assist` is only an available
+   authority: a project receives it only with explicit `adaptive_assist: true`;
+   every unmarked project is downgraded to effective `breaker`.
 2. `observe` preserves the exact 0.8.11 execution order, eligibility decisions,
    fallback behavior and provider-call count. Shadow data cannot withhold an
    account or change a tariff floor.
@@ -32,6 +39,18 @@ quota/rate-limit outcome may close a route.
    a potentially healthy neighbor. A local `bravo_adaptive_*` decision can never
    be the final client error, including when `max_attempts` is exhausted. The
    mechanism never waits, queues, or creates background work.
+   `assist` preserves this evidence breaker and adds only a soft forecast
+   reorder. Immediately before dispatch, a non-primary attempt with fresh
+   confirmed quota and complete token calibration for session plus the
+   effective weekly/model-weekly window may reserve its forecast atomically. If
+   it does not fit, the exact already-authorized attempt is retained once in the
+   sequential request tail. Its tail copy bypasses forecast admission but
+   rechecks the current evidence breaker and ordinary route rules. Primary,
+   compact/allocator bypasses, protected proofs, partial or stale evidence,
+   saturation, and every finite `max_attempts` fail open to baseline ordering.
+   Streaming hedging is disabled only when assist can defer
+   (`max_attempts == 0`); finite budgets keep the baseline hedge because the
+   forecast is fully inert. Hard forecast rejection is not part of this mode.
 4. The ordinary allocator remains authoritative for project allowlists,
    primary ownership, disabled subscriptions, cooldowns and tariff floors. A
    project primary precedes shared capacity and has a zero owner floor, but
@@ -62,7 +81,8 @@ quota/rate-limit outcome may close a route.
    runtime-only. Reconciled token-rate profiles and aggregate consumption
    analytics persist so that observation can continue across restarts. No
    database, credential, YAML or state-file migration is required for
-   preview.12.
+   preview.13. The optional hourly audit sidecar is created automatically from
+   existing bounded telemetry.
 10. Public project views expose only aggregate values after the project's allowed
    account pool is applied. Credential identities are not returned.
 11. The durable audit writer is telemetry-only. Enqueue is non-blocking; queue,
@@ -87,15 +107,28 @@ quota/rate-limit outcome may close a route.
     scheduled or recovery proof for an existing breaker skips locally when its
     coordination lease cannot be acquired. A stale simulated lease has a hard
     two-hour recovery bound.
-16. The attempt snapshots whether it was built under `observe`, `breaker`, or
-    `enforce`. A concurrent hot reload cannot retroactively apply or erase
-    routing authority in its asynchronous audit record.
+16. The request and every attempt snapshot the project-effective `observe`,
+    `breaker`, `assist`, or `enforce` authority together with `max_attempts`.
+    Planning, provider budget, acquisition, streaming hedge and retained tails
+    use that same snapshot. A concurrent hot reload affects only later requests
+    and cannot relabel the asynchronous audit record.
 17. A stale confirmed zero whose scheduled reset already elapsed may bypass the
     ordinary allocator only through one non-queued probe per credential and
     reset generation. Competitors continue a neighboring route without a
     provider call. The generation is consumed at provider dispatch, obsolete
     consumed generations are reconciled by fresh confirmed quota, and the
     runtime is bounded to 4096 entries with a two-hour abandoned-lease bound.
+18. Detailed adaptive records remain bounded to 4096, while readiness and
+    aggregate report totals use at most seven days of privacy-safe hourly
+    buckets. Buckets contain counters and first/last timestamps only: no trace,
+    project, credential, prompt, header, request, or response identity. A stale
+    writer assigns a monotonic sequence before memory, hourly aggregation and
+    JSONL write; the sidecar atomically stores its checkpoint. On restart only
+    sequence values above that checkpoint are re-aggregated, so out-of-order
+    completion cannot drop or double-count a crash tail. Reports expose
+    truncation, retained span, explicit readiness blockers, and separate assist
+    request/defer/tail/invariant counters. Any lost or duplicate tail, primary
+    defer, or actual assist stream hedge forces `needs_review`.
 
 ## Edge gate v5
 
@@ -121,6 +154,14 @@ these decisions remain counterfactual. In `breaker`, the skipped attempt is
 `not_dispatched` while neighbors are tried, with one synchronous baseline last
 chance if none answers. Full proactive Guarded/forecast behavior exists only in
 experimental `enforce`.
+
+In `assist`, this breaker remains authoritative. A fully calibrated secondary
+attempt that does not fit its fresh confirmed forecast is not rejected: its
+exact already-authorized copy is atomically deferred to the sequential tail.
+The tail runs only after ordinary neighbors, before the final breaker-recovery
+proof, bypasses forecast admission, and rechecks the current evidence breaker.
+It cannot be hedged or deferred a second time. Primary and uncertain evidence
+continue in their baseline position.
 
 The simulated lease is acquired only after the real allocator grants an
 attempt and is settled only after the provider outcome has been classified.

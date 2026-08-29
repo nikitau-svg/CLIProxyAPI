@@ -168,6 +168,24 @@ func TestProjectLimitsReturnsConfirmedResetsUsageAndHourlyCache(t *testing.T) {
 	}
 }
 
+func TestProjectLimitsReportsProjectEffectiveAssistMode(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := defaultPluginConfig()
+	cfg.AdaptiveAllocatorMode = "assist"
+	project := smartKeyConfig{ID: "assist-opt-out", Name: "Opt out"}
+	response := buildProjectLimitsResponse(cfg, project, nil, now, now.Add(5*time.Minute))
+	if response.AdaptiveAllocator.Mode != "breaker" || response.AdaptiveAllocator.SoftAssistEnabled ||
+		response.AdaptiveAllocator.ForecastRoutingEnforced {
+		t.Fatalf("opt-out limits leaked global assist: %#v", response.AdaptiveAllocator)
+	}
+	project.AdaptiveAssist = true
+	response = buildProjectLimitsResponse(cfg, project, nil, now, now.Add(5*time.Minute))
+	if response.AdaptiveAllocator.Mode != "assist" || !response.AdaptiveAllocator.SoftAssistEnabled ||
+		response.AdaptiveAllocator.ForecastRoutingEnforced {
+		t.Fatalf("opt-in limits hid effective assist: %#v", response.AdaptiveAllocator)
+	}
+}
+
 func TestProjectLimitsRejectsInvalidFormatBeforeHostIO(t *testing.T) {
 	resetProjectLimitsCacheForTest()
 	t.Cleanup(resetProjectLimitsCacheForTest)

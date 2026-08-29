@@ -12,10 +12,28 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+func TestProjectAdaptiveAssistDefaultsFalseAndPatchIsOptional(t *testing.T) {
+	view := smartKeyProjectView(smartKeyConfig{ID: "legacy", Name: "Legacy"})
+	if view.AdaptiveAssist {
+		t.Fatal("legacy project unexpectedly opted into assist")
+	}
+	var patch patchProjectRequest
+	if err := json.Unmarshal([]byte(`{"id":"legacy","name":"unchanged"}`), &patch); err != nil {
+		t.Fatal(err)
+	}
+	if patch.AdaptiveAssist != nil {
+		t.Fatal("omitted adaptive_assist would overwrite persisted value")
+	}
+	if err := json.Unmarshal([]byte(`{"id":"legacy","adaptive_assist":false}`), &patch); err != nil || patch.AdaptiveAssist == nil || *patch.AdaptiveAssist {
+		t.Fatalf("explicit false patch lost pointer semantics: err=%v patch=%#v", err, patch)
+	}
+}
+
 func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	previousConfig := loadedConfig()
 	cfg := defaultPluginConfig()
 	cfg.RequireSmartKey = true
+	cfg.AdaptiveAllocatorMode = "assist"
 	if errNormalize := normalizeConfig(&cfg); errNormalize != nil {
 		t.Fatal(errNormalize)
 	}
@@ -81,6 +99,7 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 		"models":["bravo/frontier"],
 		"primary_auth_ids":["claude-primary"],
 		"allowed_auth_ids":["claude-primary"],
+		"adaptive_assist":true,
 		"policy":{"future_reserve_percent":50},
 		"prompt_cache":{"anthropic_ttl":"1h"}
 	}`)
@@ -108,6 +127,9 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	if got, _ := project["allowed_auth_ids"].([]any); len(got) != 1 || got[0] != "1111111111111111" {
 		t.Fatalf("created allowed_auth_ids = %#v", project["allowed_auth_ids"])
 	}
+	if project["adaptive_assist"] != true {
+		t.Fatalf("created adaptive_assist = %#v", project["adaptive_assist"])
+	}
 	promptCache := projectMap(t, project["prompt_cache"])
 	if promptCache["anthropic_ttl"] != "1h" || promptCache["openai_mode"] != projectPromptCacheOpenAIManaged {
 		t.Fatalf("created prompt_cache = %#v", promptCache)
@@ -122,6 +144,9 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	sum := sha256.Sum256([]byte(plaintext))
 	if persisted.SHA256 != hex.EncodeToString(sum[:]) {
 		t.Fatal("persisted digest does not match the one-time plaintext key")
+	}
+	if !persisted.AdaptiveAssist {
+		t.Fatal("create did not persist adaptive_assist")
 	}
 	if strings.Contains(string(stored[0]), plaintext) {
 		t.Fatal("persisted config contains plaintext key")
@@ -139,6 +164,8 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	}
 	if projects, _ := listed["projects"].([]any); len(projects) != 1 {
 		t.Fatalf("projects = %#v", listed["projects"])
+	} else if listedProject := projectMap(t, projects[0]); listedProject["adaptive_assist"] != true {
+		t.Fatalf("listed adaptive_assist = %#v", listedProject["adaptive_assist"])
 	}
 	modelOptions, _ := listed["models"].([]any)
 	if len(modelOptions) != len(cfg.Models) {
@@ -171,7 +198,7 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 		t,
 		http.MethodPatch,
 		"/v0/management/bravo/projects",
-		`{"id":"`+projectID+`","name":"Alpha disabled","enabled":false,"policy":null,"prompt_cache":{"anthropic_ttl":"5m"}}`,
+		`{"id":"`+projectID+`","name":"Alpha disabled","enabled":false,"adaptive_assist":false,"policy":null,"prompt_cache":{"anthropic_ttl":"5m"}}`,
 	)
 	if status != http.StatusOK {
 		t.Fatalf("patch status = %d body=%#v", status, patched)
@@ -179,6 +206,18 @@ func TestBravoProjectCRUDGeneratesOneTimeHashedKeys(t *testing.T) {
 	patchedProject := projectMap(t, patched["project"])
 	if patchedProject["enabled"] != false || patchedProject["status"] != projectStatusDisabled {
 		t.Fatalf("patched project = %#v", patchedProject)
+	}
+	if patchedProject["adaptive_assist"] != false {
+		t.Fatalf("patched adaptive_assist = %#v", patchedProject["adaptive_assist"])
+	}
+	var patchedPersisted smartKeyConfig
+	if errUnmarshal := json.Unmarshal(stored[0], &patchedPersisted); errUnmarshal != nil || patchedPersisted.AdaptiveAssist {
+		t.Fatalf("patch did not persist assist kill switch: err=%v item=%#v", errUnmarshal, patchedPersisted)
+	}
+	loadedAfterKill := loadedConfig()
+	storedAfterKill, foundAfterKill := findProjectByID(loadedAfterKill, projectID)
+	if !foundAfterKill || adaptiveConfigForProject(loadedAfterKill, storedAfterKill).AdaptiveAllocatorMode == "assist" {
+		t.Fatalf("hot assist kill switch was not installed: found=%v project=%#v", foundAfterKill, storedAfterKill)
 	}
 	patchedPromptCache := projectMap(t, patchedProject["prompt_cache"])
 	if patchedPromptCache["anthropic_ttl"] != "5m" {

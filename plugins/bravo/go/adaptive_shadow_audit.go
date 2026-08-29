@@ -26,7 +26,66 @@ const (
 	adaptiveShadowAuditDefaultPeriod     = 24 * time.Hour
 	adaptiveShadowAuditReviewRequests    = 100
 	adaptiveShadowAuditReviewCoverage    = 6 * time.Hour
+	adaptiveShadowAuditAggregatePeriod   = 7 * 24 * time.Hour
 )
+
+type adaptiveShadowAuditHour struct {
+	Hour                     time.Time `json:"hour"`
+	First                    time.Time `json:"first"`
+	Last                     time.Time `json:"last"`
+	Requests                 int       `json:"requests"`
+	SuccessfulRequests       int       `json:"successful_requests"`
+	FailedRequests           int       `json:"failed_requests"`
+	ActualAttempts           int       `json:"actual_attempts"`
+	FallbackRequests         int       `json:"fallback_requests"`
+	RoutingEnforced          bool      `json:"routing_enforced"`
+	RoutingChanges           int       `json:"routing_changes"`
+	AdditionalRequests       int       `json:"additional_requests"`
+	WouldAdmit               int       `json:"would_admit"`
+	WouldWithhold            int       `json:"would_withhold"`
+	LegacyAttempts           int       `json:"legacy_attempts"`
+	Unknown                  int       `json:"unknown"`
+	SuccessfulWithhold       int       `json:"successful_withhold"`
+	QuotaFailuresAdmit       int       `json:"quota_failures_admit"`
+	TokenAttempts            int       `json:"token_attempts"`
+	TokenFirst               time.Time `json:"token_first,omitempty"`
+	TokenLast                time.Time `json:"token_last,omitempty"`
+	TokenWouldAdmit          int       `json:"token_would_admit"`
+	TokenWouldWithhold       int       `json:"token_would_withhold"`
+	TokenUnknown             int       `json:"token_unknown"`
+	TokenSuccessfulWithhold  int       `json:"token_successful_withhold"`
+	TokenQuotaFailuresAdmit  int       `json:"token_quota_failures_admit"`
+	EdgeAttempts             int       `json:"edge_attempts"`
+	EdgeFirst                time.Time `json:"edge_first,omitempty"`
+	EdgeLast                 time.Time `json:"edge_last,omitempty"`
+	EdgeGreen                int       `json:"edge_green"`
+	EdgeGuarded              int       `json:"edge_guarded"`
+	EdgeTripped              int       `json:"edge_tripped"`
+	EdgeHalfOpen             int       `json:"edge_half_open"`
+	EdgeDispatch             int       `json:"edge_dispatch"`
+	EdgeProbe                int       `json:"edge_probe"`
+	EdgeSkipBusy             int       `json:"edge_skip_busy"`
+	EdgeSkipTripped          int       `json:"edge_skip_tripped"`
+	EdgeSuccessfulSkip       int       `json:"edge_successful_skip"`
+	EdgeQuotaFailureSkip     int       `json:"edge_quota_failure_skip"`
+	EdgeQuotaFailureDispatch int       `json:"edge_quota_failure_dispatch"`
+	EdgeTrips                int       `json:"edge_trips"`
+	EdgeReopens              int       `json:"edge_reopens"`
+	AssistActuallyDeferred   int       `json:"assist_actually_deferred"`
+	AssistTailReached        int       `json:"assist_tail_reached"`
+	AssistTailDispatched     int       `json:"assist_tail_dispatched"`
+	AssistTailSuccess        int       `json:"assist_tail_success"`
+	AssistNeighborSuccess    int       `json:"assist_neighbor_success"`
+	AssistLostTail           int       `json:"assist_lost_tail"`
+	AssistDuplicateTail      int       `json:"assist_duplicate_tail"`
+	AssistPrimaryDeferred    int       `json:"assist_primary_deferred"`
+	AssistStreamHedge        int       `json:"assist_stream_hedge"`
+	AssistRequests           int       `json:"assist_requests"`
+	AssistSuccessfulRequests int       `json:"assist_successful_requests"`
+	AssistFailedRequests     int       `json:"assist_failed_requests"`
+	AssistTailNotReached     int       `json:"assist_tail_not_reached"`
+	AssistTerminalBeforeTail int       `json:"assist_terminal_before_tail"`
+}
 
 type adaptiveShadowAuditAttempt struct {
 	Provider                      string  `json:"provider"`
@@ -57,10 +116,12 @@ type adaptiveShadowAuditAttempt struct {
 	EdgeGateWeeklyHeadroom        float64 `json:"edge_gate_weekly_headroom_percent,omitempty"`
 	EdgeGateTripRemainingSeconds  int64   `json:"edge_gate_trip_remaining_seconds,omitempty"`
 	EdgeGateOutcomeTransition     string  `json:"edge_gate_outcome_transition,omitempty"`
+	AssistLifecycle               string  `json:"assist_lifecycle,omitempty"`
 }
 
 type adaptiveShadowAuditRecord struct {
 	SchemaVersion              int                          `json:"schema_version"`
+	Sequence                   uint64                       `json:"sequence,omitempty"`
 	At                         time.Time                    `json:"at"`
 	TraceID                    string                       `json:"trace_id"`
 	LogicalModel               string                       `json:"logical_model"`
@@ -74,6 +135,20 @@ type adaptiveShadowAuditRecord struct {
 	RoutingChangesApplied      int                          `json:"routing_changes_applied"`
 	AdditionalProviderRequests int                          `json:"additional_provider_requests"`
 	Attempts                   []adaptiveShadowAuditAttempt `json:"attempts"`
+	AssistActuallyDeferred     int                          `json:"assist_actually_deferred,omitempty"`
+	AssistTailReached          int                          `json:"assist_tail_reached,omitempty"`
+	AssistTailDispatched       int                          `json:"assist_tail_dispatched,omitempty"`
+	AssistTailSuccess          int                          `json:"assist_tail_success,omitempty"`
+	AssistNeighborSuccess      int                          `json:"assist_neighbor_success,omitempty"`
+	AssistLostTail             int                          `json:"assist_lost_tail,omitempty"`
+	AssistDuplicateTail        int                          `json:"assist_duplicate_tail,omitempty"`
+	AssistPrimaryDeferred      int                          `json:"assist_primary_deferred,omitempty"`
+	AssistStreamHedge          int                          `json:"assist_stream_hedge,omitempty"`
+	AssistRequests             int                          `json:"assist_requests,omitempty"`
+	AssistSuccessfulRequests   int                          `json:"assist_successful_requests,omitempty"`
+	AssistFailedRequests       int                          `json:"assist_failed_requests,omitempty"`
+	AssistTailNotReached       int                          `json:"assist_tail_not_reached,omitempty"`
+	AssistTerminalBeforeTail   int                          `json:"assist_terminal_before_tail,omitempty"`
 }
 
 type adaptiveShadowAuditReport struct {
@@ -126,6 +201,20 @@ type adaptiveShadowAuditReport struct {
 	EdgeGateCoverageSeconds             int64                       `json:"edge_gate_coverage_seconds"`
 	EdgeGateVerdict                     string                      `json:"edge_gate_verdict"`
 	EdgeGateVerdictMessage              string                      `json:"edge_gate_verdict_message"`
+	AssistActuallyDeferred              int                         `json:"assist_actually_deferred"`
+	AssistTailReached                   int                         `json:"assist_tail_reached"`
+	AssistTailDispatched                int                         `json:"assist_tail_dispatched"`
+	AssistTailSuccess                   int                         `json:"assist_tail_success"`
+	AssistNeighborSuccess               int                         `json:"assist_neighbor_success"`
+	AssistLostTail                      int                         `json:"assist_lost_tail"`
+	AssistDuplicateTail                 int                         `json:"assist_duplicate_tail"`
+	AssistPrimaryDeferred               int                         `json:"assist_primary_deferred"`
+	AssistStreamHedge                   int                         `json:"assist_stream_hedge"`
+	AssistRequests                      int                         `json:"assist_requests"`
+	AssistSuccessfulRequests            int                         `json:"assist_successful_requests"`
+	AssistFailedRequests                int                         `json:"assist_failed_requests"`
+	AssistTailNotReached                int                         `json:"assist_tail_not_reached"`
+	AssistTerminalBeforeTail            int                         `json:"assist_terminal_before_tail"`
 	RoutingChangesApplied               int                         `json:"routing_changes_applied"`
 	AdditionalProviderRequests          int                         `json:"additional_provider_requests"`
 	QueueDepth                          int                         `json:"queue_depth"`
@@ -137,6 +226,11 @@ type adaptiveShadowAuditReport struct {
 	DiskBytes                           int64                       `json:"disk_bytes"`
 	DiskLimitBytes                      int64                       `json:"disk_limit_bytes"`
 	LastEventAt                         time.Time                   `json:"last_event_at,omitempty"`
+	OldestRetainedAt                    time.Time                   `json:"oldest_retained_at,omitempty"`
+	RetainedHistorySpanSeconds          int64                       `json:"retained_history_span_seconds"`
+	HistoryTruncated                    bool                        `json:"history_truncated"`
+	HighRateTruncation                  bool                        `json:"high_rate_truncation"`
+	ReadinessBlockers                   []string                    `json:"readiness_blockers,omitempty"`
 	Warning                             string                      `json:"warning,omitempty"`
 	Recent                              []adaptiveShadowAuditRecord `json:"recent,omitempty"`
 }
@@ -151,9 +245,12 @@ type adaptiveShadowAuditStore struct {
 	closeOnce   sync.Once
 	lifecycle   sync.RWMutex
 
-	mu      sync.RWMutex
-	records []adaptiveShadowAuditRecord
-	warning string
+	mu                  sync.RWMutex
+	records             []adaptiveShadowAuditRecord
+	hours               map[int64]*adaptiveShadowAuditHour
+	nextSequence        uint64
+	aggregateCheckpoint uint64
+	warning             string
 
 	dropped         atomic.Uint64
 	writeFailures   atomic.Uint64
@@ -192,6 +289,7 @@ func newAdaptiveShadowAuditStore(statePath string, queueCapacity int) *adaptiveS
 		queue:       make(chan adaptiveShadowAuditRecord, queueCapacity),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
+		hours:       make(map[int64]*adaptiveShadowAuditHour),
 	}
 }
 
@@ -313,7 +411,7 @@ func (store *adaptiveShadowAuditStore) run() {
 		file, writer = nil, nil
 	}
 	writeRecord := func(record adaptiveShadowAuditRecord) {
-		store.appendMemory(record)
+		record = store.appendMemory(record)
 		if store.diskDisabled.Load() {
 			return
 		}
@@ -360,6 +458,7 @@ func (store *adaptiveShadowAuditStore) run() {
 			writeRecord(record)
 		case <-ticker.C:
 			flush(true)
+			store.saveHours()
 		case <-store.stop:
 			for {
 				select {
@@ -367,6 +466,7 @@ func (store *adaptiveShadowAuditStore) run() {
 					writeRecord(record)
 				default:
 					closeFile()
+					store.saveHours()
 					return
 				}
 			}
@@ -377,6 +477,12 @@ func (store *adaptiveShadowAuditStore) run() {
 func (store *adaptiveShadowAuditStore) rotate() error {
 	if store == nil {
 		return nil
+	}
+	// Rotation is destructive: a second rotation removes the only older JSONL
+	// generation. Durably checkpoint every record already accepted by the
+	// single writer before deleting it, rather than relying on the 1s ticker.
+	if errPersist := store.persistHours(); errPersist != nil {
+		return fmt.Errorf("persist adaptive audit checkpoint before rotation: %w", errPersist)
 	}
 	if errRemove := os.Remove(store.rotatedPath); errRemove != nil && !os.IsNotExist(errRemove) {
 		return errRemove
@@ -389,13 +495,310 @@ func (store *adaptiveShadowAuditStore) rotate() error {
 	return nil
 }
 
-func (store *adaptiveShadowAuditStore) appendMemory(record adaptiveShadowAuditRecord) {
+func (store *adaptiveShadowAuditStore) appendMemory(record adaptiveShadowAuditRecord) adaptiveShadowAuditRecord {
 	store.mu.Lock()
+	if record.Sequence == 0 {
+		store.nextSequence++
+		record.Sequence = store.nextSequence
+	} else if record.Sequence > store.nextSequence {
+		store.nextSequence = record.Sequence
+	}
+	store.appendHourLocked(record)
+	if record.Sequence > store.aggregateCheckpoint {
+		store.aggregateCheckpoint = record.Sequence
+	}
 	store.records = append(store.records, record)
 	if excess := len(store.records) - adaptiveShadowAuditMemoryRecords; excess > 0 {
 		copy(store.records, store.records[excess:])
 		store.records = store.records[:adaptiveShadowAuditMemoryRecords]
 	}
+	store.mu.Unlock()
+	return record
+}
+
+func (store *adaptiveShadowAuditStore) appendHourLocked(record adaptiveShadowAuditRecord) {
+	if store.hours == nil {
+		store.hours = make(map[int64]*adaptiveShadowAuditHour)
+	}
+	hour := record.At.UTC().Truncate(time.Hour)
+	key := hour.Unix()
+	bucket := store.hours[key]
+	if bucket == nil {
+		bucket = &adaptiveShadowAuditHour{Hour: hour}
+		store.hours[key] = bucket
+	}
+	if bucket.First.IsZero() || record.At.Before(bucket.First) {
+		bucket.First = record.At
+	}
+	if record.At.After(bucket.Last) {
+		bucket.Last = record.At
+	}
+	bucket.Requests++
+	if record.Success {
+		bucket.SuccessfulRequests++
+	} else {
+		bucket.FailedRequests++
+	}
+	bucket.ActualAttempts += record.ActualExecutionAttempts
+	if record.FallbackUsed {
+		bucket.FallbackRequests++
+	}
+	bucket.RoutingEnforced = bucket.RoutingEnforced || record.RoutingEnforced
+	bucket.RoutingChanges += record.RoutingChangesApplied
+	bucket.AdditionalRequests += record.AdditionalProviderRequests
+	bucket.AssistActuallyDeferred += record.AssistActuallyDeferred
+	bucket.AssistTailReached += record.AssistTailReached
+	bucket.AssistTailDispatched += record.AssistTailDispatched
+	bucket.AssistTailSuccess += record.AssistTailSuccess
+	bucket.AssistNeighborSuccess += record.AssistNeighborSuccess
+	bucket.AssistLostTail += record.AssistLostTail
+	bucket.AssistDuplicateTail += record.AssistDuplicateTail
+	bucket.AssistPrimaryDeferred += record.AssistPrimaryDeferred
+	bucket.AssistStreamHedge += record.AssistStreamHedge
+	bucket.AssistRequests += record.AssistRequests
+	bucket.AssistSuccessfulRequests += record.AssistSuccessfulRequests
+	bucket.AssistFailedRequests += record.AssistFailedRequests
+	bucket.AssistTailNotReached += record.AssistTailNotReached
+	bucket.AssistTerminalBeforeTail += record.AssistTerminalBeforeTail
+	for _, attempt := range record.Attempts {
+		if attempt.AssistLifecycle != "" {
+			continue
+		}
+		token := strings.HasPrefix(attempt.EstimateConfidence, "token_calibrated_")
+		if token {
+			bucket.TokenAttempts++
+			if bucket.TokenFirst.IsZero() || record.At.Before(bucket.TokenFirst) {
+				bucket.TokenFirst = record.At
+			}
+			if record.At.After(bucket.TokenLast) {
+				bucket.TokenLast = record.At
+			}
+		} else {
+			bucket.LegacyAttempts++
+		}
+		switch attempt.Decision {
+		case adaptiveShadowDecisionAdmit:
+			bucket.WouldAdmit++
+			if token {
+				bucket.TokenWouldAdmit++
+			}
+		case adaptiveShadowDecisionWithhold:
+			bucket.WouldWithhold++
+			if token {
+				bucket.TokenWouldWithhold++
+			}
+		}
+		if attempt.Decision != adaptiveShadowDecisionAdmit && attempt.Decision != adaptiveShadowDecisionWithhold {
+			bucket.Unknown++
+			if token {
+				bucket.TokenUnknown++
+			}
+		}
+		if attempt.Success && attempt.Decision == adaptiveShadowDecisionWithhold {
+			bucket.SuccessfulWithhold++
+			if token {
+				bucket.TokenSuccessfulWithhold++
+			}
+		}
+		if attempt.Decision == adaptiveShadowDecisionAdmit && adaptiveShadowAuditQuotaFailure(attempt.ErrorCode) {
+			bucket.QuotaFailuresAdmit++
+			if token {
+				bucket.TokenQuotaFailuresAdmit++
+			}
+		}
+		if attempt.EdgeGateState != "" {
+			bucket.EdgeAttempts++
+			if bucket.EdgeFirst.IsZero() || record.At.Before(bucket.EdgeFirst) {
+				bucket.EdgeFirst = record.At
+			}
+			if record.At.After(bucket.EdgeLast) {
+				bucket.EdgeLast = record.At
+			}
+			switch attempt.EdgeGateState {
+			case adaptiveEdgeGateStateGreen:
+				bucket.EdgeGreen++
+			case adaptiveEdgeGateStateGuarded:
+				bucket.EdgeGuarded++
+			case adaptiveEdgeGateStateTripped:
+				bucket.EdgeTripped++
+			case adaptiveEdgeGateStateHalfOpen:
+				bucket.EdgeHalfOpen++
+			}
+			skipped := false
+			switch attempt.EdgeGateDecision {
+			case adaptiveEdgeGateDecisionDispatch:
+				bucket.EdgeDispatch++
+			case adaptiveEdgeGateDecisionProbe:
+				bucket.EdgeProbe++
+			case adaptiveEdgeGateDecisionSkipBusy:
+				bucket.EdgeSkipBusy++
+				skipped = true
+			case adaptiveEdgeGateDecisionSkipTripped:
+				bucket.EdgeSkipTripped++
+				skipped = true
+			}
+			quotaFailure := adaptiveEdgeGateAuditQuotaFailure(attempt)
+			if skipped && attempt.Success {
+				bucket.EdgeSuccessfulSkip++
+			}
+			if skipped && quotaFailure {
+				bucket.EdgeQuotaFailureSkip++
+			} else if !skipped && quotaFailure {
+				bucket.EdgeQuotaFailureDispatch++
+			}
+			if strings.HasPrefix(attempt.EdgeGateOutcomeTransition, "tripped_") {
+				bucket.EdgeTrips++
+			}
+			if attempt.EdgeGateOutcomeTransition == "reopened" {
+				bucket.EdgeReopens++
+			}
+		}
+	}
+	cutoff := record.At.UTC().Add(-adaptiveShadowAuditAggregatePeriod).Truncate(time.Hour).Unix()
+	for item := range store.hours {
+		if item < cutoff {
+			delete(store.hours, item)
+		}
+	}
+}
+
+func (store *adaptiveShadowAuditStore) aggregatePath() string { return store.path + ".hours.json" }
+
+type adaptiveShadowAuditAggregateFile struct {
+	SchemaVersion int                       `json:"schema_version"`
+	Checkpoint    uint64                    `json:"checkpoint"`
+	Hours         []adaptiveShadowAuditHour `json:"hours"`
+}
+
+func mergeAdaptiveShadowAuditHour(total *adaptiveShadowAuditHour, item adaptiveShadowAuditHour) {
+	if total == nil {
+		return
+	}
+	total.Requests += item.Requests
+	total.SuccessfulRequests += item.SuccessfulRequests
+	total.FailedRequests += item.FailedRequests
+	total.ActualAttempts += item.ActualAttempts
+	total.FallbackRequests += item.FallbackRequests
+	total.RoutingEnforced = total.RoutingEnforced || item.RoutingEnforced
+	total.RoutingChanges += item.RoutingChanges
+	total.AdditionalRequests += item.AdditionalRequests
+	total.WouldAdmit += item.WouldAdmit
+	total.WouldWithhold += item.WouldWithhold
+	total.LegacyAttempts += item.LegacyAttempts
+	total.Unknown += item.Unknown
+	total.SuccessfulWithhold += item.SuccessfulWithhold
+	total.QuotaFailuresAdmit += item.QuotaFailuresAdmit
+	total.TokenAttempts += item.TokenAttempts
+	total.TokenWouldAdmit += item.TokenWouldAdmit
+	total.TokenWouldWithhold += item.TokenWouldWithhold
+	total.TokenUnknown += item.TokenUnknown
+	total.TokenSuccessfulWithhold += item.TokenSuccessfulWithhold
+	total.TokenQuotaFailuresAdmit += item.TokenQuotaFailuresAdmit
+	total.EdgeAttempts += item.EdgeAttempts
+	total.EdgeGreen += item.EdgeGreen
+	total.EdgeGuarded += item.EdgeGuarded
+	total.EdgeTripped += item.EdgeTripped
+	total.EdgeHalfOpen += item.EdgeHalfOpen
+	total.EdgeDispatch += item.EdgeDispatch
+	total.EdgeProbe += item.EdgeProbe
+	total.EdgeSkipBusy += item.EdgeSkipBusy
+	total.EdgeSkipTripped += item.EdgeSkipTripped
+	total.EdgeSuccessfulSkip += item.EdgeSuccessfulSkip
+	total.EdgeQuotaFailureSkip += item.EdgeQuotaFailureSkip
+	total.EdgeQuotaFailureDispatch += item.EdgeQuotaFailureDispatch
+	total.EdgeTrips += item.EdgeTrips
+	total.EdgeReopens += item.EdgeReopens
+	total.AssistActuallyDeferred += item.AssistActuallyDeferred
+	total.AssistTailReached += item.AssistTailReached
+	total.AssistTailDispatched += item.AssistTailDispatched
+	total.AssistTailSuccess += item.AssistTailSuccess
+	total.AssistNeighborSuccess += item.AssistNeighborSuccess
+	total.AssistLostTail += item.AssistLostTail
+	total.AssistDuplicateTail += item.AssistDuplicateTail
+	total.AssistPrimaryDeferred += item.AssistPrimaryDeferred
+	total.AssistStreamHedge += item.AssistStreamHedge
+	total.AssistRequests += item.AssistRequests
+	total.AssistSuccessfulRequests += item.AssistSuccessfulRequests
+	total.AssistFailedRequests += item.AssistFailedRequests
+	total.AssistTailNotReached += item.AssistTailNotReached
+	total.AssistTerminalBeforeTail += item.AssistTerminalBeforeTail
+}
+
+func (store *adaptiveShadowAuditStore) saveHours() {
+	if err := store.persistHours(); err != nil {
+		store.noteWriteFailure(err)
+	}
+}
+
+func (store *adaptiveShadowAuditStore) persistHours() error {
+	store.mu.RLock()
+	hours := make([]adaptiveShadowAuditHour, 0, len(store.hours))
+	for _, bucket := range store.hours {
+		if bucket != nil {
+			hours = append(hours, *bucket)
+		}
+	}
+	checkpoint := store.aggregateCheckpoint
+	store.mu.RUnlock()
+	raw, err := json.Marshal(adaptiveShadowAuditAggregateFile{SchemaVersion: 1, Checkpoint: checkpoint, Hours: hours})
+	if err != nil {
+		return err
+	}
+	path := store.aggregatePath()
+	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = file.Write(raw); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(tmp, path); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	err = directory.Sync()
+	if closeErr := directory.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func (store *adaptiveShadowAuditStore) loadHours() {
+	raw, err := os.ReadFile(store.aggregatePath())
+	if err != nil {
+		return
+	}
+	var persisted adaptiveShadowAuditAggregateFile
+	if json.Unmarshal(raw, &persisted) != nil || persisted.SchemaVersion != 1 {
+		// preview.13 development snapshots used a bare array; accept it once.
+		if json.Unmarshal(raw, &persisted.Hours) != nil {
+			return
+		}
+	}
+	cutoff := time.Now().UTC().Add(-adaptiveShadowAuditAggregatePeriod).Truncate(time.Hour)
+	store.mu.Lock()
+	for index := range persisted.Hours {
+		bucket := persisted.Hours[index]
+		if !bucket.Hour.Before(cutoff) {
+			copyBucket := bucket
+			store.hours[bucket.Hour.Unix()] = &copyBucket
+		}
+	}
+	store.aggregateCheckpoint = persisted.Checkpoint
+	store.nextSequence = persisted.Checkpoint
 	store.mu.Unlock()
 }
 
@@ -403,6 +806,9 @@ func (store *adaptiveShadowAuditStore) loadBoundedHistory() {
 	if store == nil {
 		return
 	}
+	store.loadHours()
+	hadAggregates := len(store.hours) > 0
+	checkpoint := store.aggregateCheckpoint
 	for _, path := range []string{store.rotatedPath, store.path} {
 		info, errStat := os.Stat(path)
 		if errStat != nil {
@@ -447,7 +853,22 @@ func (store *adaptiveShadowAuditStore) loadBoundedHistory() {
 		for scanner.Scan() {
 			var record adaptiveShadowAuditRecord
 			if errDecode := json.Unmarshal(scanner.Bytes(), &record); errDecode == nil && record.SchemaVersion == adaptiveShadowAuditSchemaVersion {
-				store.appendMemory(sanitizeAdaptiveShadowAuditRecord(record))
+				record = sanitizeAdaptiveShadowAuditRecord(record)
+				// Sequence zero is legacy JSONL. Once a sidecar exists those rows
+				// formed its bootstrap cohort; all preview.13 crash-tail rows carry
+				// a writer-assigned sequence and can be compared exactly.
+				alreadyAggregated := hadAggregates && (record.Sequence == 0 || record.Sequence <= checkpoint)
+				if alreadyAggregated {
+					store.mu.Lock()
+					store.records = append(store.records, record)
+					if excess := len(store.records) - adaptiveShadowAuditMemoryRecords; excess > 0 {
+						copy(store.records, store.records[excess:])
+						store.records = store.records[:adaptiveShadowAuditMemoryRecords]
+					}
+					store.mu.Unlock()
+				} else {
+					store.appendMemory(record)
+				}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
@@ -491,6 +912,12 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 	}
 	store.mu.RLock()
 	records := append([]adaptiveShadowAuditRecord(nil), store.records...)
+	hours := make([]adaptiveShadowAuditHour, 0, len(store.hours))
+	for _, bucket := range store.hours {
+		if bucket != nil {
+			hours = append(hours, *bucket)
+		}
+	}
 	report.Warning = strings.TrimSpace(store.warning)
 	store.mu.RUnlock()
 	report.QueueDepth = len(store.queue)
@@ -530,6 +957,9 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 			firstEventAt = record.At
 		}
 		for _, attempt := range record.Attempts {
+			if attempt.AssistLifecycle != "" {
+				continue
+			}
 			tokenCalibrated := strings.HasPrefix(attempt.EstimateConfidence, "token_calibrated_")
 			if tokenCalibrated {
 				report.TokenCalibratedAttempts++
@@ -636,6 +1066,146 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 	if !firstEdgeGateAt.IsZero() && lastEdgeGateAt.After(firstEdgeGateAt) {
 		report.EdgeGateCoverageSeconds = int64(lastEdgeGateAt.Sub(firstEdgeGateAt) / time.Second)
 	}
+	// Detailed records are intentionally capped, but readiness uses the compact
+	// seven-day hourly cohort so high request rates cannot collapse six hours of
+	// evidence into a few minutes. The aggregate contains no trace or identity.
+	var aggregateFirst, aggregateLast, tokenFirst, tokenLast, edgeFirst, edgeLast time.Time
+	var total adaptiveShadowAuditHour
+	for _, bucket := range hours {
+		// Hour buckets are indivisible counters. Exclude a partial leading hour
+		// instead of attributing requests from before the requested period.
+		if bucket.First.Before(report.From) || bucket.Last.After(now) {
+			continue
+		}
+		bucketFirst := bucket.First
+		if bucketFirst.Before(report.From) {
+			bucketFirst = report.From
+		}
+		bucketLast := bucket.Last
+		if bucketLast.After(now) {
+			bucketLast = now
+		}
+		mergeAdaptiveShadowAuditHour(&total, bucket)
+		if aggregateFirst.IsZero() || bucketFirst.Before(aggregateFirst) {
+			aggregateFirst = bucketFirst
+		}
+		if bucketLast.After(aggregateLast) {
+			aggregateLast = bucketLast
+		}
+		if bucket.TokenAttempts > 0 {
+			itemFirst := bucket.TokenFirst
+			if itemFirst.IsZero() {
+				itemFirst = bucketFirst
+			}
+			if itemFirst.Before(report.From) {
+				itemFirst = report.From
+			}
+			itemLast := bucket.TokenLast
+			if itemLast.IsZero() {
+				itemLast = bucketLast
+			}
+			if itemLast.After(now) {
+				itemLast = now
+			}
+			if tokenFirst.IsZero() || itemFirst.Before(tokenFirst) {
+				tokenFirst = itemFirst
+			}
+			if itemLast.After(tokenLast) {
+				tokenLast = itemLast
+			}
+		}
+		if bucket.EdgeAttempts > 0 {
+			itemFirst := bucket.EdgeFirst
+			if itemFirst.IsZero() {
+				itemFirst = bucketFirst
+			}
+			if itemFirst.Before(report.From) {
+				itemFirst = report.From
+			}
+			itemLast := bucket.EdgeLast
+			if itemLast.IsZero() {
+				itemLast = bucketLast
+			}
+			if itemLast.After(now) {
+				itemLast = now
+			}
+			if edgeFirst.IsZero() || itemFirst.Before(edgeFirst) {
+				edgeFirst = itemFirst
+			}
+			if itemLast.After(edgeLast) {
+				edgeLast = itemLast
+			}
+		}
+	}
+	if total.Requests > 0 {
+		report.RequestsObserved = total.Requests
+		report.SuccessfulRequests = total.SuccessfulRequests
+		report.FailedRequests = total.FailedRequests
+		report.ActualExecutionAttempts = total.ActualAttempts
+		report.RequestsWithFallback = total.FallbackRequests
+		report.RoutingEnforced = report.RoutingEnforced || total.RoutingEnforced
+		report.RoutingChangesApplied = total.RoutingChanges
+		report.AdditionalProviderRequests = total.AdditionalRequests
+		report.WouldAdmitAttempts = total.WouldAdmit
+		report.WouldWithholdAttempts = total.WouldWithhold
+		report.UnknownDecisionAttempts = total.Unknown
+		report.LegacyShapeEstimateAttempts = total.LegacyAttempts
+		report.SuccessfulWouldWithhold = total.SuccessfulWithhold
+		report.QuotaFailuresWouldAdmit = total.QuotaFailuresAdmit
+		report.TokenCalibratedAttempts = total.TokenAttempts
+		report.TokenCalibratedWouldAdmit = total.TokenWouldAdmit
+		report.TokenCalibratedWouldWithhold = total.TokenWouldWithhold
+		report.TokenCalibratedUnknown = total.TokenUnknown
+		report.SuccessfulTokenCalibratedWithhold = total.TokenSuccessfulWithhold
+		report.TokenCalibratedQuotaFailuresOnAdmit = total.TokenQuotaFailuresAdmit
+		report.EdgeGateAttempts = total.EdgeAttempts
+		report.EdgeGateGreenAttempts = total.EdgeGreen
+		report.EdgeGateGuardedAttempts = total.EdgeGuarded
+		report.EdgeGateTrippedAttempts = total.EdgeTripped
+		report.EdgeGateHalfOpenAttempts = total.EdgeHalfOpen
+		report.EdgeGateWouldDispatch = total.EdgeDispatch
+		report.EdgeGateWouldProbe = total.EdgeProbe
+		report.EdgeGateWouldSkipBusy = total.EdgeSkipBusy
+		report.EdgeGateWouldSkipTripped = total.EdgeSkipTripped
+		report.EdgeGateSuccessfulWouldSkip = total.EdgeSuccessfulSkip
+		report.EdgeGateQuotaFailuresWouldSkip = total.EdgeQuotaFailureSkip
+		report.EdgeGateQuotaFailuresWhileDispatch = total.EdgeQuotaFailureDispatch
+		report.EdgeGateTripsObserved = total.EdgeTrips
+		report.EdgeGateReopensObserved = total.EdgeReopens
+		report.AssistActuallyDeferred = total.AssistActuallyDeferred
+		report.AssistTailReached = total.AssistTailReached
+		report.AssistTailDispatched = total.AssistTailDispatched
+		report.AssistTailSuccess = total.AssistTailSuccess
+		report.AssistNeighborSuccess = total.AssistNeighborSuccess
+		report.AssistLostTail = total.AssistLostTail
+		report.AssistDuplicateTail = total.AssistDuplicateTail
+		report.AssistPrimaryDeferred = total.AssistPrimaryDeferred
+		report.AssistStreamHedge = total.AssistStreamHedge
+		report.AssistRequests = total.AssistRequests
+		report.AssistSuccessfulRequests = total.AssistSuccessfulRequests
+		report.AssistFailedRequests = total.AssistFailedRequests
+		report.AssistTailNotReached = total.AssistTailNotReached
+		report.AssistTerminalBeforeTail = total.AssistTerminalBeforeTail
+		report.OldestRetainedAt = aggregateFirst
+		report.LastEventAt = aggregateLast
+		if aggregateLast.After(aggregateFirst) {
+			report.CoverageSeconds = int64(aggregateLast.Sub(aggregateFirst) / time.Second)
+		}
+		if tokenLast.After(tokenFirst) {
+			report.TokenCalibratedCoverageSeconds = int64(tokenLast.Sub(tokenFirst) / time.Second)
+		}
+		if edgeLast.After(edgeFirst) {
+			report.EdgeGateCoverageSeconds = int64(edgeLast.Sub(edgeFirst) / time.Second)
+		}
+	} else if len(records) > 0 {
+		report.OldestRetainedAt = firstEventAt
+	}
+	report.RetainedHistorySpanSeconds = report.CoverageSeconds
+	if len(records) == adaptiveShadowAuditMemoryRecords && !aggregateFirst.IsZero() && !firstEventAt.IsZero() && aggregateFirst.Before(firstEventAt) {
+		report.HistoryTruncated = true
+		detailSpan := report.LastEventAt.Sub(firstEventAt)
+		report.HighRateTruncation = detailSpan < adaptiveShadowAuditReviewCoverage
+	}
 	report.TokenCalibrationVerdict = "collecting"
 	report.TokenCalibrationVerdictMessage = "Полностью токен-калиброванных наблюдений пока недостаточно; маршрутизация остаётся прежней."
 	if report.DroppedRecords > 0 || report.WriteFailures > 0 || report.RotationFailures > 0 ||
@@ -722,6 +1292,29 @@ func (store *adaptiveShadowAuditStore) report(cfg pluginConfig, period time.Dura
 		report.EdgeGateVerdictMessage = adaptiveEnforcedAuditComponentMessage(
 			"breaker", report.EdgeGateVerdict, report.EdgeGateAttempts,
 		)
+	}
+	if report.Status == "warning" {
+		report.ReadinessBlockers = append(report.ReadinessBlockers, "telemetry_degraded")
+	}
+	if report.RequestsObserved < adaptiveShadowAuditReviewRequests {
+		report.ReadinessBlockers = append(report.ReadinessBlockers, "minimum_requests")
+	}
+	if report.CoverageSeconds < int64(adaptiveShadowAuditReviewCoverage/time.Second) {
+		report.ReadinessBlockers = append(report.ReadinessBlockers, "minimum_coverage")
+	}
+	if report.UnknownDecisionAttempts > 0 {
+		report.ReadinessBlockers = append(report.ReadinessBlockers, "unknown_quota")
+	}
+	if report.SuccessfulWouldWithhold > 0 {
+		report.ReadinessBlockers = append(report.ReadinessBlockers, "successful_would_withhold")
+	}
+	if report.QuotaFailuresWouldAdmit > 0 {
+		report.ReadinessBlockers = append(report.ReadinessBlockers, "quota_failure_would_admit")
+	}
+	if report.AssistLostTail > 0 || report.AssistDuplicateTail > 0 || report.AssistPrimaryDeferred > 0 || report.AssistStreamHedge > 0 {
+		report.ReadinessBlockers = append(report.ReadinessBlockers, "assist_lifecycle_invariant")
+		report.Verdict = "needs_review"
+		report.VerdictMessage = "Assist lifecycle нарушил инвариант сохранения хвостовой попытки; требуется ручная проверка перед продолжением canary."
 	}
 	return report
 }
@@ -832,11 +1425,12 @@ func sanitizeAdaptiveShadowAuditRecord(record adaptiveShadowAuditRecord) adaptiv
 		attempt.ModelWeeklyName = adaptiveShadowAuditToken(attempt.ModelWeeklyName, 96)
 		attempt.Outcome = adaptiveShadowAuditToken(attempt.Outcome, 32)
 		attempt.ProviderAcceptance = adaptiveShadowAuditToken(attempt.ProviderAcceptance, 16)
-		attempt.ErrorCode = adaptiveShadowAuditToken(attempt.ErrorCode, 96)
+		attempt.ErrorCode = adaptiveShadowAuditErrorCategory(attempt.ErrorCode)
 		attempt.EdgeGateState = adaptiveShadowAuditToken(attempt.EdgeGateState, 24)
 		attempt.EdgeGateDecision = adaptiveShadowAuditToken(attempt.EdgeGateDecision, 32)
 		attempt.EdgeGateReason = adaptiveShadowAuditToken(attempt.EdgeGateReason, 64)
 		attempt.EdgeGateOutcomeTransition = adaptiveShadowAuditToken(attempt.EdgeGateOutcomeTransition, 48)
+		attempt.AssistLifecycle = adaptiveShadowAuditToken(attempt.AssistLifecycle, 32)
 		attempt.ReservationPercent = adaptiveShadowAuditNumber(attempt.ReservationPercent, 0, 100)
 		attempt.SessionReservationPercent = adaptiveShadowAuditNumber(attempt.SessionReservationPercent, 0, 100)
 		attempt.WeeklyReservationPercent = adaptiveShadowAuditNumber(attempt.WeeklyReservationPercent, 0, 100)
@@ -855,6 +1449,33 @@ func sanitizeAdaptiveShadowAuditRecord(record adaptiveShadowAuditRecord) adaptiv
 		}
 	}
 	return record
+}
+
+func adaptiveShadowAuditErrorCategory(code string) string {
+	// Persisted audit uses a closed taxonomy. Host/provider error codes are
+	// untrusted and may contain credentials or tenant identifiers even when they
+	// look like a valid bravo_* token.
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "":
+		return ""
+	case "credits_required", "billing_error":
+		return "credits_exhausted"
+	case "usage limit has been reached":
+		return "usage_limit"
+	case "bravo_adaptive_quota_withheld", "bravo_adaptive_edge_tripped", "bravo_adaptive_edge_busy",
+		"bravo_subscription_quota_exhausted", "bravo_subscription_model_credits_exhausted",
+		"rate_limit_error", "rate_limited", "quota_unavailable",
+		"request_canceled", "bravo_attempt_superseded", "bravo_stream_attempt_aborted",
+		"bravo_request_invalid", "invalid_request", "invalid_request_error", "invalid_tool_parameters",
+		"bravo_context_window_exceeded", "bravo_context_target_incompatible", "context_window_exceeded",
+		"bravo_capability_conflict", "bravo_capability_undeclared", "bravo_capability_unsupported",
+		"bravo_no_eligible_account", "bravo_route_temporarily_unavailable", "bravo_subscription_cooling_down",
+		"bravo_provider_stream_error", "provider_stream_error", "provider_stream_incomplete",
+		"provider_error", "provider_failed", "upstream_failed", "overloaded_error", "server_error", "timeout":
+		return strings.ToLower(strings.TrimSpace(code))
+	default:
+		return "unclassified_provider_error"
+	}
 }
 
 func adaptiveShadowAuditNumber(value, minimum, maximum float64) float64 {

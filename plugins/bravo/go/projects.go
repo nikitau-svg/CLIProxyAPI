@@ -36,6 +36,7 @@ type projectView struct {
 	Models         []string               `json:"models"`
 	PrimaryAuthIDs []string               `json:"primary_auth_ids"`
 	AllowedAuthIDs []string               `json:"allowed_auth_ids"`
+	AdaptiveAssist bool                   `json:"adaptive_assist"`
 	Policy         map[string]any         `json:"policy"`
 	PromptCache    projectPromptCacheView `json:"prompt_cache"`
 	CreatedAt      string                 `json:"created_at,omitempty"`
@@ -57,6 +58,7 @@ type createProjectRequest struct {
 	Models         []string                  `json:"models,omitempty"`
 	PrimaryAuthIDs []string                  `json:"primary_auth_ids,omitempty"`
 	AllowedAuthIDs []string                  `json:"allowed_auth_ids,omitempty"`
+	AdaptiveAssist bool                      `json:"adaptive_assist,omitempty"`
 	Policy         map[string]any            `json:"policy,omitempty"`
 	PromptCache    *projectPromptCachePolicy `json:"prompt_cache,omitempty"`
 }
@@ -69,6 +71,7 @@ type patchProjectRequest struct {
 	Models         *[]string                 `json:"models,omitempty"`
 	PrimaryAuthIDs *[]string                 `json:"primary_auth_ids,omitempty"`
 	AllowedAuthIDs *[]string                 `json:"allowed_auth_ids,omitempty"`
+	AdaptiveAssist *bool                     `json:"adaptive_assist,omitempty"`
 	Policy         json.RawMessage           `json:"policy,omitempty"`
 	PromptCache    *projectPromptCachePolicy `json:"prompt_cache,omitempty"`
 }
@@ -216,6 +219,7 @@ func createProject(req rpcManagementRequest) ([]byte, error) {
 		Models:         models,
 		PrimaryAuthIDs: normalizeOpaqueStrings(input.PrimaryAuthIDs),
 		AllowedAuthIDs: normalizeOpaqueStrings(input.AllowedAuthIDs),
+		AdaptiveAssist: input.AdaptiveAssist,
 		Policy:         policy,
 		CreatedAt:      now,
 		UpdatedAt:      now,
@@ -283,6 +287,9 @@ func patchProject(req rpcManagementRequest) ([]byte, error) {
 	}
 	if input.AllowedAuthIDs != nil {
 		updated.AllowedAuthIDs = normalizeOpaqueStrings(*input.AllowedAuthIDs)
+	}
+	if input.AdaptiveAssist != nil {
+		updated.AdaptiveAssist = *input.AdaptiveAssist
 	}
 	if input.Policy != nil {
 		if strings.TrimSpace(string(input.Policy)) == "null" {
@@ -664,6 +671,7 @@ func smartKeyProjectView(item smartKeyConfig) projectView {
 		Models:         append([]string{}, item.Models...),
 		PrimaryAuthIDs: append([]string{}, item.PrimaryAuthIDs...),
 		AllowedAuthIDs: append([]string{}, item.AllowedAuthIDs...),
+		AdaptiveAssist: item.AdaptiveAssist,
 		Policy:         cloneProjectPolicy(item.Policy),
 		PromptCache:    projectPromptCacheViewFor(item),
 		CreatedAt:      item.CreatedAt,
